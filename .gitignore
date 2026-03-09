@@ -1,0 +1,23 @@
+# Environment
+.env
+.streamlit/secrets.toml
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+# Test fixtures (real IBKR PDFs)
+tests/fixtures/*.pdf
+
+# OS
+.DS_Store
+Thumbs.db
