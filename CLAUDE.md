@@ -1,13 +1,7 @@
 # IBKR Trade Journal
 
 ## What this is
-Personal trading journal built in Python and Streamlit. Parses IBKR
-Custom Date Range PDF statements, stores holdings and trade history
-in Supabase, deployed on Streamlit Community Cloud from this repo.
 
-## Architecture
-Three-layer architecture: Presentation (pages/), Service (src/parser.py,
-src/models.py), Data (src/db.py). Layers only communicate downward.
 Never import from a layer above.
 
 ## Stack
