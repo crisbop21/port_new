@@ -48,7 +48,10 @@ for col in numeric_cols:
     if col in df.columns:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
-# ── Summary metrics ──────────────────────────────────────────────────────────
+if "trade_date" in df.columns:
+    df["trade_date"] = pd.to_datetime(df["trade_date"], errors="coerce")
+
+# ── Summary metrics (row 1) ─────────────────────────────────────────────────
 
 total_realized = df["realized_pnl"].sum()
 total_commission = df["commission"].sum()
@@ -60,9 +63,120 @@ col1.metric("Total Realized P&L", f"${total_realized:,.2f}",
 col2.metric("Total Commissions", f"${total_commission:,.2f}")
 col3.metric("Trades", trade_count)
 
+# ── Win / Loss metrics (row 2) ──────────────────────────────────────────────
+
+# Only count trades where P&L is non-zero (opening legs typically have 0 P&L)
+closing_trades = df[df["realized_pnl"] != 0]
+
+if not closing_trades.empty:
+    winners = closing_trades[closing_trades["realized_pnl"] > 0]
+    losers = closing_trades[closing_trades["realized_pnl"] < 0]
+
+    win_rate = len(winners) / len(closing_trades) * 100
+    avg_win = winners["realized_pnl"].mean() if not winners.empty else 0
+    avg_loss = losers["realized_pnl"].mean() if not losers.empty else 0
+    gross_wins = winners["realized_pnl"].sum() if not winners.empty else 0
+    gross_losses = abs(losers["realized_pnl"].sum()) if not losers.empty else 0
+    profit_factor = gross_wins / gross_losses if gross_losses > 0 else float("inf")
+    largest_win = winners["realized_pnl"].max() if not winners.empty else 0
+    largest_loss = losers["realized_pnl"].min() if not losers.empty else 0
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Win Rate", f"{win_rate:.1f}%")
+    c2.metric("Profit Factor", f"{profit_factor:.2f}" if profit_factor != float("inf") else "∞")
+    c3.metric("Avg Win", f"${avg_win:,.2f}")
+    c4.metric("Avg Loss", f"${avg_loss:,.2f}")
+
+    c5, c6, c7 = st.columns(3)
+    c5.metric("Largest Win", f"${largest_win:,.2f}")
+    c6.metric("Largest Loss", f"${largest_loss:,.2f}")
+    comm_pct = (abs(total_commission) / gross_wins * 100) if gross_wins > 0 else 0
+    c7.metric("Commissions / Gross Wins", f"{comm_pct:.1f}%")
+
+st.divider()
+
+# ── Charts ───────────────────────────────────────────────────────────────────
+
+chart_left, chart_right = st.columns(2)
+
+# Daily P&L bar chart
+with chart_left:
+    st.subheader("Daily P&L")
+    daily_pnl = (
+        df.dropna(subset=["trade_date"])
+        .groupby(df["trade_date"].dt.date)["realized_pnl"]
+        .sum()
+        .reset_index()
+        .rename(columns={"trade_date": "Date", "realized_pnl": "Realized P&L"})
+    )
+    if not daily_pnl.empty:
+        st.bar_chart(daily_pnl, x="Date", y="Realized P&L")
+
+# Cumulative P&L line chart
+with chart_right:
+    st.subheader("Cumulative P&L")
+    if not daily_pnl.empty:
+        cum = daily_pnl.copy()
+        cum["Cumulative P&L"] = cum["Realized P&L"].cumsum()
+        st.line_chart(cum, x="Date", y="Cumulative P&L")
+
+# P&L Distribution histogram
+if not closing_trades.empty:
+    st.subheader("P&L Distribution")
+    hist_data = closing_trades[["realized_pnl"]].rename(columns={"realized_pnl": "Realized P&L"})
+    st.bar_chart(
+        hist_data["Realized P&L"]
+        .value_counts(bins=20)
+        .sort_index()
+        .rename("Count")
+    )
+
+st.divider()
+
+# ── Per-symbol breakdown ─────────────────────────────────────────────────────
+
+st.subheader("P&L by Symbol")
+
+symbol_stats = (
+    closing_trades.groupby("symbol")
+    .agg(
+        total_pnl=("realized_pnl", "sum"),
+        trades=("realized_pnl", "count"),
+        wins=("realized_pnl", lambda x: (x > 0).sum()),
+        avg_pnl=("realized_pnl", "mean"),
+        total_commission=("commission", "sum"),
+    )
+    .reset_index()
+)
+if not symbol_stats.empty:
+    symbol_stats["win_rate"] = (symbol_stats["wins"] / symbol_stats["trades"] * 100).round(1)
+    symbol_stats = symbol_stats.sort_values("total_pnl", ascending=False)
+
+    st.dataframe(
+        symbol_stats[["symbol", "total_pnl", "trades", "win_rate", "avg_pnl", "total_commission"]],
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "symbol": "Symbol",
+            "total_pnl": st.column_config.NumberColumn("Total P&L", format="$%.2f"),
+            "trades": "Trades",
+            "win_rate": st.column_config.NumberColumn("Win Rate %", format="%.1f%%"),
+            "avg_pnl": st.column_config.NumberColumn("Avg P&L", format="$%.2f"),
+            "total_commission": st.column_config.NumberColumn("Commissions", format="$%.4f"),
+        },
+    )
+
+    # Top winners / losers bar chart
+    top_n = min(10, len(symbol_stats))
+    st.bar_chart(
+        symbol_stats.head(top_n).set_index("symbol")["total_pnl"].rename("P&L by Symbol")
+    )
+
 st.divider()
 
 # ── Trade table ──────────────────────────────────────────────────────────────
+
+st.subheader("Trade Log")
 
 display_cols = [
     "trade_date", "symbol", "asset_class", "side",
