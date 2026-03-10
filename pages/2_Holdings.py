@@ -38,8 +38,16 @@ for s in statements:
             info["period_start"] = p_start
 
 account_list = list(accounts.keys())
-selected_account = st.selectbox("Account", account_list)
-acct_info = accounts[selected_account]
+account_options = ["All Accounts"] + account_list
+selected_account = st.selectbox("Account", account_options)
+
+if selected_account == "All Accounts":
+    # Merge date ranges across all accounts
+    all_start = min(info["period_start"] for info in accounts.values())
+    all_end = max(info["period_end"] for info in accounts.values())
+    acct_info = {"period_start": all_start, "period_end": all_end}
+else:
+    acct_info = accounts[selected_account]
 
 # ── Date picker ──────────────────────────────────────────────────────────────
 
@@ -56,7 +64,12 @@ is_historical = as_of < acct_info["period_end"]
 # ── Reconstruct holdings ────────────────────────────────────────────────────
 
 with st.spinner("Reconstructing holdings..."):
-    rows = reconstruct_holdings(acct_info["latest_id"], as_of)
+    if selected_account == "All Accounts":
+        rows = []
+        for acct, info in accounts.items():
+            rows.extend(reconstruct_holdings(info["latest_id"], as_of))
+    else:
+        rows = reconstruct_holdings(accounts[selected_account]["latest_id"], as_of)
 
 if not rows:
     st.warning("No holdings found as of this date.")

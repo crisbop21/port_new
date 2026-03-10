@@ -5,9 +5,19 @@ from datetime import date, timedelta
 import pandas as pd
 import streamlit as st
 
-from src.db import get_positions, get_statements, get_trades
+from src.db import get_account_ids, get_positions, get_statements, get_trades
 
 st.title("Dashboard")
+
+# ── Account selector ─────────────────────────────────────────────────────────
+
+account_ids = get_account_ids()
+if not account_ids:
+    st.info("No statements uploaded yet. Go to **Upload** to import a PDF.")
+    st.stop()
+
+account_options = ["All Accounts"] + account_ids
+selected_account = st.selectbox("Account", account_options)
 
 # ── Load data ────────────────────────────────────────────────────────────────
 
@@ -18,12 +28,31 @@ with st.spinner("Loading portfolio data..."):
         st.info("No statements uploaded yet. Go to **Upload** to import a PDF.")
         st.stop()
 
-    # Use the most recent statement for positions
-    latest = statements[0]
-    positions = get_positions(latest["id"])
+    if selected_account == "All Accounts":
+        # Collect positions from the latest statement per account
+        latest_by_account: dict[str, dict] = {}
+        for s in statements:
+            acct = s["account_id"]
+            if acct not in latest_by_account:
+                latest_by_account[acct] = s  # already sorted by period_end desc
+        positions = []
+        for s in latest_by_account.values():
+            positions.extend(get_positions(s["id"]))
+        latest = statements[0]
+    else:
+        acct_statements = [s for s in statements if s["account_id"] == selected_account]
+        if not acct_statements:
+            st.info("No statements found for this account.")
+            st.stop()
+        latest = acct_statements[0]
+        positions = get_positions(latest["id"])
 
-    # Load all trades (last 365 days by default)
-    trades = get_trades(date_from=date.today() - timedelta(days=365), date_to=date.today())
+    account_filter = None if selected_account == "All Accounts" else selected_account
+    trades = get_trades(
+        account_id=account_filter,
+        date_from=date.today() - timedelta(days=365),
+        date_to=date.today(),
+    )
 
 # ── DataFrames ───────────────────────────────────────────────────────────────
 
@@ -125,6 +154,10 @@ if not trade_df.empty:
 # ── Statement info ───────────────────────────────────────────────────────────
 
 with st.expander("Statement info"):
-    st.write(f"**Account:** {latest['account_id']}")
-    st.write(f"**Period:** {latest['period_start']} → {latest['period_end']}")
-    st.write(f"**Statements uploaded:** {len(statements)}")
+    if selected_account == "All Accounts":
+        st.write(f"**Accounts:** {', '.join(account_ids)}")
+        st.write(f"**Statements uploaded:** {len(statements)}")
+    else:
+        st.write(f"**Account:** {latest['account_id']}")
+        st.write(f"**Period:** {latest['period_start']} → {latest['period_end']}")
+        st.write(f"**Statements uploaded:** {len([s for s in statements if s['account_id'] == selected_account])}")
