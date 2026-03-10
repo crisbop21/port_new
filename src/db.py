@@ -98,6 +98,14 @@ def _trade_fingerprint(t: dict) -> tuple:
     )
 
 
+def _position_fingerprint(p: dict) -> tuple:
+    """Fingerprint for deduplicating the same position across overlapping PDFs."""
+    return (
+        p.get("symbol"), p.get("asset_class"), p.get("statement_date"),
+        p.get("expiry"), p.get("strike"), p.get("right"),
+    )
+
+
 def _get_account_statement_ids(account_id: str) -> list[str]:
     """Get all statement IDs for an account."""
     result = (
@@ -132,6 +140,96 @@ def _get_existing_trade_fingerprints(account_id: str, exclude_statement_id: str 
     return fingerprints
 
 
+def _get_existing_position_fingerprints(
+    account_id: str, exclude_statement_id: str | None = None,
+) -> set[tuple]:
+    """Collect fingerprints of all positions already stored for an account."""
+    stmt_ids = _get_account_statement_ids(account_id)
+    if exclude_statement_id:
+        stmt_ids = [s for s in stmt_ids if s != exclude_statement_id]
+    if not stmt_ids:
+        return set()
+
+    fingerprints: set[tuple] = set()
+    client = get_client()
+    for sid in stmt_ids:
+        positions = (
+            client.table("positions")
+            .select("symbol,asset_class,statement_date,expiry,strike,right")
+            .eq("statement_id", sid)
+            .execute()
+        )
+        for p in positions.data:
+            fingerprints.add(_position_fingerprint(p))
+    return fingerprints
+
+
+# ── Duplicate analysis ────────────────────────────────────────────────────────
+
+
+def check_duplicates(parsed: ParsedStatement) -> dict:
+    """Analyse a parsed statement against the DB to find new vs duplicate data.
+
+    Returns a dict with keys:
+        new_trades, dup_trades, new_positions, dup_positions,
+        existing_statement_id (UUID str or None).
+    """
+    client = get_client()
+    meta = parsed.meta
+
+    # Check if this exact statement period already exists
+    try:
+        existing_stmt = (
+            client.table("statements")
+            .select("id")
+            .eq("account_id", meta.account_id)
+            .eq("period_start", _ser(meta.period_start))
+            .eq("period_end", _ser(meta.period_end))
+            .execute()
+        )
+        existing_statement_id = (
+            existing_stmt.data[0]["id"] if existing_stmt.data else None
+        )
+    except Exception:
+        existing_statement_id = None
+
+    # Trade duplicates
+    existing_trade_fps = _get_existing_trade_fingerprints(
+        meta.account_id, exclude_statement_id=existing_statement_id,
+    )
+    new_trades = 0
+    dup_trades = 0
+    for t in parsed.trades:
+        row = _trade_row(t, "dummy")
+        fp = _trade_fingerprint(row)
+        if fp in existing_trade_fps:
+            dup_trades += 1
+        else:
+            new_trades += 1
+
+    # Position duplicates
+    existing_pos_fps = _get_existing_position_fingerprints(
+        meta.account_id, exclude_statement_id=existing_statement_id,
+    )
+    new_positions = 0
+    dup_positions = 0
+    for p in parsed.positions:
+        row = _position_row(p, "dummy")
+        fp = _position_fingerprint(row)
+        if fp in existing_pos_fps:
+            dup_positions += 1
+        else:
+            new_positions += 1
+
+    return {
+        "new_trades": new_trades,
+        "dup_trades": dup_trades,
+        "new_positions": new_positions,
+        "dup_positions": dup_positions,
+        "existing_statement_id": existing_statement_id,
+    }
+
+
 # ── Upsert ───────────────────────────────────────────────────────────────────
 
 
@@ -163,8 +261,8 @@ def upsert_statement(parsed: ParsedStatement) -> tuple[str, int]:
     coexist; trades that already exist in another statement are skipped.
 
     Returns:
-        (statement_id, trades_skipped) — the UUID and how many duplicate
-        trades were filtered out.
+        (statement_id, trades_skipped, positions_skipped) — the UUID and
+        how many duplicate trades/positions were filtered out.
 
     Raises:
         st.error and re-raises on any Supabase/network failure.
@@ -201,15 +299,28 @@ def upsert_statement(parsed: ParsedStatement) -> tuple[str, int]:
             "statement_id", statement_id
         ).execute()
 
-        # Insert positions
+        # Insert positions — deduplicate against other statements
+        positions_skipped = 0
         if parsed.positions:
-            pos_rows = [_position_row(p, statement_id) for p in parsed.positions]
-            pos_result = client.table("positions").insert(pos_rows).execute()
-            if not pos_result.data:
-                raise RuntimeError(
-                    f"Positions insert returned no data ({len(pos_rows)} rows sent). "
-                    "Check RLS policies on the 'positions' table."
-                )
+            existing_pos_fps = _get_existing_position_fingerprints(
+                meta.account_id, exclude_statement_id=statement_id,
+            )
+            pos_rows = []
+            for p in parsed.positions:
+                row = _position_row(p, statement_id)
+                fp = _position_fingerprint(row)
+                if fp in existing_pos_fps:
+                    positions_skipped += 1
+                    continue
+                pos_rows.append(row)
+
+            if pos_rows:
+                pos_result = client.table("positions").insert(pos_rows).execute()
+                if not pos_result.data:
+                    raise RuntimeError(
+                        f"Positions insert returned no data ({len(pos_rows)} rows sent). "
+                        "Check RLS policies on the 'positions' table."
+                    )
 
         # Insert trades — deduplicate against existing trades in other statements
         trades_skipped = 0
@@ -234,11 +345,12 @@ def upsert_statement(parsed: ParsedStatement) -> tuple[str, int]:
                     )
 
         logger.info(
-            "Upserted statement %s: %d positions, %d trades (%d dupes skipped)",
-            statement_id, len(parsed.positions),
+            "Upserted statement %s: %d positions (%d dupes), %d trades (%d dupes)",
+            statement_id,
+            len(parsed.positions) - positions_skipped, positions_skipped,
             len(parsed.trades) - trades_skipped, trades_skipped,
         )
-        return statement_id, trades_skipped
+        return statement_id, trades_skipped, positions_skipped
 
     except Exception as e:
         logger.exception("Failed to upsert statement for %s", meta.account_id)

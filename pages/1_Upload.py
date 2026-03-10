@@ -3,7 +3,7 @@
 import streamlit as st
 
 from src.parser import parse_statement
-from src.db import upsert_statement, get_existing_period, clear_query_caches, get_client
+from src.db import upsert_statement, check_duplicates, clear_query_caches, get_client
 
 st.title("Upload IBKR Statement")
 
@@ -74,51 +74,62 @@ if uploaded is not None:
 
     st.divider()
 
-    # ── Check for narrower-period warnings before saving ────────────────
-    narrower_warnings: dict[str, tuple] = {}
-    for parsed in statements:
-        existing = get_existing_period(parsed.meta.account_id)
-        if existing:
-            old_start, old_end = existing
-            new_start = parsed.meta.period_start
-            new_end = parsed.meta.period_end
-            # Warn if the new PDF covers a narrower window — the user
-            # would lose trades outside the new range.
-            if new_start > old_start or new_end < old_end:
-                narrower_warnings[parsed.meta.account_id] = (
-                    old_start, old_end, new_start, new_end,
+    # ── Pre-save duplicate analysis ─────────────────────────────────────
+    dup_key = f"dup_analysis_{uploaded.name}_{uploaded.size}"
+    if dup_key not in st.session_state:
+        with st.spinner("Checking for duplicates against database..."):
+            try:
+                analysis = {}
+                for parsed in statements:
+                    analysis[parsed.meta.account_id] = check_duplicates(parsed)
+                st.session_state[dup_key] = analysis
+            except Exception as e:
+                st.warning(f"Could not check duplicates (will still save): {e}")
+                st.session_state[dup_key] = {}
+
+    dup_analysis = st.session_state.get(dup_key, {})
+
+    if dup_analysis:
+        st.subheader("Duplicate analysis")
+        st.caption(
+            "Only new data will be added — existing trades and positions "
+            "are never deleted or overwritten."
+        )
+        for acct, info in dup_analysis.items():
+            new_t = info["new_trades"]
+            dup_t = info["dup_trades"]
+            new_p = info["new_positions"]
+            dup_p = info["dup_positions"]
+
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric(f"{acct} — New trades", new_t)
+            c2.metric("Duplicate trades", dup_t)
+            c3.metric("New positions", new_p)
+            c4.metric("Duplicate positions", dup_p)
+
+            if new_t == 0 and new_p == 0:
+                st.info(
+                    f"**{acct}**: All data from this PDF already exists in the "
+                    f"database. Saving will have no effect."
                 )
 
-    if narrower_warnings:
-        for acct, (os, oe, ns, ne) in narrower_warnings.items():
-            st.warning(
-                f"**{acct}**: database has trades from **{os}** to **{oe}**, "
-                f"but this PDF only covers **{ns}** to **{ne}**. "
-                f"Saving will **replace all existing data** — trades outside "
-                f"the new range will be lost."
-            )
-        confirm_key = "confirm_narrower"
-        st.checkbox(
-            "I understand — replace existing data with this narrower period",
-            key=confirm_key,
-        )
-        save_blocked = not st.session_state.get(confirm_key, False)
-    else:
-        save_blocked = False
-
-    if st.button("Save to database", type="primary", disabled=save_blocked):
+    if st.button("Save to database", type="primary"):
         saved = 0
         errors = []
         for parsed in statements:
             try:
-                stmt_id, trades_skipped = upsert_statement(parsed)
+                stmt_id, trades_skipped, positions_skipped = upsert_statement(parsed)
                 trades_new = len(parsed.trades) - trades_skipped
+                positions_new = len(parsed.positions) - positions_skipped
                 msg = (
                     f"Saved account {parsed.meta.account_id} → `{stmt_id}` "
-                    f"({len(parsed.positions)} positions, {trades_new} trades)"
+                    f"({positions_new} new positions, {trades_new} new trades)"
                 )
-                if trades_skipped:
-                    msg += f" — {trades_skipped} duplicate trades skipped"
+                if trades_skipped or positions_skipped:
+                    msg += (
+                        f" — skipped {trades_skipped} duplicate trades, "
+                        f"{positions_skipped} duplicate positions"
+                    )
                 st.success(msg)
                 saved += 1
             except Exception as exc:
