@@ -241,6 +241,39 @@ class TestUpsertStatement:
         # statements: upsert, positions: delete, trades: delete
         assert table_names == ["statements", "positions", "trades"]
 
+    @patch("src.db.get_client")
+    def test_upsert_idempotent(self, mock_get_client, parsed_statement):
+        """Upserting the same statement twice returns the same ID."""
+        from src.db import upsert_statement
+
+        client = _make_mock_client()
+        mock_get_client.return_value = client
+
+        id1 = upsert_statement(parsed_statement)
+        id2 = upsert_statement(parsed_statement)
+        assert id1 == id2
+
+    @patch("src.db.get_client")
+    def test_upsert_uses_on_conflict(self, mock_get_client, parsed_statement):
+        """Upsert must specify the correct conflict key."""
+        from src.db import upsert_statement
+
+        client = _make_mock_client()
+        mock_get_client.return_value = client
+
+        upsert_statement(parsed_statement)
+
+        # Find the statements table upsert call
+        for call in client.table.call_args_list:
+            if call.args[0] == "statements":
+                table_mock = client.table(call.args[0])
+                upsert_calls = table_mock.upsert.call_args_list
+                if upsert_calls:
+                    _, kwargs = upsert_calls[0]
+                    assert "on_conflict" in kwargs
+                    assert "account_id" in kwargs["on_conflict"]
+                break
+
 
 # ── Query tests ──────────────────────────────────────────────────────────────
 
@@ -319,6 +352,73 @@ class TestGetTrades:
             date_to=date(2026, 3, 6),
         )
         assert isinstance(result, list)
+
+    @patch("src.db.get_client")
+    def test_symbol_filter_applied(self, mock_get_client):
+        """Verify .eq('symbol', ...) is called when symbol filter is set."""
+        from src.db import get_trades
+
+        get_trades.clear()
+
+        client = MagicMock()
+        # Build a chainable mock
+        query = MagicMock()
+        client.table.return_value.select.return_value = query
+        query.eq.return_value = query
+        query.gte.return_value = query
+        query.lte.return_value = query
+        query.order.return_value = query
+        query.execute.return_value = MagicMock(data=[])
+        mock_get_client.return_value = client
+
+        get_trades(symbol="AAPL")
+
+        # .eq should have been called with 'symbol', 'AAPL'
+        eq_calls = query.eq.call_args_list
+        symbols = [c for c in eq_calls if c.args == ("symbol", "AAPL")]
+        assert len(symbols) == 1
+
+    @patch("src.db.get_client")
+    def test_date_range_filters_applied(self, mock_get_client):
+        """Verify .gte and .lte are called for date range filters."""
+        from src.db import get_trades
+
+        get_trades.clear()
+
+        client = MagicMock()
+        query = MagicMock()
+        client.table.return_value.select.return_value = query
+        query.eq.return_value = query
+        query.gte.return_value = query
+        query.lte.return_value = query
+        query.order.return_value = query
+        query.execute.return_value = MagicMock(data=[])
+        mock_get_client.return_value = client
+
+        get_trades(date_from=date(2026, 1, 1), date_to=date(2026, 3, 6))
+
+        query.gte.assert_called_once_with("trade_date", "2026-01-01")
+        query.lte.assert_called_once_with("trade_date", "2026-03-06T23:59:59")
+
+    @patch("src.db.get_client")
+    def test_no_filters_skips_eq(self, mock_get_client):
+        """With no filters, only .order and .execute should be called."""
+        from src.db import get_trades
+
+        get_trades.clear()
+
+        client = MagicMock()
+        query = MagicMock()
+        client.table.return_value.select.return_value = query
+        query.order.return_value = query
+        query.execute.return_value = MagicMock(data=[])
+        mock_get_client.return_value = client
+
+        get_trades()
+
+        query.eq.assert_not_called()
+        query.gte.assert_not_called()
+        query.lte.assert_not_called()
 
     @patch("src.db.get_client")
     @patch("src.db.st")
