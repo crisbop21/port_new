@@ -7,12 +7,17 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import streamlit as st
-from dotenv import load_dotenv
+try:
+    from dotenv import load_dotenv
+except ModuleNotFoundError:
+    # python-dotenv is not strictly required on Streamlit Cloud,
+    # where secrets are injected via the platform.
+    load_dotenv = None
 
 from src.logging_config import setup_logging
 
 _env_file = Path(__file__).resolve().parent / ".env"
-if _env_file.exists():
+if _env_file.exists() and load_dotenv is not None:
     load_dotenv(_env_file)
 setup_logging()
 
