@@ -8,7 +8,6 @@ import logging
 import os
 from datetime import date, datetime
 from decimal import Decimal
-from typing import TypedDict
 
 import streamlit as st
 from supabase import Client, create_client
@@ -80,132 +79,40 @@ def _trade_row(trade: Trade, statement_id: str) -> dict:
     }
 
 
-# ── Overlap cleanup ──────────────────────────────────────────────────────────
-
-
-class UpsertResult(TypedDict):
-    statement_id: str
-    trades_deduped: int
-    positions_deduped: int
-    statements_absorbed: int
-
-
-def _cleanup_overlaps(
-    client: Client,
-    account_id: str,
-    new_stmt_id: str,
-    period_start: date,
-    period_end: date,
-) -> tuple[int, int, int]:
-    """Remove duplicate data from older statements whose periods overlap.
-
-    When a new PDF covers dates that an existing statement already has,
-    the new upload is treated as authoritative for those dates.
-
-    - **Fully covered** old statements (old period ⊆ new period) are deleted
-      entirely (cascade removes their trades/positions).
-    - **Partially overlapping** old statements keep data outside the overlap
-      but lose trades/positions within the overlapping date range.
-
-    Returns:
-        (trades_removed, positions_removed, statements_absorbed)
-    """
-    # Find all statements for the same account, then filter out the
-    # current one in Python.  (Avoids potential issues with .neq()
-    # across different supabase-py versions.)
-    result = (
-        client.table("statements")
-        .select("id,period_start,period_end")
-        .eq("account_id", account_id)
-        .execute()
-    )
-
-    if not result.data:
-        return 0, 0, 0
-
-    trades_removed = 0
-    positions_removed = 0
-    stmts_to_delete: list[str] = []
-
-    for stmt in result.data:
-        # Guard against unexpected response shapes
-        if not isinstance(stmt, dict):
-            logger.warning("Unexpected statement row type: %s — skipping", type(stmt))
-            continue
-        old_id = stmt["id"]
-        # Skip the statement we just upserted
-        if old_id == new_stmt_id:
-            continue
-        old_start = date.fromisoformat(stmt["period_start"])
-        old_end = date.fromisoformat(stmt["period_end"])
-
-        # No overlap at all → skip
-        if old_end < period_start or old_start > period_end:
-            continue
-
-        # New statement fully covers old → absorb (delete old entirely)
-        if old_start >= period_start and old_end <= period_end:
-            stmts_to_delete.append(old_id)
-            logger.info(
-                "Absorbing fully-covered statement %s (%s–%s) into %s",
-                old_id, old_start, old_end, new_stmt_id,
-            )
-            continue
-
-        # Partial overlap → remove only the overlapping trades/positions
-        overlap_start = max(old_start, period_start)
-        overlap_end = min(old_end, period_end)
-
-        # Delete overlapping trades from the old statement
-        del_trades = (
-            client.table("trades")
-            .delete()
-            .eq("statement_id", old_id)
-            .gte("trade_date", overlap_start.isoformat())
-            .lte("trade_date", f"{overlap_end.isoformat()}T23:59:59")
-            .execute()
-        )
-        count = len(del_trades.data) if del_trades.data else 0
-        trades_removed += count
-
-        # Delete overlapping positions from the old statement
-        del_pos = (
-            client.table("positions")
-            .delete()
-            .eq("statement_id", old_id)
-            .gte("statement_date", overlap_start.isoformat())
-            .lte("statement_date", overlap_end.isoformat())
-            .execute()
-        )
-        count = len(del_pos.data) if del_pos.data else 0
-        positions_removed += count
-
-        logger.info(
-            "Cleaned %d trades, %d positions from statement %s "
-            "for overlap %s–%s",
-            len(del_trades.data or []), len(del_pos.data or []),
-            old_id, overlap_start, overlap_end,
-        )
-
-    # Delete fully-covered statements (cascade handles children)
-    for stmt_id in stmts_to_delete:
-        client.table("statements").delete().eq("id", stmt_id).execute()
-
-    return trades_removed, positions_removed, len(stmts_to_delete)
-
-
 # ── Upsert ───────────────────────────────────────────────────────────────────
 
-def upsert_statement(parsed: ParsedStatement) -> UpsertResult:
+
+def get_existing_period(account_id: str) -> tuple[date, date] | None:
+    """Return (period_start, period_end) for an account, or None if new."""
+    try:
+        result = (
+            get_client()
+            .table("statements")
+            .select("period_start,period_end")
+            .eq("account_id", account_id)
+            .execute()
+        )
+        if result.data:
+            row = result.data[0]
+            return (
+                date.fromisoformat(row["period_start"]),
+                date.fromisoformat(row["period_end"]),
+            )
+    except Exception:
+        logger.debug("Could not fetch existing period for %s", account_id)
+    return None
+
+
+def upsert_statement(parsed: ParsedStatement) -> str:
     """Idempotently save a parsed statement to Supabase.
 
-    Upserts the statement row (on account+period conflict), then replaces
-    all child positions and trades for that statement.  Finally, cleans up
-    duplicate data from any other statements for the same account whose
-    date ranges overlap with this one.
+    Upserts the statement row on account_id conflict (one statement per
+    account), then replaces all child positions and trades.  Uploading a
+    new PDF for the same account always fully replaces the old data —
+    no duplicates are possible.
 
     Returns:
-        UpsertResult dict with statement_id and dedup counts.
+        The statement UUID.
 
     Raises:
         st.error and re-raises on any Supabase/network failure.
@@ -214,7 +121,7 @@ def upsert_statement(parsed: ParsedStatement) -> UpsertResult:
     meta = parsed.meta
 
     try:
-        # Upsert statement row
+        # Upsert statement row (account_id is the unique key)
         stmt_data = {
             "account_id": meta.account_id,
             "period_start": _ser(meta.period_start),
@@ -223,7 +130,7 @@ def upsert_statement(parsed: ParsedStatement) -> UpsertResult:
         }
         result = (
             client.table("statements")
-            .upsert(stmt_data, on_conflict="account_id,period_start,period_end")
+            .upsert(stmt_data, on_conflict="account_id")
             .execute()
         )
         if not result.data:
@@ -263,24 +170,11 @@ def upsert_statement(parsed: ParsedStatement) -> UpsertResult:
                     "Check RLS policies on the 'trades' table."
                 )
 
-        # Clean up duplicates from overlapping statements
-        trades_deduped, positions_deduped, stmts_absorbed = _cleanup_overlaps(
-            client, meta.account_id, statement_id,
-            meta.period_start, meta.period_end,
-        )
-
         logger.info(
-            "Upserted statement %s: %d positions, %d trades "
-            "(deduped %d trades, %d positions, absorbed %d statements)",
+            "Upserted statement %s: %d positions, %d trades",
             statement_id, len(parsed.positions), len(parsed.trades),
-            trades_deduped, positions_deduped, stmts_absorbed,
         )
-        return UpsertResult(
-            statement_id=statement_id,
-            trades_deduped=trades_deduped,
-            positions_deduped=positions_deduped,
-            statements_absorbed=stmts_absorbed,
-        )
+        return statement_id
 
     except Exception as e:
         logger.exception("Failed to upsert statement for %s", meta.account_id)
