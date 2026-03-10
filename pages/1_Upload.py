@@ -79,31 +79,11 @@ if uploaded is not None:
         errors = []
         for parsed in statements:
             try:
-                result = upsert_statement(parsed)
-                stmt_id = result["statement_id"]
+                stmt_id = upsert_statement(parsed)
                 st.success(
                     f"Saved account {parsed.meta.account_id} → `{stmt_id}` "
                     f"({len(parsed.positions)} positions, {len(parsed.trades)} trades)"
                 )
-                # Show dedup info when overlapping data was cleaned up
-                dedup_parts = []
-                if result["trades_deduped"]:
-                    dedup_parts.append(
-                        f"{result['trades_deduped']} duplicate trade(s) removed"
-                    )
-                if result["positions_deduped"]:
-                    dedup_parts.append(
-                        f"{result['positions_deduped']} duplicate position(s) removed"
-                    )
-                if result["statements_absorbed"]:
-                    dedup_parts.append(
-                        f"{result['statements_absorbed']} fully-covered statement(s) absorbed"
-                    )
-                if dedup_parts:
-                    st.info(
-                        f"Overlap cleanup for {parsed.meta.account_id}: "
-                        + "; ".join(dedup_parts)
-                    )
                 saved += 1
             except Exception as exc:
                 errors.append(str(exc))

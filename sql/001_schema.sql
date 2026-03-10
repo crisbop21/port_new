@@ -10,7 +10,7 @@ create table if not exists statements (
     base_currency text   not null default 'USD',
     created_at   timestamptz not null default now(),
 
-    constraint uq_account_period unique (account_id, period_start, period_end)
+    constraint uq_account unique (account_id)
 );
 
 -- ── positions ───────────────────────────────────────────────────────────────

@@ -5,7 +5,7 @@ All tests mock the Supabase client — no real database needed.
 
 from datetime import date, datetime
 from decimal import Decimal
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -134,18 +134,8 @@ class TestTradeRow:
 
 # ── Mock Supabase client ────────────────────────────────────────────────────
 
-def _make_mock_client(overlap_statements=None):
-    """Build a mock Supabase client with chained .table().method().execute().
-
-    Args:
-        overlap_statements: Optional list of dicts to return from the
-            overlap-detection SELECT on the statements table.  Each dict
-            should have 'id', 'period_start', 'period_end'.  Defaults to
-            an empty list (no overlaps).
-    """
-    if overlap_statements is None:
-        overlap_statements = []
-
+def _make_mock_client():
+    """Build a mock Supabase client with chained .table().method().execute()."""
     client = MagicMock()
 
     def _mock_table(name):
@@ -154,32 +144,19 @@ def _make_mock_client(overlap_statements=None):
         table.upsert.return_value.execute.return_value = MagicMock(
             data=[{"id": "stmt-uuid-001"}]
         )
-        # delete chain — support arbitrary chained filters
-        delete_chain = MagicMock()
-        delete_chain.eq.return_value = delete_chain
-        delete_chain.neq.return_value = delete_chain
-        delete_chain.gte.return_value = delete_chain
-        delete_chain.lte.return_value = delete_chain
-        delete_chain.execute.return_value = MagicMock(data=[])
-        table.delete.return_value = delete_chain
+        # delete chain
+        table.delete.return_value.eq.return_value.execute.return_value = MagicMock(data=[])
         # insert chain — return a row to indicate successful insert
         table.insert.return_value.execute.return_value = MagicMock(
             data=[{"id": "row-uuid-001"}]
         )
-        # select chain (for queries and overlap detection)
-        select = MagicMock()
+        # select chain (for queries)
+        select = table.select.return_value
         select.eq.return_value = select
-        select.neq.return_value = select
         select.gte.return_value = select
         select.lte.return_value = select
         select.order.return_value = select
-        # Return overlap_statements when selecting from statements
-        # (the overlap query uses select + eq + neq)
-        if name == "statements":
-            select.execute.return_value = MagicMock(data=overlap_statements)
-        else:
-            select.execute.return_value = MagicMock(data=[])
-        table.select.return_value = select
+        select.execute.return_value = MagicMock(data=[])
         return table
 
     client.table.side_effect = _mock_table
@@ -190,17 +167,14 @@ def _make_mock_client(overlap_statements=None):
 
 class TestUpsertStatement:
     @patch("src.db.get_client")
-    def test_upsert_returns_result_dict(self, mock_get_client, parsed_statement):
+    def test_upsert_returns_statement_id(self, mock_get_client, parsed_statement):
         from src.db import upsert_statement
 
         client = _make_mock_client()
         mock_get_client.return_value = client
 
-        result = upsert_statement(parsed_statement)
-        assert result["statement_id"] == "stmt-uuid-001"
-        assert result["trades_deduped"] == 0
-        assert result["positions_deduped"] == 0
-        assert result["statements_absorbed"] == 0
+        stmt_id = upsert_statement(parsed_statement)
+        assert stmt_id == "stmt-uuid-001"
 
     @patch("src.db.get_client")
     def test_upsert_calls_correct_tables(self, mock_get_client, parsed_statement):
@@ -262,12 +236,12 @@ class TestUpsertStatement:
         upsert_statement(parsed)
 
         # Should still upsert statement and delete, but no insert calls
-        # for positions/trades with empty lists.
-        # The table is called for: upsert statement, delete positions,
-        # delete trades, then overlap-cleanup SELECT on statements.
+        # for positions/trades with empty lists
+        # The table is called for delete but not insert
         calls = client.table.call_args_list
         table_names = [c.args[0] for c in calls]
-        assert table_names == ["statements", "positions", "trades", "statements"]
+        # statements: upsert, positions: delete, trades: delete
+        assert table_names == ["statements", "positions", "trades"]
 
     @patch("src.db.get_client")
     def test_upsert_idempotent(self, mock_get_client, parsed_statement):
@@ -277,9 +251,9 @@ class TestUpsertStatement:
         client = _make_mock_client()
         mock_get_client.return_value = client
 
-        r1 = upsert_statement(parsed_statement)
-        r2 = upsert_statement(parsed_statement)
-        assert r1["statement_id"] == r2["statement_id"]
+        id1 = upsert_statement(parsed_statement)
+        id2 = upsert_statement(parsed_statement)
+        assert id1 == id2
 
     @patch("src.db.get_client")
     def test_upsert_uses_on_conflict(self, mock_get_client, parsed_statement):
@@ -462,166 +436,3 @@ class TestGetTrades:
         result = get_trades()
         assert result == []
         mock_st.error.assert_called_once()
-
-
-# ── Overlap / dedup tests ──────────────────────────────────────────────────
-
-
-class TestCleanupOverlaps:
-    """Tests for _cleanup_overlaps via upsert_statement."""
-
-    @patch("src.db.get_client")
-    def test_no_overlaps_returns_zero(self, mock_get_client, parsed_statement):
-        """When no other statements exist, dedup counts are all zero."""
-        from src.db import upsert_statement
-
-        client = _make_mock_client(overlap_statements=[])
-        mock_get_client.return_value = client
-
-        result = upsert_statement(parsed_statement)
-        assert result["trades_deduped"] == 0
-        assert result["positions_deduped"] == 0
-        assert result["statements_absorbed"] == 0
-
-    @patch("src.db.get_client")
-    def test_fully_covered_statement_absorbed(self, mock_get_client, parsed_statement):
-        """An older statement whose period is fully inside the new one gets deleted."""
-        from src.db import upsert_statement
-
-        # parsed_statement has period 2026-01-01 → 2026-03-06
-        # Old statement: 2026-01-15 → 2026-02-15 (fully inside)
-        old_stmt = {
-            "id": "old-stmt-uuid",
-            "period_start": "2026-01-15",
-            "period_end": "2026-02-15",
-        }
-        client = _make_mock_client(overlap_statements=[old_stmt])
-        mock_get_client.return_value = client
-
-        result = upsert_statement(parsed_statement)
-        assert result["statements_absorbed"] == 1
-
-        # Verify the old statement was deleted
-        table_calls = client.table.call_args_list
-        # There should be a delete call on "statements" for the old stmt
-        stmt_delete_calls = [
-            c for c in table_calls if c.args[0] == "statements"
-        ]
-        # At least 2: one for the upsert, one for the overlap select,
-        # one for the delete of the old statement
-        assert len(stmt_delete_calls) >= 2
-
-    @patch("src.db.get_client")
-    def test_partial_overlap_removes_trades(self, mock_get_client, parsed_statement):
-        """Partial overlap: trades in the overlap range are removed from old stmt."""
-        from src.db import upsert_statement
-
-        # parsed_statement: 2026-01-01 → 2026-03-06
-        # Old statement: 2025-06-01 → 2026-02-01 (overlaps Jan 1 – Feb 1)
-        old_stmt = {
-            "id": "old-stmt-uuid",
-            "period_start": "2025-06-01",
-            "period_end": "2026-02-01",
-        }
-
-        # Track delete calls to verify overlap filtering
-        delete_calls = []
-        original_mock_table = _make_mock_client(overlap_statements=[old_stmt]).table.side_effect
-
-        client = MagicMock()
-
-        def tracking_table(name):
-            table = MagicMock()
-            # upsert chain
-            table.upsert.return_value.execute.return_value = MagicMock(
-                data=[{"id": "stmt-uuid-001"}]
-            )
-            # delete chain — track calls
-            delete_chain = MagicMock()
-            delete_chain.eq.return_value = delete_chain
-            delete_chain.neq.return_value = delete_chain
-            delete_chain.gte.return_value = delete_chain
-            delete_chain.lte.return_value = delete_chain
-            delete_chain.execute.return_value = MagicMock(data=[
-                {"id": "dup-1"}, {"id": "dup-2"}
-            ])
-
-            def track_delete():
-                d = MagicMock()
-                d.eq.return_value = d
-                d.neq.return_value = d
-                d.gte.return_value = d
-                d.lte.return_value = d
-                d.execute.return_value = MagicMock(data=[{"id": "dup-1"}])
-                delete_calls.append({"table": name, "mock": d})
-                return d
-            table.delete.side_effect = track_delete
-
-            # insert chain
-            table.insert.return_value.execute.return_value = MagicMock(
-                data=[{"id": "row-uuid-001"}]
-            )
-            # select chain
-            select = MagicMock()
-            select.eq.return_value = select
-            select.neq.return_value = select
-            select.gte.return_value = select
-            select.lte.return_value = select
-            select.order.return_value = select
-            if name == "statements":
-                select.execute.return_value = MagicMock(data=[old_stmt])
-            else:
-                select.execute.return_value = MagicMock(data=[])
-            table.select.return_value = select
-            return table
-
-        client.table.side_effect = tracking_table
-        mock_get_client.return_value = client
-
-        result = upsert_statement(parsed_statement)
-
-        # The old statement is NOT absorbed (only partial overlap)
-        assert result["statements_absorbed"] == 0
-        # Trades and positions were cleaned from old statement
-        assert result["trades_deduped"] >= 1
-        assert result["positions_deduped"] >= 1
-
-    @patch("src.db.get_client")
-    def test_no_overlap_no_cleanup(self, mock_get_client, parsed_statement):
-        """An old statement with no date overlap is left untouched."""
-        from src.db import upsert_statement
-
-        # parsed_statement: 2026-01-01 → 2026-03-06
-        # Old statement: 2025-01-01 → 2025-06-30 (no overlap)
-        old_stmt = {
-            "id": "old-stmt-uuid",
-            "period_start": "2025-01-01",
-            "period_end": "2025-06-30",
-        }
-        client = _make_mock_client(overlap_statements=[old_stmt])
-        mock_get_client.return_value = client
-
-        result = upsert_statement(parsed_statement)
-        assert result["trades_deduped"] == 0
-        assert result["positions_deduped"] == 0
-        assert result["statements_absorbed"] == 0
-
-    @patch("src.db.get_client")
-    def test_multiple_overlapping_statements(self, mock_get_client, parsed_statement):
-        """Multiple old statements: one absorbed, one partial, one untouched."""
-        from src.db import upsert_statement
-
-        # parsed_statement: 2026-01-01 → 2026-03-06
-        old_stmts = [
-            # Fully covered → absorbed
-            {"id": "absorbed", "period_start": "2026-01-15", "period_end": "2026-02-15"},
-            # Partial overlap → cleaned
-            {"id": "partial", "period_start": "2025-10-01", "period_end": "2026-01-31"},
-            # No overlap → untouched
-            {"id": "separate", "period_start": "2024-01-01", "period_end": "2024-12-31"},
-        ]
-        client = _make_mock_client(overlap_statements=old_stmts)
-        mock_get_client.return_value = client
-
-        result = upsert_statement(parsed_statement)
-        assert result["statements_absorbed"] == 1
