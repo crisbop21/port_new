@@ -11,7 +11,9 @@ from dotenv import load_dotenv
 
 from src.logging_config import setup_logging
 
-load_dotenv()
+_env_file = Path(__file__).resolve().parent / ".env"
+if _env_file.exists():
+    load_dotenv(_env_file)
 setup_logging()
 
 st.set_page_config(
