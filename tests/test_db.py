@@ -9,7 +9,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from src.db import _position_row, _ser, _trade_row
+from src.db import _position_row, _position_fingerprint, _ser, _trade_row, _trade_fingerprint
 from src.models import ParsedStatement, Position, StatementMeta, Trade
 
 
@@ -173,9 +173,10 @@ class TestUpsertStatement:
         client = _make_mock_client()
         mock_get_client.return_value = client
 
-        stmt_id, trades_skipped = upsert_statement(parsed_statement)
+        stmt_id, trades_skipped, positions_skipped = upsert_statement(parsed_statement)
         assert stmt_id == "stmt-uuid-001"
         assert trades_skipped == 0
+        assert positions_skipped == 0
 
     @patch("src.db.get_client")
     def test_upsert_calls_correct_tables(self, mock_get_client, parsed_statement):
@@ -252,8 +253,8 @@ class TestUpsertStatement:
         client = _make_mock_client()
         mock_get_client.return_value = client
 
-        id1 = upsert_statement(parsed_statement)
-        id2 = upsert_statement(parsed_statement)
+        id1, _, _ = upsert_statement(parsed_statement)
+        id2, _, _ = upsert_statement(parsed_statement)
         assert id1 == id2
 
     @patch("src.db.get_client")
@@ -437,3 +438,82 @@ class TestGetTrades:
         result = get_trades()
         assert result == []
         mock_st.error.assert_called_once()
+
+
+# ── Fingerprint tests ─────────────────────────────────────────────────────
+
+
+class TestFingerprints:
+    def test_trade_fingerprint_matches_same_trade(self, sample_trade):
+        row = _trade_row(sample_trade, "stmt-1")
+        fp1 = _trade_fingerprint(row)
+        row2 = _trade_row(sample_trade, "stmt-2")
+        fp2 = _trade_fingerprint(row2)
+        assert fp1 == fp2, "Same trade in different statements should have same fingerprint"
+
+    def test_trade_fingerprint_differs_for_different_price(self, sample_trade):
+        row1 = _trade_row(sample_trade, "stmt-1")
+        fp1 = _trade_fingerprint(row1)
+        # Modify price
+        row2 = dict(row1)
+        row2["price"] = "999.00"
+        fp2 = _trade_fingerprint(row2)
+        assert fp1 != fp2
+
+    def test_position_fingerprint_matches_same_position(self, sample_position):
+        row = _position_row(sample_position, "stmt-1")
+        fp1 = _position_fingerprint(row)
+        row2 = _position_row(sample_position, "stmt-2")
+        fp2 = _position_fingerprint(row2)
+        assert fp1 == fp2, "Same position in different statements should have same fingerprint"
+
+    def test_position_fingerprint_differs_for_different_date(self, sample_position):
+        row1 = _position_row(sample_position, "stmt-1")
+        fp1 = _position_fingerprint(row1)
+        row2 = dict(row1)
+        row2["statement_date"] = "2026-04-01"
+        fp2 = _position_fingerprint(row2)
+        assert fp1 != fp2
+
+    def test_option_position_fingerprint_includes_option_fields(
+        self, sample_option_position,
+    ):
+        row = _position_row(sample_option_position, "stmt-1")
+        fp = _position_fingerprint(row)
+        # Should include expiry, strike, right
+        assert fp == (
+            "EEM 31MAR26 48 C", "OPT", "2026-03-06",
+            "2026-03-31", "48", "C",
+        )
+
+
+# ── check_duplicates tests ───────────────────────────────────────────────
+
+
+class TestCheckDuplicates:
+    @patch("src.db.get_client")
+    def test_all_new_data(self, mock_get_client, parsed_statement):
+        from src.db import check_duplicates
+
+        client = _make_mock_client()
+        mock_get_client.return_value = client
+
+        result = check_duplicates(parsed_statement)
+        assert result["new_trades"] == 1
+        assert result["dup_trades"] == 0
+        assert result["new_positions"] == 1
+        assert result["dup_positions"] == 0
+
+    @patch("src.db.get_client")
+    def test_no_data(self, mock_get_client, sample_meta):
+        from src.db import check_duplicates
+
+        client = _make_mock_client()
+        mock_get_client.return_value = client
+
+        parsed = ParsedStatement(meta=sample_meta, positions=[], trades=[])
+        result = check_duplicates(parsed)
+        assert result["new_trades"] == 0
+        assert result["dup_trades"] == 0
+        assert result["new_positions"] == 0
+        assert result["dup_positions"] == 0
