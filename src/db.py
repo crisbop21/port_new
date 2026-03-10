@@ -363,6 +363,7 @@ def clear_query_caches() -> None:
     get_statements.clear()
     get_positions.clear()
     get_trades.clear()
+    get_account_ids.clear()
     reconstruct_holdings.clear()
 
 
@@ -405,8 +406,35 @@ def get_positions(statement_id: str) -> list[dict]:
 
 
 @st.cache_data(ttl=60)
+def get_account_ids() -> list[str]:
+    """Return distinct account IDs from all uploaded statements."""
+    try:
+        result = (
+            get_client()
+            .table("statements")
+            .select("account_id")
+            .order("account_id")
+            .execute()
+        )
+        # Deduplicate while preserving order
+        seen: set[str] = set()
+        ids: list[str] = []
+        for row in result.data:
+            aid = row["account_id"]
+            if aid not in seen:
+                seen.add(aid)
+                ids.append(aid)
+        return ids
+    except Exception as e:
+        logger.exception("Failed to fetch account IDs")
+        st.error(f"Database error fetching account IDs: {e}")
+        return []
+
+
+@st.cache_data(ttl=60)
 def get_trades(
     statement_id: str | None = None,
+    account_id: str | None = None,
     symbol: str | None = None,
     asset_class: str | None = None,
     side: str | None = None,
@@ -417,6 +445,7 @@ def get_trades(
 
     Args:
         statement_id: Filter by statement.
+        account_id: Filter by account (looks up statement IDs for the account).
         symbol: Filter by ticker symbol.
         asset_class: Filter by asset class (STK, OPT, ETF).
         side: Filter by side (BOT, SLD).
@@ -428,6 +457,11 @@ def get_trades(
 
         if statement_id:
             query = query.eq("statement_id", statement_id)
+        elif account_id:
+            stmt_ids = _get_account_statement_ids(account_id)
+            if not stmt_ids:
+                return []
+            query = query.in_("statement_id", stmt_ids)
         if symbol:
             query = query.eq("symbol", symbol)
         if asset_class:

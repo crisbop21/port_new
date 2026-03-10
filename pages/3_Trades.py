@@ -5,7 +5,7 @@ from datetime import date, timedelta
 import pandas as pd
 import streamlit as st
 
-from src.db import get_trades
+from src.db import get_account_ids, get_trades
 
 st.title("Trade History")
 
@@ -13,6 +13,11 @@ st.title("Trade History")
 
 with st.sidebar:
     st.header("Filters")
+
+    account_ids = get_account_ids()
+    account_options = ["All Accounts"] + account_ids
+    selected_account = st.selectbox("Account", account_options)
+    account_filter = None if selected_account == "All Accounts" else selected_account
 
     date_col1, date_col2 = st.columns(2)
     date_from = date_col1.date_input("From", value=date.today() - timedelta(days=90))
@@ -30,6 +35,7 @@ with st.sidebar:
 
 with st.spinner("Loading trades..."):
     rows = get_trades(
+        account_id=account_filter,
         symbol=symbol,
         asset_class=asset_class_filter,
         side=side_filter,
