@@ -12,18 +12,19 @@ st.title("Dashboard")
 
 # ── Load data ────────────────────────────────────────────────────────────────
 
-statements = get_statements()
+with st.spinner("Loading portfolio data..."):
+    statements = get_statements()
 
-if not statements:
-    st.info("No statements uploaded yet. Go to **Upload** to import a PDF.")
-    st.stop()
+    if not statements:
+        st.info("No statements uploaded yet. Go to **Upload** to import a PDF.")
+        st.stop()
 
-# Use the most recent statement for positions
-latest = statements[0]
-positions = get_positions(latest["id"])
+    # Use the most recent statement for positions
+    latest = statements[0]
+    positions = get_positions(latest["id"])
 
-# Load all trades (last 365 days by default)
-trades = get_trades(date_from=date.today() - timedelta(days=365), date_to=date.today())
+    # Load all trades (last 365 days by default)
+    trades = get_trades(date_from=date.today() - timedelta(days=365), date_to=date.today())
 
 # ── DataFrames ───────────────────────────────────────────────────────────────
 

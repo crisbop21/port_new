@@ -29,13 +29,14 @@ with st.sidebar:
 
 # ── Load trades ──────────────────────────────────────────────────────────────
 
-rows = get_trades(
-    symbol=symbol,
-    asset_class=asset_class_filter,
-    side=side_filter,
-    date_from=date_from,
-    date_to=date_to,
-)
+with st.spinner("Loading trades..."):
+    rows = get_trades(
+        symbol=symbol,
+        asset_class=asset_class_filter,
+        side=side_filter,
+        date_from=date_from,
+        date_to=date_to,
+    )
 
 if not rows:
     st.info("No trades match the current filters.")

@@ -55,26 +55,34 @@ if uploaded is not None:
                     use_container_width=True,
                 )
 
-        # Show skipped rows
+        # Show skipped items with details
         if parsed.skipped_rows:
-            with st.expander("Skipped rows (review these)", expanded=True):
+            with st.expander(
+                f"Skipped items ({len(parsed.skipped_rows)}) — review these",
+                expanded=True,
+            ):
+                st.caption(
+                    "Rows skipped due to unsupported asset classes or parse errors. "
+                    "Stocks, ETFs, and Options are supported."
+                )
                 st.dataframe(parsed.skipped_rows, use_container_width=True)
 
     st.divider()
 
     if st.button("Save to database", type="primary"):
         saved = 0
-        for parsed in statements:
-            try:
-                stmt_id = upsert_statement(parsed)
-                st.success(
-                    f"Saved account {parsed.meta.account_id} → `{stmt_id}` "
-                    f"({len(parsed.positions)} positions, {len(parsed.trades)} trades)"
-                )
-                saved += 1
-            except Exception:
-                # upsert_statement already calls st.error
-                pass
+        with st.spinner("Saving to database..."):
+            for parsed in statements:
+                try:
+                    stmt_id = upsert_statement(parsed)
+                    st.success(
+                        f"Saved account {parsed.meta.account_id} → `{stmt_id}` "
+                        f"({len(parsed.positions)} positions, {len(parsed.trades)} trades)"
+                    )
+                    saved += 1
+                except Exception:
+                    # upsert_statement already calls st.error
+                    pass
 
         if saved == len(statements):
             st.balloons()
