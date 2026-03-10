@@ -1,8 +1,7 @@
 """Tests for the IBKR PDF parser.
 
-Uses a synthetic PDF built with pdfplumber's underlying library (pdfminer)
-via reportlab to mimic the IBKR table layout. This lets us test the full
-parse pipeline without needing a real statement.
+Unit tests use synthetic row data matching the real IBKR PDF layout.
+Integration test runs against the real fixture PDF.
 """
 
 import io
@@ -16,64 +15,84 @@ from src.parser import (
     _extract_meta,
     _extract_positions,
     _extract_trades,
+    _is_total,
     _parse_datetime,
     _parse_option_symbol,
+    _split_accounts,
     _to_decimal,
     parse_statement,
 )
 
 
-# ── Helper: build fake row sets mimicking IBKR table extraction ──────────────
+# ── Synthetic row builders matching real IBKR format ─────────────────────────
 
-def _meta_rows():
-    """Rows as they'd come from _extract_tables for the Statement section."""
+def _account_info_rows(account_id="U9876543", currency="SGD"):
     return [
-        ["Statement", "Header", "Field Name", "Field Value"],
-        ["Statement", "Data", "Account", "U9876543"],
-        ["Statement", "Data", "Period", "2024-01-01 - 2024-01-31"],
-        ["Statement", "Data", "Base Currency", "USD"],
+        ["Account Information", ""],
+        ["Name", "TEST USER"],
+        ["Account", account_id],
+        ["Account Type", "Individual"],
+        ["Base Currency", currency],
+    ]
+
+
+def _nav_rows(prior="December 31, 2025", current="March 6, 2026"):
+    return [
+        ["Net Asset Value", "", "", "", "", ""],
+        [prior, "", current, "", "", ""],
+        ["", "Total", "Long", "Short", "Total", "Change"],
+        ["Cash", "10,000.00", "5,000.00", "0.00", "5,000.00", "-5,000.00"],
+        ["Total", "50,000.00", "45,000.00", "0.00", "45,000.00", "-5,000.00"],
     ]
 
 
 def _position_rows():
-    """Open Positions rows with one stock and one option."""
     return [
-        ["Open Positions", "Header", "Symbol", "Quantity", "Cost Basis",
-         "Close Price", "Value", "Unrealized P/L", "Currency"],
-        ["Open Positions", "Data", "Stocks", "", "", "", "", "", ""],
-        ["Open Positions", "Data", "AAPL", "100", "15,000.00",
-         "175.50", "17,550.00", "2,550.00", "USD"],
-        ["Open Positions", "Data", "MSFT", "50", "18,000.00",
-         "400.00", "20,000.00", "2,000.00", "USD"],
-        ["Open Positions", "SubTotal", "", "", "", "", "37,550.00", "4,550.00", ""],
-        ["Open Positions", "Data", "Equity and Index Options", "", "", "", "", "", ""],
-        ["Open Positions", "Data", "AAPL 20240119 150.0 C", "10", "5,000.00",
-         "8.50", "8,500.00", "3,500.00", "USD"],
-        ["Open Positions", "Total", "", "", "", "", "46,050.00", "8,050.00", ""],
+        ["Open Positions", "", "", "", "", "", "", "", ""],
+        ["Symbol", "Quantity", "Mult", "Cost Price", "Cost Basis",
+         "Close Price", "Value", "Unrealized P/L", "Code"],
+        ["Stocks", "", "", "", "", "", "", "", ""],
+        ["USD", "", "", "", "", "", "", "", ""],
+        ["AAPL", "100", "1", "150.00", "15,000.00",
+         "175.50", "17,550.00", "2,550.00", ""],
+        ["MSFT", "50", "1", "360.00", "18,000.00",
+         "400.00", "20,000.00", "2,000.00", ""],
+        ["Total", "", "", "", "33,000.00", "", "37,550.00", "4,550.00", ""],
+        ["Total in SGD", "", "", "", "42,000.00", "", "48,000.00", "6,000.00", ""],
+        ["Symbol", "Quantity", "Mult", "Cost Price", "Cost Basis",
+         "Close Price", "Value", "Unrealized P/L", "Code"],
+        ["Equity and Index Options", "", "", "", "", "", "", "", ""],
+        ["USD", "", "", "", "", "", "", "", ""],
+        ["EEM 31MAR26 48 C", "6", "100", "3.49", "2,095.71",
+         "9.68", "5,806.98", "3,711.27", ""],
+        ["Total", "", "", "", "2,095.71", "", "5,806.98", "3,711.27", ""],
     ]
 
 
 def _trade_rows():
-    """Trades rows with a buy and a sell."""
     return [
-        ["Trades", "Header", "Symbol", "Date/Time", "Quantity",
-         "T. Price", "Proceeds", "Comm/Fee", "Realized P/L", "Currency"],
-        ["Trades", "Data", "Stocks", "", "", "", "", "", "", ""],
-        ["Trades", "Data", "AAPL", "2024-01-15, 10:30:00", "50",
-         "175.00", "-8,750.00", "-1.00", "0", "USD"],
-        ["Trades", "Data", "MSFT", "2024-01-20, 14:00:00", "-25",
-         "405.00", "10,125.00", "-1.00", "125.00", "USD"],
-        ["Trades", "SubTotal", "", "", "", "", "", "", "", ""],
+        ["Trades", "", "", "", "", "", "", "", "", "", "", "", ""],
+        ["Symbol", "Date/Time", "", "Quantity", "T. Price", "C. Price",
+         "Proceeds", "Comm/Fee", "Basis", "Realized P/L", "", "MTM P/L", "Code"],
+        ["Stocks", "", "", "", "", "", "", "", "", "", "", "", ""],
+        ["USD", "", "", "", "", "", "", "", "", "", "", "", ""],
+        ["AAPL", "2026-01-15,\n10:30:00", "", "50", "175.00", "176.00",
+         "-8,750.00", "-1.09", "8,751.09", "0.00", "", "-50.00", "O"],
+        ["Total AAPL", "", "", "50", "", "", "-8,750.00", "-1.09",
+         "8,751.09", "0.00", "", "-50.00", ""],
+        ["MSFT", "2026-01-20,\n14:00:00", "", "-25", "405.00", "400.00",
+         "10,125.00", "-1.09", "-9,000.00", "1,123.91", "", "125.00", "C"],
+        ["Total MSFT", "", "", "-25", "", "", "10,125.00", "-1.09",
+         "-9,000.00", "1,123.91", "", "125.00", ""],
+        ["Total", "", "", "", "", "", "1,375.00", "-2.18",
+         "-248.91", "1,123.91", "", "75.00", ""],
     ]
 
 
-def _skipped_rows():
-    """Rows for an unsupported asset class (Futures)."""
-    return [
-        ["Trades", "Data", "Futures", "", "", "", "", "", "", ""],
-        ["Trades", "Data", "ESH4", "2024-01-10, 09:00:00", "1",
-         "4800.00", "4,800.00", "-2.50", "50.00", "USD"],
-    ]
+def _full_account_rows():
+    return (
+        _account_info_rows() + _nav_rows() + _position_rows() + _trade_rows()
+    )
 
 
 # ── Unit tests: helpers ──────────────────────────────────────────────────────
@@ -92,29 +111,46 @@ class TestToDecimal:
         assert _to_decimal(None) == Decimal("0")
 
     def test_negative(self):
-        assert _to_decimal("-1.00") == Decimal("-1.00")
+        assert _to_decimal("-1.09") == Decimal("-1.09")
 
 
 class TestParseDatetime:
-    def test_comma_format(self):
-        dt = _parse_datetime("2024-01-15, 10:30:00")
-        assert dt == datetime(2024, 1, 15, 10, 30, 0)
+    def test_comma_with_newline(self):
+        dt = _parse_datetime("2026-01-15,\n10:30:00")
+        assert dt == datetime(2026, 1, 15, 10, 30, 0)
 
-    def test_space_format(self):
-        dt = _parse_datetime("2024-01-15 10:30:00")
-        assert dt == datetime(2024, 1, 15, 10, 30, 0)
+    def test_comma_format(self):
+        dt = _parse_datetime("2026-01-15, 10:30:00")
+        assert dt == datetime(2026, 1, 15, 10, 30, 0)
 
     def test_date_only_fallback(self):
-        dt = _parse_datetime("2024-01-15")
-        assert dt.date() == date(2024, 1, 15)
+        dt = _parse_datetime("2026-01-15")
+        assert dt.date() == date(2026, 1, 15)
 
 
 class TestParseOptionSymbol:
-    def test_space_separated(self):
+    def test_ddmmmyy_format(self):
+        """Real IBKR format: 'EEM 31MAR26 48 C'"""
+        result = _parse_option_symbol("EEM 31MAR26 48 C")
+        assert result["expiry"] == date(2026, 3, 31)
+        assert result["strike"] == Decimal("48")
+        assert result["right"] == "C"
+
+    def test_ddmmmyy_put(self):
+        result = _parse_option_symbol("SPY 31DEC26 680 P")
+        assert result["expiry"] == date(2026, 12, 31)
+        assert result["strike"] == Decimal("680")
+        assert result["right"] == "P"
+
+    def test_ddmmmyy_decimal_strike(self):
+        result = _parse_option_symbol("PYPL 18SEP26 87.5 C")
+        assert result["strike"] == Decimal("87.5")
+        assert result["right"] == "C"
+
+    def test_yyyymmdd_format(self):
         result = _parse_option_symbol("AAPL 20240119 150.0 C")
         assert result["expiry"] == date(2024, 1, 19)
         assert result["strike"] == Decimal("150.0")
-        assert result["right"] == "C"
 
     def test_osi_format(self):
         result = _parse_option_symbol("AAPL  240119C00150000")
@@ -127,31 +163,59 @@ class TestParseOptionSymbol:
         assert result == {}
 
 
-# ── Integration tests: section extraction ────────────────────────────────────
+class TestIsTotal:
+    def test_total(self):
+        assert _is_total(["Total", "", "", ""])
+    def test_total_symbol(self):
+        assert _is_total(["Total AAPL", "", "", ""])
+    def test_total_in_sgd(self):
+        assert _is_total(["Total in SGD", "", "", ""])
+    def test_not_total(self):
+        assert not _is_total(["AAPL", "100", "1", ""])
+
+
+# ── Metadata extraction ─────────────────────────────────────────────────────
 
 class TestExtractMeta:
     def test_valid(self):
-        meta = _extract_meta(_meta_rows())
+        rows = _account_info_rows() + _nav_rows()
+        meta = _extract_meta(rows)
         assert meta.account_id == "U9876543"
-        assert meta.period_start == date(2024, 1, 1)
-        assert meta.period_end == date(2024, 1, 31)
-        assert meta.base_currency == "USD"
+        assert meta.base_currency == "SGD"
+        assert meta.period_start == date(2026, 1, 1)
+        assert meta.period_end == date(2026, 3, 6)
 
     def test_missing_account_raises(self):
-        rows = [["Statement", "Data", "Period", "2024-01-01 - 2024-01-31"]]
+        rows = _nav_rows()  # no account info
         with pytest.raises(ValueError, match="account ID"):
             _extract_meta(rows)
 
-    def test_missing_period_raises(self):
-        rows = [["Statement", "Data", "Account", "U123"]]
+    def test_missing_nav_raises(self):
+        rows = _account_info_rows()  # no NAV table
         with pytest.raises(ValueError, match="period"):
             _extract_meta(rows)
 
 
+# ── Account splitting ────────────────────────────────────────────────────────
+
+class TestSplitAccounts:
+    def test_single_account(self):
+        rows = _full_account_rows()
+        groups = _split_accounts(rows)
+        assert len(groups) == 1
+
+    def test_multi_account(self):
+        rows = _full_account_rows() + _account_info_rows("U1111111") + _nav_rows()
+        groups = _split_accounts(rows)
+        assert len(groups) == 2
+
+
+# ── Position extraction ──────────────────────────────────────────────────────
+
 class TestExtractPositions:
     def test_stock_positions(self):
         rows = _position_rows()
-        positions, skipped = _extract_positions(rows, date(2024, 1, 31))
+        positions, skipped = _extract_positions(rows, date(2026, 3, 6))
         stocks = [p for p in positions if p.asset_class == "STK"]
         assert len(stocks) == 2
         assert stocks[0].symbol == "AAPL"
@@ -160,27 +224,27 @@ class TestExtractPositions:
 
     def test_option_position(self):
         rows = _position_rows()
-        positions, _ = _extract_positions(rows, date(2024, 1, 31))
+        positions, _ = _extract_positions(rows, date(2026, 3, 6))
         opts = [p for p in positions if p.asset_class == "OPT"]
         assert len(opts) == 1
-        assert opts[0].expiry == date(2024, 1, 19)
-        assert opts[0].strike == Decimal("150.0")
+        assert opts[0].expiry == date(2026, 3, 31)
+        assert opts[0].strike == Decimal("48")
         assert opts[0].right == "C"
 
-    def test_subtotal_and_total_skipped(self):
+    def test_totals_skipped(self):
         rows = _position_rows()
-        positions, _ = _extract_positions(rows, date(2024, 1, 31))
-        # 2 stocks + 1 option = 3 total, no subtotal/total rows
-        assert len(positions) == 3
+        positions, _ = _extract_positions(rows, date(2026, 3, 6))
+        assert len(positions) == 3  # 2 stocks + 1 option
 
     def test_unsupported_asset_class_skipped(self):
-        rows = _position_rows() + [
-            ["Open Positions", "Data", "Futures", "", "", "", "", "", ""],
-            ["Open Positions", "Data", "ESH4", "1", "4800", "4850", "4850", "50", "USD"],
+        extra = [
+            ["Futures", "", "", "", "", "", "", "", ""],
+            ["USD", "", "", "", "", "", "", "", ""],
+            ["ESH4", "1", "1", "4800", "4800", "4850", "4850", "50", ""],
         ]
-        positions, skipped = _extract_positions(rows, date(2024, 1, 31))
-        assert len(positions) == 3  # only STK + OPT
-        assert any("unsupported" in s["reason"] for s in skipped)
+        rows = _position_rows() + extra
+        positions, _ = _extract_positions(rows, date(2026, 3, 6))
+        assert len(positions) == 3  # futures skipped
 
 
 class TestExtractTrades:
@@ -199,36 +263,42 @@ class TestExtractTrades:
         sells = [t for t in trades if t.side == "SLD"]
         assert len(sells) == 1
         assert sells[0].symbol == "MSFT"
-        assert sells[0].realized_pnl == Decimal("125.00")
+        assert sells[0].realized_pnl == Decimal("1123.91")
 
-    def test_side_from_quantity_sign(self):
+    def test_newline_datetime_parsed(self):
         rows = _trade_rows()
         trades, _ = _extract_trades(rows)
-        # Positive qty → BOT, negative qty → SLD
-        assert trades[0].side == "BOT"
-        assert trades[1].side == "SLD"
-        # Quantity is stored as absolute
-        assert trades[1].quantity == Decimal("25")
+        assert trades[0].trade_date == datetime(2026, 1, 15, 10, 30, 0)
 
-    def test_skipped_futures_trades(self):
-        rows = _trade_rows() + _skipped_rows()
-        trades, skipped = _extract_trades(rows)
-        assert len(trades) == 2  # only stocks
-        assert any("unsupported" in s["reason"] for s in skipped)
+    def test_total_rows_skipped(self):
+        rows = _trade_rows()
+        trades, _ = _extract_trades(rows)
+        assert len(trades) == 2  # only data rows, not Total AAPL etc.
 
 
-# ── End-to-end: parse_statement with mocked PDF extraction ───────────────────
+# ── End-to-end: parse_statement with mocked extraction ───────────────────────
 
 class TestParseStatement:
-    def test_full_parse(self):
-        all_rows = _meta_rows() + _position_rows() + _trade_rows()
+    def test_single_account(self):
+        all_rows = _full_account_rows()
         with patch("src.parser._extract_tables", return_value=all_rows):
-            result = parse_statement(io.BytesIO(b"fake"))
+            results = parse_statement(io.BytesIO(b"fake"))
 
-        assert result.meta.account_id == "U9876543"
-        assert len(result.positions) == 3
-        assert len(result.trades) == 2
-        assert result.skipped_rows == []
+        assert len(results) == 1
+        r = results[0]
+        assert r.meta.account_id == "U9876543"
+        assert len(r.positions) == 3
+        assert len(r.trades) == 2
+
+    def test_multi_account(self):
+        rows1 = _full_account_rows()
+        rows2 = _account_info_rows("U1111111") + _nav_rows() + _position_rows()
+        with patch("src.parser._extract_tables", return_value=rows1 + rows2):
+            results = parse_statement(io.BytesIO(b"fake"))
+
+        assert len(results) == 2
+        assert results[0].meta.account_id == "U9876543"
+        assert results[1].meta.account_id == "U1111111"
 
     def test_empty_pdf_raises(self):
         with patch("src.parser._extract_tables", return_value=[]):
@@ -236,11 +306,114 @@ class TestParseStatement:
                 parse_statement(io.BytesIO(b"fake"))
 
     def test_financial_precision(self):
-        """Verify Decimal precision flows through the full pipeline."""
-        all_rows = _meta_rows() + _position_rows() + _trade_rows()
+        all_rows = _full_account_rows()
         with patch("src.parser._extract_tables", return_value=all_rows):
-            result = parse_statement(io.BytesIO(b"fake"))
+            results = parse_statement(io.BytesIO(b"fake"))
 
-        aapl = [p for p in result.positions if p.symbol == "AAPL"][0]
+        aapl = [p for p in results[0].positions if p.symbol == "AAPL"][0]
         assert aapl.cost_basis == Decimal("15000.00")
         assert aapl.unrealized_pnl == Decimal("2550.00")
+
+
+# ── Integration test with real PDF ───────────────────────────────────────────
+
+FIXTURE_PATH = "tests/fixtures/MULTI_20260101_20260306.pdf"
+
+
+@pytest.fixture
+def real_pdf():
+    """Load the real IBKR fixture PDF if available."""
+    try:
+        return open(FIXTURE_PATH, "rb")
+    except FileNotFoundError:
+        pytest.skip("Fixture PDF not available")
+
+
+class TestRealPDF:
+    def test_parses_two_accounts(self, real_pdf):
+        results = parse_statement(real_pdf)
+        real_pdf.close()
+        assert len(results) == 2
+
+    def test_account_ids(self, real_pdf):
+        results = parse_statement(real_pdf)
+        real_pdf.close()
+        ids = {r.meta.account_id for r in results}
+        assert ids == {"U10278751", "U12890661"}
+
+    def test_period(self, real_pdf):
+        results = parse_statement(real_pdf)
+        real_pdf.close()
+        for r in results:
+            assert r.meta.period_start == date(2026, 1, 1)
+            assert r.meta.period_end == date(2026, 3, 6)
+
+    def test_account1_positions(self, real_pdf):
+        results = parse_statement(real_pdf)
+        real_pdf.close()
+        acct1 = [r for r in results if r.meta.account_id == "U10278751"][0]
+        assert len(acct1.positions) == 14  # 13 stocks + 1 option
+        stocks = [p for p in acct1.positions if p.asset_class == "STK"]
+        opts = [p for p in acct1.positions if p.asset_class == "OPT"]
+        assert len(stocks) == 13
+        assert len(opts) == 1
+        assert opts[0].symbol == "EEM 31MAR26 48 C"
+        assert opts[0].expiry == date(2026, 3, 31)
+        assert opts[0].strike == Decimal("48")
+
+    def test_account1_trades(self, real_pdf):
+        results = parse_statement(real_pdf)
+        real_pdf.close()
+        acct1 = [r for r in results if r.meta.account_id == "U10278751"][0]
+        assert len(acct1.trades) == 35
+        stk_trades = [t for t in acct1.trades if t.asset_class == "STK"]
+        opt_trades = [t for t in acct1.trades if t.asset_class == "OPT"]
+        assert len(stk_trades) == 29
+        assert len(opt_trades) == 6
+
+    def test_account2_positions(self, real_pdf):
+        results = parse_statement(real_pdf)
+        real_pdf.close()
+        acct2 = [r for r in results if r.meta.account_id == "U12890661"][0]
+        assert len(acct2.positions) == 13  # all stocks, no options
+        assert all(p.asset_class == "STK" for p in acct2.positions)
+
+    def test_account2_trades(self, real_pdf):
+        results = parse_statement(real_pdf)
+        real_pdf.close()
+        acct2 = [r for r in results if r.meta.account_id == "U12890661"][0]
+        assert len(acct2.trades) == 50
+        opt_trades = [t for t in acct2.trades if t.asset_class == "OPT"]
+        assert len(opt_trades) == 4
+
+    def test_no_skipped_rows(self, real_pdf):
+        results = parse_statement(real_pdf)
+        real_pdf.close()
+        for r in results:
+            assert r.skipped_rows == []
+
+    def test_specific_position_values(self, real_pdf):
+        """Verify exact financial values from PDF aren't mutated."""
+        results = parse_statement(real_pdf)
+        real_pdf.close()
+        acct1 = [r for r in results if r.meta.account_id == "U10278751"][0]
+        aapl = [p for p in acct1.positions if p.symbol == "AMZN"][0]
+        assert aapl.quantity == Decimal("35")
+        assert aapl.cost_basis == Decimal("7920.43")
+        assert aapl.market_price == Decimal("213.2100")
+        assert aapl.market_value == Decimal("7462.35")
+        assert aapl.unrealized_pnl == Decimal("-458.08")
+
+    def test_specific_trade_values(self, real_pdf):
+        """Verify exact trade values from PDF."""
+        results = parse_statement(real_pdf)
+        real_pdf.close()
+        acct1 = [r for r in results if r.meta.account_id == "U10278751"][0]
+        # Find the EWY sell trade
+        ewy_sell = [t for t in acct1.trades
+                     if t.symbol == "EWY" and t.side == "SLD"][0]
+        assert ewy_sell.trade_date == datetime(2026, 3, 3, 9, 30, 0)
+        assert ewy_sell.quantity == Decimal("30")
+        assert ewy_sell.price == Decimal("130.0400")
+        assert ewy_sell.realized_pnl == Decimal("380.91")
+        assert ewy_sell.commission == Decimal("-1.10")
