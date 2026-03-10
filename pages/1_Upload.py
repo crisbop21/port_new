@@ -111,11 +111,15 @@ if uploaded is not None:
         errors = []
         for parsed in statements:
             try:
-                stmt_id = upsert_statement(parsed)
-                st.success(
+                stmt_id, trades_skipped = upsert_statement(parsed)
+                trades_new = len(parsed.trades) - trades_skipped
+                msg = (
                     f"Saved account {parsed.meta.account_id} → `{stmt_id}` "
-                    f"({len(parsed.positions)} positions, {len(parsed.trades)} trades)"
+                    f"({len(parsed.positions)} positions, {trades_new} trades)"
                 )
+                if trades_skipped:
+                    msg += f" — {trades_skipped} duplicate trades skipped"
+                st.success(msg)
                 saved += 1
             except Exception as exc:
                 errors.append(str(exc))

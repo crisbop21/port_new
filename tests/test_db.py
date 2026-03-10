@@ -173,8 +173,9 @@ class TestUpsertStatement:
         client = _make_mock_client()
         mock_get_client.return_value = client
 
-        stmt_id = upsert_statement(parsed_statement)
+        stmt_id, trades_skipped = upsert_statement(parsed_statement)
         assert stmt_id == "stmt-uuid-001"
+        assert trades_skipped == 0
 
     @patch("src.db.get_client")
     def test_upsert_calls_correct_tables(self, mock_get_client, parsed_statement):
