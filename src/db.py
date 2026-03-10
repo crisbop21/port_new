@@ -81,6 +81,28 @@ def _trade_row(trade: Trade, statement_id: str) -> dict:
 
 # ── Upsert ───────────────────────────────────────────────────────────────────
 
+
+def get_existing_period(account_id: str) -> tuple[date, date] | None:
+    """Return (period_start, period_end) for an account, or None if new."""
+    try:
+        result = (
+            get_client()
+            .table("statements")
+            .select("period_start,period_end")
+            .eq("account_id", account_id)
+            .execute()
+        )
+        if result.data:
+            row = result.data[0]
+            return (
+                date.fromisoformat(row["period_start"]),
+                date.fromisoformat(row["period_end"]),
+            )
+    except Exception:
+        logger.debug("Could not fetch existing period for %s", account_id)
+    return None
+
+
 def upsert_statement(parsed: ParsedStatement) -> str:
     """Idempotently save a parsed statement to Supabase.
 

@@ -3,7 +3,7 @@
 import streamlit as st
 
 from src.parser import parse_statement
-from src.db import upsert_statement, clear_query_caches, get_client
+from src.db import upsert_statement, get_existing_period, clear_query_caches, get_client
 
 st.title("Upload IBKR Statement")
 
@@ -74,7 +74,39 @@ if uploaded is not None:
 
     st.divider()
 
-    if st.button("Save to database", type="primary"):
+    # ── Check for narrower-period warnings before saving ────────────────
+    narrower_warnings: dict[str, tuple] = {}
+    for parsed in statements:
+        existing = get_existing_period(parsed.meta.account_id)
+        if existing:
+            old_start, old_end = existing
+            new_start = parsed.meta.period_start
+            new_end = parsed.meta.period_end
+            # Warn if the new PDF covers a narrower window — the user
+            # would lose trades outside the new range.
+            if new_start > old_start or new_end < old_end:
+                narrower_warnings[parsed.meta.account_id] = (
+                    old_start, old_end, new_start, new_end,
+                )
+
+    if narrower_warnings:
+        for acct, (os, oe, ns, ne) in narrower_warnings.items():
+            st.warning(
+                f"**{acct}**: database has trades from **{os}** to **{oe}**, "
+                f"but this PDF only covers **{ns}** to **{ne}**. "
+                f"Saving will **replace all existing data** — trades outside "
+                f"the new range will be lost."
+            )
+        confirm_key = "confirm_narrower"
+        st.checkbox(
+            "I understand — replace existing data with this narrower period",
+            key=confirm_key,
+        )
+        save_blocked = not st.session_state.get(confirm_key, False)
+    else:
+        save_blocked = False
+
+    if st.button("Save to database", type="primary", disabled=save_blocked):
         saved = 0
         errors = []
         for parsed in statements:
