@@ -21,11 +21,11 @@ if uploaded is not None:
         with st.spinner("Parsing PDF..."):
             try:
                 st.session_state[file_key] = parse_statement(uploaded)
-            except ValueError as e:
+            except Exception as e:
                 st.error(f"Failed to parse PDF: {e}")
                 st.stop()
 
-    statements = st.session_state[file_key]
+    statements = st.session_state.get(file_key)
 
     if not statements:
         st.warning("No accounts found in the PDF.")
@@ -76,18 +76,18 @@ if uploaded is not None:
 
     if st.button("Save to database", type="primary"):
         saved = 0
-        with st.spinner("Saving to database..."):
-            for parsed in statements:
-                try:
-                    stmt_id = upsert_statement(parsed)
-                    st.success(
-                        f"Saved account {parsed.meta.account_id} → `{stmt_id}` "
-                        f"({len(parsed.positions)} positions, {len(parsed.trades)} trades)"
-                    )
-                    saved += 1
-                except Exception:
-                    # upsert_statement already calls st.error
-                    pass
+        errors = []
+        for parsed in statements:
+            try:
+                stmt_id = upsert_statement(parsed)
+                st.success(
+                    f"Saved account {parsed.meta.account_id} → `{stmt_id}` "
+                    f"({len(parsed.positions)} positions, {len(parsed.trades)} trades)"
+                )
+                saved += 1
+            except Exception as exc:
+                errors.append(str(exc))
+                st.error(f"Failed to save account {parsed.meta.account_id}: {exc}")
 
         if saved > 0:
             clear_query_caches()
@@ -101,8 +101,16 @@ if uploaded is not None:
                     .execute()
                 )
                 st.info(f"Verification: {verify.count} total statement(s) in database.")
-            except Exception:
-                pass
+            except Exception as exc:
+                st.warning(f"Could not verify: {exc}")
 
         if saved == len(statements):
             st.balloons()
+        elif saved == 0:
+            st.error(
+                "No accounts were saved. Check the errors above.\n\n"
+                "Common causes:\n"
+                "- SUPABASE_KEY is the **anon** key but RLS blocks writes\n"
+                "- Network issue reaching Supabase\n"
+                "- Table schema doesn't match expected columns"
+            )
