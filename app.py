@@ -13,14 +13,22 @@ st.set_page_config(
     layout="wide",
 )
 
-# --- Validate required environment variables ---
+# --- Resolve secrets: prefer env vars, fall back to st.secrets ---
+for var in ("SUPABASE_URL", "SUPABASE_KEY"):
+    if not os.environ.get(var):
+        try:
+            os.environ[var] = st.secrets[var]
+        except (KeyError, FileNotFoundError):
+            pass
+
 REQUIRED_VARS = ("SUPABASE_URL", "SUPABASE_KEY")
-missing = [var for var in REQUIRED_VARS if not os.getenv(var)]
+missing = [var for var in REQUIRED_VARS if not os.environ.get(var)]
 if missing:
     st.error(
-        f"Missing required environment variables: **{', '.join(missing)}**.\n\n"
-        "Set them in your `.env` file (see `.env.example`) or in "
-        "Streamlit Cloud → App settings → Secrets."
+        f"Missing required secrets: **{', '.join(missing)}**.\n\n"
+        "**Local:** set them in your `.env` file (see `.env.example`).\n\n"
+        "**Streamlit Cloud:** add them in App settings → Secrets as:\n"
+        "```\nSUPABASE_URL = \"your-url\"\nSUPABASE_KEY = \"your-key\"\n```"
     )
     st.stop()
 
