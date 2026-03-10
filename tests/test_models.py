@@ -66,6 +66,46 @@ class TestPosition:
         pos = self._stock(market_price=Decimal("175.123456"))
         assert pos.market_price == Decimal("175.123456")
 
+    def test_decimal_zero_preserved(self):
+        """Decimal('0.00') must not become 0 or None."""
+        pos = self._stock(unrealized_pnl=Decimal("0.00"))
+        assert pos.unrealized_pnl == Decimal("0.00")
+        assert isinstance(pos.unrealized_pnl, Decimal)
+
+    def test_decimal_negative_preserved(self):
+        pos = self._stock(unrealized_pnl=Decimal("-458.08"))
+        assert pos.unrealized_pnl == Decimal("-458.08")
+
+    def test_decimal_large_value(self):
+        pos = self._stock(market_value=Decimal("1234567.89"))
+        assert pos.market_value == Decimal("1234567.89")
+
+    def test_decimal_many_places(self):
+        """Financial values must not be silently rounded."""
+        pos = self._stock(market_price=Decimal("9.6783"))
+        assert pos.market_price == Decimal("9.6783")
+
+    def test_option_missing_strike_rejected(self):
+        with pytest.raises(ValidationError):
+            self._stock(asset_class="OPT", expiry=date(2024, 1, 19), right="C")
+
+    def test_option_missing_right_rejected(self):
+        with pytest.raises(ValidationError):
+            self._stock(
+                asset_class="OPT",
+                expiry=date(2024, 1, 19),
+                strike=Decimal("150"),
+            )
+
+    def test_invalid_right_rejected(self):
+        with pytest.raises(ValidationError):
+            self._stock(
+                asset_class="OPT",
+                expiry=date(2024, 1, 19),
+                strike=Decimal("150"),
+                right="X",
+            )
+
 
 class TestTrade:
     def _trade(self, **overrides):
@@ -109,6 +149,20 @@ class TestTrade:
             right="P",
         )
         assert t.right == "P"
+
+    def test_commission_precision(self):
+        """Commission must preserve exact cents."""
+        t = self._trade(commission=Decimal("-1.09"))
+        assert t.commission == Decimal("-1.09")
+
+    def test_proceeds_negative_for_buy(self):
+        t = self._trade(proceeds=Decimal("-8750.00"))
+        assert t.proceeds == Decimal("-8750.00")
+
+    def test_realized_pnl_zero(self):
+        t = self._trade(realized_pnl=Decimal("0"))
+        assert t.realized_pnl == Decimal("0")
+        assert isinstance(t.realized_pnl, Decimal)
 
 
 class TestParsedStatement:

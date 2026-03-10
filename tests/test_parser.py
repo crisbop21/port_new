@@ -163,6 +163,33 @@ class TestParseOptionSymbol:
         assert result == {}
 
 
+class TestToDecimalEdgeCases:
+    def test_whitespace_only(self):
+        assert _to_decimal("   ") == Decimal("0")
+
+    def test_newline_in_value(self):
+        assert _to_decimal("1,234\n.56") == Decimal("1234.56")
+
+    def test_non_numeric_returns_zero(self):
+        assert _to_decimal("N/A") == Decimal("0")
+
+    def test_precision_not_lost(self):
+        """Financial figures must never be silently mutated."""
+        val = _to_decimal("9.6783")
+        assert val == Decimal("9.6783")
+        assert str(val) == "9.6783"
+
+
+class TestParseDatetimeEdgeCases:
+    def test_semicolon_format(self):
+        dt = _parse_datetime("2026-01-15;10:30:00")
+        assert dt == datetime(2026, 1, 15, 10, 30, 0)
+
+    def test_whitespace_padded(self):
+        dt = _parse_datetime("  2026-01-15, 10:30:00  ")
+        assert dt == datetime(2026, 1, 15, 10, 30, 0)
+
+
 class TestIsTotal:
     def test_total(self):
         assert _is_total(["Total", "", "", ""])
@@ -172,6 +199,10 @@ class TestIsTotal:
         assert _is_total(["Total in SGD", "", "", ""])
     def test_not_total(self):
         assert not _is_total(["AAPL", "100", "1", ""])
+    def test_empty_row(self):
+        assert not _is_total([])
+    def test_none_first_cell(self):
+        assert not _is_total([None, "", ""])
 
 
 # ── Metadata extraction ─────────────────────────────────────────────────────
