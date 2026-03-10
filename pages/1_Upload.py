@@ -3,7 +3,7 @@
 import streamlit as st
 
 from src.parser import parse_statement
-from src.db import upsert_statement, clear_query_caches
+from src.db import upsert_statement, clear_query_caches, get_client
 
 st.title("Upload IBKR Statement")
 
@@ -14,12 +14,18 @@ uploaded = st.file_uploader(
 )
 
 if uploaded is not None:
-    with st.spinner("Parsing PDF..."):
-        try:
-            statements = parse_statement(uploaded)
-        except ValueError as e:
-            st.error(f"Failed to parse PDF: {e}")
-            st.stop()
+    # Parse only once per file — store in session_state so the result
+    # survives the rerun triggered by the "Save" button click.
+    file_key = f"parsed_{uploaded.name}_{uploaded.size}"
+    if file_key not in st.session_state:
+        with st.spinner("Parsing PDF..."):
+            try:
+                st.session_state[file_key] = parse_statement(uploaded)
+            except ValueError as e:
+                st.error(f"Failed to parse PDF: {e}")
+                st.stop()
+
+    statements = st.session_state[file_key]
 
     if not statements:
         st.warning("No accounts found in the PDF.")
@@ -85,6 +91,18 @@ if uploaded is not None:
 
         if saved > 0:
             clear_query_caches()
+
+            # Verify data actually landed in Supabase
+            try:
+                client = get_client()
+                verify = (
+                    client.table("statements")
+                    .select("id", count="exact")
+                    .execute()
+                )
+                st.info(f"Verification: {verify.count} total statement(s) in database.")
+            except Exception:
+                pass
 
         if saved == len(statements):
             st.balloons()
