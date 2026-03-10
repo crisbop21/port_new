@@ -110,12 +110,13 @@ def _cleanup_overlaps(
     Returns:
         (trades_removed, positions_removed, statements_absorbed)
     """
-    # Find other statements for the same account
+    # Find all statements for the same account, then filter out the
+    # current one in Python.  (Avoids potential issues with .neq()
+    # across different supabase-py versions.)
     result = (
         client.table("statements")
         .select("id,period_start,period_end")
         .eq("account_id", account_id)
-        .neq("id", new_stmt_id)
         .execute()
     )
 
@@ -127,9 +128,16 @@ def _cleanup_overlaps(
     stmts_to_delete: list[str] = []
 
     for stmt in result.data:
+        # Guard against unexpected response shapes
+        if not isinstance(stmt, dict):
+            logger.warning("Unexpected statement row type: %s — skipping", type(stmt))
+            continue
+        old_id = stmt["id"]
+        # Skip the statement we just upserted
+        if old_id == new_stmt_id:
+            continue
         old_start = date.fromisoformat(stmt["period_start"])
         old_end = date.fromisoformat(stmt["period_end"])
-        old_id = stmt["id"]
 
         # No overlap at all → skip
         if old_end < period_start or old_start > period_end:
