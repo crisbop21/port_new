@@ -5,7 +5,6 @@ import streamlit as st
 
 from src.db import get_positions, get_statements
 
-st.set_page_config(page_title="Holdings", page_icon="📂", layout="wide")
 st.title("Holdings")
 
 # ── Statement selector ───────────────────────────────────────────────────────

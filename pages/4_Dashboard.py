@@ -7,7 +7,6 @@ import streamlit as st
 
 from src.db import get_positions, get_statements, get_trades
 
-st.set_page_config(page_title="Dashboard", page_icon="📊", layout="wide")
 st.title("Dashboard")
 
 # ── Load data ────────────────────────────────────────────────────────────────
