@@ -5,7 +5,6 @@ import streamlit as st
 from src.parser import parse_statement
 from src.db import upsert_statement
 
-st.set_page_config(page_title="Upload Statement", page_icon="📤", layout="wide")
 st.title("Upload IBKR Statement")
 
 uploaded = st.file_uploader(

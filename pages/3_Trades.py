@@ -7,7 +7,6 @@ import streamlit as st
 
 from src.db import get_trades
 
-st.set_page_config(page_title="Trade History", page_icon="📈", layout="wide")
 st.title("Trade History")
 
 # ── Filters ──────────────────────────────────────────────────────────────────
