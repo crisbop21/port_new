@@ -1,5 +1,10 @@
 """Upload page — parse an IBKR PDF and save to Supabase."""
 
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 import streamlit as st
 
 from src.parser import parse_statement
