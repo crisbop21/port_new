@@ -16,6 +16,8 @@ from src.models import ParsedStatement, Position, Trade
 
 logger = logging.getLogger(__name__)
 
+OPTION_MULTIPLIER = 100
+
 
 # ── Client ───────────────────────────────────────────────────────────────────
 
@@ -79,11 +81,62 @@ def _trade_row(trade: Trade, statement_id: str) -> dict:
     }
 
 
+# ── Key / fingerprint helpers ────────────────────────────────────────────────
+
+def _position_key(row: dict) -> tuple:
+    """Unique key for a position/trade: includes option fields for OPT."""
+    if row.get("asset_class") == "OPT":
+        return (row["symbol"], row.get("expiry"), row.get("strike"), row.get("right"))
+    return (row["symbol"],)
+
+
+def _trade_fingerprint(t: dict) -> tuple:
+    """Fingerprint for deduplicating the same trade across overlapping PDFs."""
+    return (
+        t.get("trade_date"), t.get("symbol"), t.get("asset_class"),
+        t.get("side"), str(t.get("quantity")), str(t.get("price")),
+    )
+
+
+def _get_account_statement_ids(account_id: str) -> list[str]:
+    """Get all statement IDs for an account."""
+    result = (
+        get_client()
+        .table("statements")
+        .select("id")
+        .eq("account_id", account_id)
+        .execute()
+    )
+    return [s["id"] for s in result.data] if result.data else []
+
+
+def _get_existing_trade_fingerprints(account_id: str, exclude_statement_id: str | None = None) -> set[tuple]:
+    """Collect fingerprints of all trades already stored for an account."""
+    stmt_ids = _get_account_statement_ids(account_id)
+    if exclude_statement_id:
+        stmt_ids = [s for s in stmt_ids if s != exclude_statement_id]
+    if not stmt_ids:
+        return set()
+
+    fingerprints: set[tuple] = set()
+    client = get_client()
+    for sid in stmt_ids:
+        trades = (
+            client.table("trades")
+            .select("trade_date,symbol,asset_class,side,quantity,price")
+            .eq("statement_id", sid)
+            .execute()
+        )
+        for t in trades.data:
+            fingerprints.add(_trade_fingerprint(t))
+    return fingerprints
+
+
 # ── Upsert ───────────────────────────────────────────────────────────────────
 
 
 def get_existing_period(account_id: str) -> tuple[date, date] | None:
-    """Return (period_start, period_end) for an account, or None if new."""
+    """Return the widest (period_start, period_end) across all statements for an account."""
     try:
         result = (
             get_client()
@@ -93,26 +146,25 @@ def get_existing_period(account_id: str) -> tuple[date, date] | None:
             .execute()
         )
         if result.data:
-            row = result.data[0]
-            return (
-                date.fromisoformat(row["period_start"]),
-                date.fromisoformat(row["period_end"]),
-            )
+            starts = [date.fromisoformat(r["period_start"]) for r in result.data]
+            ends = [date.fromisoformat(r["period_end"]) for r in result.data]
+            return (min(starts), max(ends))
     except Exception:
         logger.debug("Could not fetch existing period for %s", account_id)
     return None
 
 
-def upsert_statement(parsed: ParsedStatement) -> str:
+def upsert_statement(parsed: ParsedStatement) -> tuple[str, int]:
     """Idempotently save a parsed statement to Supabase.
 
-    Upserts the statement row on account_id conflict (one statement per
-    account), then replaces all child positions and trades.  Uploading a
-    new PDF for the same account always fully replaces the old data —
-    no duplicates are possible.
+    Upserts the statement row on (account_id, period_start, period_end)
+    conflict, then replaces positions and deduplicates trades for that
+    statement.  Multiple PDFs for the same account with different periods
+    coexist; trades that already exist in another statement are skipped.
 
     Returns:
-        The statement UUID.
+        (statement_id, trades_skipped) — the UUID and how many duplicate
+        trades were filtered out.
 
     Raises:
         st.error and re-raises on any Supabase/network failure.
@@ -121,7 +173,7 @@ def upsert_statement(parsed: ParsedStatement) -> str:
     meta = parsed.meta
 
     try:
-        # Upsert statement row (account_id is the unique key)
+        # Upsert statement row (unique on account + period)
         stmt_data = {
             "account_id": meta.account_id,
             "period_start": _ser(meta.period_start),
@@ -130,7 +182,7 @@ def upsert_statement(parsed: ParsedStatement) -> str:
         }
         result = (
             client.table("statements")
-            .upsert(stmt_data, on_conflict="account_id")
+            .upsert(stmt_data, on_conflict="account_id,period_start,period_end")
             .execute()
         )
         if not result.data:
@@ -141,8 +193,7 @@ def upsert_statement(parsed: ParsedStatement) -> str:
             )
         statement_id = result.data[0]["id"]
 
-        # Delete old child rows (cascade would handle this on statement
-        # delete, but we're upserting so we need to clean up explicitly)
+        # Delete old child rows for THIS statement only
         client.table("positions").delete().eq(
             "statement_id", statement_id
         ).execute()
@@ -160,21 +211,34 @@ def upsert_statement(parsed: ParsedStatement) -> str:
                     "Check RLS policies on the 'positions' table."
                 )
 
-        # Insert trades
+        # Insert trades — deduplicate against existing trades in other statements
+        trades_skipped = 0
         if parsed.trades:
-            trade_rows = [_trade_row(t, statement_id) for t in parsed.trades]
-            trade_result = client.table("trades").insert(trade_rows).execute()
-            if not trade_result.data:
-                raise RuntimeError(
-                    f"Trades insert returned no data ({len(trade_rows)} rows sent). "
-                    "Check RLS policies on the 'trades' table."
-                )
+            existing_fps = _get_existing_trade_fingerprints(
+                meta.account_id, exclude_statement_id=statement_id,
+            )
+            trade_rows = []
+            for t in parsed.trades:
+                fp = _trade_fingerprint(_trade_row(t, statement_id))
+                if fp in existing_fps:
+                    trades_skipped += 1
+                    continue
+                trade_rows.append(_trade_row(t, statement_id))
+
+            if trade_rows:
+                trade_result = client.table("trades").insert(trade_rows).execute()
+                if not trade_result.data:
+                    raise RuntimeError(
+                        f"Trades insert returned no data ({len(trade_rows)} rows sent). "
+                        "Check RLS policies on the 'trades' table."
+                    )
 
         logger.info(
-            "Upserted statement %s: %d positions, %d trades",
-            statement_id, len(parsed.positions), len(parsed.trades),
+            "Upserted statement %s: %d positions, %d trades (%d dupes skipped)",
+            statement_id, len(parsed.positions),
+            len(parsed.trades) - trades_skipped, trades_skipped,
         )
-        return statement_id
+        return statement_id, trades_skipped
 
     except Exception as e:
         logger.exception("Failed to upsert statement for %s", meta.account_id)
@@ -187,6 +251,7 @@ def clear_query_caches() -> None:
     get_statements.clear()
     get_positions.clear()
     get_trades.clear()
+    reconstruct_holdings.clear()
 
 
 # ── Queries ──────────────────────────────────────────────────────────────────
@@ -270,3 +335,154 @@ def get_trades(
         logger.exception("Failed to fetch trades")
         st.error(f"Database error fetching trades: {e}")
         return []
+
+
+# ── Holdings reconstruction ──────────────────────────────────────────────────
+
+def _get_account_trades_between(account_id: str, after_date: date, up_to_date: date) -> list[dict]:
+    """Fetch deduplicated trades for an account strictly after *after_date* up to *up_to_date*."""
+    stmt_ids = _get_account_statement_ids(account_id)
+    if not stmt_ids:
+        return []
+
+    result = (
+        get_client()
+        .table("trades")
+        .select("*")
+        .in_("statement_id", stmt_ids)
+        .gt("trade_date", after_date.isoformat())
+        .lte("trade_date", f"{up_to_date.isoformat()}T23:59:59")
+        .order("trade_date", desc=False)
+        .execute()
+    )
+
+    seen: set[tuple] = set()
+    unique: list[dict] = []
+    for t in result.data:
+        fp = _trade_fingerprint(t)
+        if fp not in seen:
+            seen.add(fp)
+            unique.append(t)
+    return unique
+
+
+@st.cache_data(ttl=60)
+def reconstruct_holdings(statement_id: str, as_of_date: date) -> list[dict]:
+    """Reconstruct holdings as of *as_of_date*.
+
+    Starts from the Open Positions snapshot attached to *statement_id*
+    (which reflects holdings at that statement's period_end) and reverses
+    trades between *as_of_date* and period_end.
+
+    Options with expiry < as_of_date are filtered out.
+    A ``multiplier`` field (100 for OPT, 1 otherwise) and ``cost_value``
+    (quantity * cost_basis * multiplier) are added to each row.
+    """
+    client = get_client()
+
+    # Statement metadata
+    stmt = (
+        client.table("statements")
+        .select("period_end,account_id")
+        .eq("id", statement_id)
+        .single()
+        .execute()
+    )
+    if not stmt.data:
+        return []
+
+    period_end = date.fromisoformat(stmt.data["period_end"])
+    account_id = stmt.data["account_id"]
+
+    # Seed from snapshot
+    positions = get_positions(statement_id)
+    pos_map: dict[tuple, dict] = {}
+    for p in positions:
+        key = _position_key(p)
+        pos_map[key] = {
+            "symbol": p["symbol"],
+            "asset_class": p["asset_class"],
+            "quantity": Decimal(str(p["quantity"])),
+            "cost_basis": Decimal(str(p["cost_basis"])),
+            "currency": p.get("currency", "USD"),
+            "expiry": p.get("expiry"),
+            "strike": p.get("strike"),
+            "right": p.get("right"),
+            "market_price": p.get("market_price"),
+            "market_value": p.get("market_value"),
+            "unrealized_pnl": p.get("unrealized_pnl"),
+        }
+
+    is_snapshot = as_of_date >= period_end
+
+    if not is_snapshot:
+        # Reverse every trade that happened AFTER as_of_date up to period_end
+        trades = _get_account_trades_between(account_id, as_of_date, period_end)
+
+        for t in trades:
+            key = _position_key(t)
+            qty = Decimal(str(t["quantity"]))
+
+            if key not in pos_map:
+                # Position was fully opened and closed between as_of_date and
+                # period_end — reversing the trade resurfaces it.
+                pos_map[key] = {
+                    "symbol": t["symbol"],
+                    "asset_class": t["asset_class"],
+                    "quantity": Decimal("0"),
+                    "cost_basis": Decimal(str(t["price"])),
+                    "currency": t.get("currency", "USD"),
+                    "expiry": t.get("expiry"),
+                    "strike": t.get("strike"),
+                    "right": t.get("right"),
+                    "market_price": None,
+                    "market_value": None,
+                    "unrealized_pnl": None,
+                }
+
+            if t["side"] == "BOT":
+                pos_map[key]["quantity"] -= qty   # hadn't bought yet
+            else:  # SLD
+                pos_map[key]["quantity"] += qty   # hadn't sold yet
+
+        # Snapshot-only fields are no longer valid for a historical date
+        for pos in pos_map.values():
+            pos["market_price"] = None
+            pos["market_value"] = None
+            pos["unrealized_pnl"] = None
+
+    # Filter and build result
+    result: list[dict] = []
+    for pos in pos_map.values():
+        if pos["quantity"] <= 0:
+            continue
+
+        # Drop expired options
+        if pos["asset_class"] == "OPT" and pos.get("expiry"):
+            expiry_val = pos["expiry"]
+            expiry_date = (
+                date.fromisoformat(expiry_val) if isinstance(expiry_val, str) else expiry_val
+            )
+            if expiry_date < as_of_date:
+                continue
+
+        multiplier = OPTION_MULTIPLIER if pos["asset_class"] == "OPT" else 1
+        cost_value = pos["quantity"] * pos["cost_basis"] * multiplier
+
+        result.append({
+            "symbol": pos["symbol"],
+            "asset_class": pos["asset_class"],
+            "quantity": str(pos["quantity"]),
+            "cost_basis": str(pos["cost_basis"]),
+            "currency": pos["currency"],
+            "expiry": pos.get("expiry"),
+            "strike": pos.get("strike"),
+            "right": pos.get("right"),
+            "multiplier": multiplier,
+            "cost_value": str(cost_value),
+            "market_price": pos.get("market_price"),
+            "market_value": pos.get("market_value"),
+            "unrealized_pnl": pos.get("unrealized_pnl"),
+        })
+
+    return sorted(result, key=lambda r: r["symbol"])
