@@ -109,6 +109,12 @@ def upsert_statement(parsed: ParsedStatement) -> str:
             .upsert(stmt_data, on_conflict="account_id,period_start,period_end")
             .execute()
         )
+        if not result.data:
+            raise RuntimeError(
+                "Statement upsert returned no data. "
+                "Check that RLS policies allow INSERT/UPDATE on the 'statements' table "
+                "for your API key."
+            )
         statement_id = result.data[0]["id"]
 
         # Delete old child rows (cascade would handle this on statement
@@ -120,15 +126,25 @@ def upsert_statement(parsed: ParsedStatement) -> str:
             "statement_id", statement_id
         ).execute()
 
-        # Insert positions in batches
+        # Insert positions
         if parsed.positions:
             pos_rows = [_position_row(p, statement_id) for p in parsed.positions]
-            client.table("positions").insert(pos_rows).execute()
+            pos_result = client.table("positions").insert(pos_rows).execute()
+            if not pos_result.data:
+                raise RuntimeError(
+                    f"Positions insert returned no data ({len(pos_rows)} rows sent). "
+                    "Check RLS policies on the 'positions' table."
+                )
 
-        # Insert trades in batches
+        # Insert trades
         if parsed.trades:
             trade_rows = [_trade_row(t, statement_id) for t in parsed.trades]
-            client.table("trades").insert(trade_rows).execute()
+            trade_result = client.table("trades").insert(trade_rows).execute()
+            if not trade_result.data:
+                raise RuntimeError(
+                    f"Trades insert returned no data ({len(trade_rows)} rows sent). "
+                    "Check RLS policies on the 'trades' table."
+                )
 
         logger.info(
             "Upserted statement %s: %d positions, %d trades",
@@ -140,6 +156,13 @@ def upsert_statement(parsed: ParsedStatement) -> str:
         logger.exception("Failed to upsert statement for %s", meta.account_id)
         st.error(f"Database error saving statement: {e}")
         raise
+
+
+def clear_query_caches() -> None:
+    """Clear all cached query results so fresh data is fetched."""
+    get_statements.clear()
+    get_positions.clear()
+    get_trades.clear()
 
 
 # ── Queries ──────────────────────────────────────────────────────────────────

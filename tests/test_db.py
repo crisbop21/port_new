@@ -146,8 +146,10 @@ def _make_mock_client():
         )
         # delete chain
         table.delete.return_value.eq.return_value.execute.return_value = MagicMock(data=[])
-        # insert chain
-        table.insert.return_value.execute.return_value = MagicMock(data=[])
+        # insert chain — return a row to indicate successful insert
+        table.insert.return_value.execute.return_value = MagicMock(
+            data=[{"id": "row-uuid-001"}]
+        )
         # select chain (for queries)
         select = table.select.return_value
         select.eq.return_value = select

@@ -3,7 +3,7 @@
 import streamlit as st
 
 from src.parser import parse_statement
-from src.db import upsert_statement
+from src.db import upsert_statement, clear_query_caches
 
 st.title("Upload IBKR Statement")
 
@@ -82,6 +82,9 @@ if uploaded is not None:
                 except Exception:
                     # upsert_statement already calls st.error
                     pass
+
+        if saved > 0:
+            clear_query_caches()
 
         if saved == len(statements):
             st.balloons()
