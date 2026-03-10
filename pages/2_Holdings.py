@@ -29,7 +29,8 @@ selected_id = st.selectbox(
 
 # ── Load positions ───────────────────────────────────────────────────────────
 
-rows = get_positions(selected_id)
+with st.spinner("Loading positions..."):
+    rows = get_positions(selected_id)
 
 if not rows:
     st.warning("No positions found for this statement.")
