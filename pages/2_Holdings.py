@@ -9,7 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import pandas as pd
 import streamlit as st
 
-from src.db import check_coverage_gap, get_statements, reconstruct_holdings
+from src.db import check_coverage_gap, get_statements, reconcile_holdings, reconstruct_holdings
 
 st.title("Holdings")
 
@@ -165,3 +165,76 @@ for asset_class, group in df.groupby("asset_class", sort=True):
             "multiplier": st.column_config.NumberColumn("Mult", format="%d"),
         },
     )
+
+# ── Data integrity: reconciliation check ─────────────────────────────────────
+
+st.divider()
+st.subheader("Data Integrity Check")
+st.caption(
+    "Rolls forward from the earliest snapshot through all trades to the latest "
+    "snapshot, then compares. Mismatches indicate missing trades, duplicate "
+    "entries, or corporate actions not captured in the statement."
+)
+
+target_accounts = list(accounts.keys()) if selected_account == "All Accounts" else [selected_account]
+
+for acct in target_accounts:
+    result = reconcile_holdings(acct)
+
+    if result.get("skipped"):
+        st.info(f"**{acct}**: {result['skipped']}")
+        continue
+
+    header = f"**{acct}** — {result['base_date']} → {result['target_date']}"
+
+    if result["coverage_gap"]:
+        st.warning(f"{header}: Coverage gap detected — {result['coverage_gap']}")
+
+    if result["ok"]:
+        st.success(f"{header}: Reconciliation passed — initial + trades = final snapshot.")
+    else:
+        st.error(f"{header}: Reconciliation FAILED — differences found below.")
+
+        if result["mismatches"]:
+            with st.expander(f"Quantity mismatches ({len(result['mismatches'])})", expanded=True):
+                st.dataframe(
+                    pd.DataFrame(result["mismatches"]),
+                    use_container_width=True,
+                    column_config={
+                        "expected_qty": "Snapshot Qty",
+                        "reconstructed_qty": "Reconstructed Qty",
+                        "diff": "Difference",
+                    },
+                )
+
+        if result["missing_from_reconstruction"]:
+            with st.expander(
+                f"In snapshot but not reconstructed ({len(result['missing_from_reconstruction'])})",
+                expanded=True,
+            ):
+                st.caption(
+                    "These positions appear in the latest snapshot but could not be "
+                    "built from the earliest snapshot + trades. Possible causes: "
+                    "missing statement covering the period when these were bought, "
+                    "or corporate action (spin-off, merger)."
+                )
+                st.dataframe(
+                    pd.DataFrame(result["missing_from_reconstruction"]),
+                    use_container_width=True,
+                )
+
+        if result["extra_in_reconstruction"]:
+            with st.expander(
+                f"Reconstructed but not in snapshot ({len(result['extra_in_reconstruction'])})",
+                expanded=True,
+            ):
+                st.caption(
+                    "These positions show up when rolling forward but are absent "
+                    "from the latest snapshot. Possible causes: position was closed "
+                    "by a trade missing from the database, option expired/exercised, "
+                    "or corporate action."
+                )
+                st.dataframe(
+                    pd.DataFrame(result["extra_in_reconstruction"]),
+                    use_container_width=True,
+                )

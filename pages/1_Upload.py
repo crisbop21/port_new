@@ -8,7 +8,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import streamlit as st
 
 from src.parser import parse_statement
-from src.db import upsert_statement, check_duplicates, clear_query_caches, get_client
+from src.db import (
+    upsert_statement,
+    check_duplicates,
+    check_coverage_gap,
+    reconcile_holdings,
+    clear_query_caches,
+    get_client,
+)
 
 st.title("Upload IBKR Statement")
 
@@ -155,6 +162,42 @@ if uploaded is not None:
                 st.info(f"Verification: {verify.count} total statement(s) in database.")
             except Exception as exc:
                 st.warning(f"Could not verify: {exc}")
+
+        # ── Post-save: gap & reconciliation alerts ────────────────────
+        if saved > 0:
+            st.divider()
+            st.subheader("Post-upload integrity check")
+            for parsed in statements:
+                acct = parsed.meta.account_id
+
+                gap = check_coverage_gap(acct, parsed.meta.period_end)
+                if gap:
+                    st.warning(
+                        f"**{acct}** — Coverage gap: {gap} "
+                        "Upload the missing statement(s) to fill the gap."
+                    )
+
+                recon = reconcile_holdings(acct)
+                if recon.get("skipped"):
+                    st.info(f"**{acct}**: {recon['skipped']}")
+                elif recon["ok"]:
+                    st.success(
+                        f"**{acct}**: Reconciliation passed — "
+                        f"earliest snapshot ({recon['base_date']}) + trades "
+                        f"= latest snapshot ({recon['target_date']})."
+                    )
+                else:
+                    problems = (
+                        len(recon["mismatches"])
+                        + len(recon["missing_from_reconstruction"])
+                        + len(recon["extra_in_reconstruction"])
+                    )
+                    st.error(
+                        f"**{acct}**: Reconciliation FAILED — {problems} difference(s) "
+                        f"between earliest ({recon['base_date']}) + trades and "
+                        f"latest snapshot ({recon['target_date']}). "
+                        "Go to **Holdings** for details."
+                    )
 
         if saved == len(statements):
             st.balloons()

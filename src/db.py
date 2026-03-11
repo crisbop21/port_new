@@ -791,3 +791,129 @@ def reconstruct_holdings(account_id: str, as_of_date: date) -> list[dict]:
         })
 
     return sorted(result, key=lambda r: r["symbol"])
+
+
+def reconcile_holdings(account_id: str) -> dict:
+    """Verify data integrity by rolling forward from the earliest snapshot to
+    the latest and comparing against the actual latest snapshot.
+
+    Returns a dict with:
+        ok: bool — True if reconstructed matches the actual snapshot
+        base_date: str — period_end of the earliest snapshot used
+        target_date: str — period_end of the latest snapshot compared against
+        mismatches: list[dict] — per-symbol details where qty differs
+            Each dict has: symbol, expected_qty (from snapshot), reconstructed_qty, diff
+        missing_from_reconstruction: list[dict] — in snapshot but not reconstructed
+        extra_in_reconstruction: list[dict] — reconstructed but not in snapshot
+        coverage_gap: str | None — gap warning if applicable
+    """
+    stmts = _get_account_statements(account_id)
+    if len(stmts) < 2:
+        return {
+            "ok": True,
+            "base_date": stmts[0]["period_end"] if stmts else None,
+            "target_date": stmts[0]["period_end"] if stmts else None,
+            "mismatches": [],
+            "missing_from_reconstruction": [],
+            "extra_in_reconstruction": [],
+            "coverage_gap": None,
+            "skipped": "Need at least 2 statements to reconcile.",
+        }
+
+    earliest = stmts[0]
+    latest = stmts[-1]
+    earliest_end = date.fromisoformat(earliest["period_end"])
+    latest_end = date.fromisoformat(latest["period_end"])
+
+    # Check coverage between earliest and latest
+    coverage_gap = check_coverage_gap(account_id, latest_end)
+
+    # Build reconstructed positions: earliest snapshot + all trades forward
+    base_positions = get_positions(earliest["id"])
+    pos_map: dict[tuple, dict] = {}
+    for p in base_positions:
+        key = _position_key(p)
+        pos_map[key] = {
+            "symbol": p["symbol"],
+            "asset_class": p["asset_class"],
+            "quantity": Decimal(str(p["quantity"])),
+        }
+
+    trades = _get_account_trades_between(account_id, earliest_end, latest_end)
+    for t in trades:
+        key = _position_key(t)
+        qty = Decimal(str(t["quantity"]))
+        if key not in pos_map:
+            pos_map[key] = {
+                "symbol": t["symbol"],
+                "asset_class": t["asset_class"],
+                "quantity": Decimal("0"),
+            }
+        if t["side"] == "BOT":
+            pos_map[key]["quantity"] += qty
+        else:
+            pos_map[key]["quantity"] -= qty
+
+    # Filter out zero/negative and expired options
+    reconstructed: dict[tuple, Decimal] = {}
+    for key, pos in pos_map.items():
+        if pos["quantity"] <= 0:
+            continue
+        # Skip expired options
+        if pos["asset_class"] == "OPT" and len(key) == 4 and key[1]:
+            expiry_val = key[1]
+            expiry_date = (
+                date.fromisoformat(expiry_val) if isinstance(expiry_val, str) else expiry_val
+            )
+            if expiry_date < latest_end:
+                continue
+        reconstructed[key] = pos["quantity"]
+
+    # Build actual latest snapshot
+    actual_positions = get_positions(latest["id"])
+    actual: dict[tuple, Decimal] = {}
+    for p in actual_positions:
+        key = _position_key(p)
+        actual[key] = Decimal(str(p["quantity"]))
+
+    # Compare
+    all_keys = set(reconstructed.keys()) | set(actual.keys())
+    mismatches = []
+    missing_from_reconstruction = []
+    extra_in_reconstruction = []
+
+    for key in sorted(all_keys, key=lambda k: k[0]):
+        r_qty = reconstructed.get(key, Decimal("0"))
+        a_qty = actual.get(key, Decimal("0"))
+
+        symbol = key[0]
+
+        if key not in reconstructed and key in actual:
+            missing_from_reconstruction.append({
+                "symbol": symbol,
+                "expected_qty": str(a_qty),
+            })
+        elif key in reconstructed and key not in actual:
+            extra_in_reconstruction.append({
+                "symbol": symbol,
+                "reconstructed_qty": str(r_qty),
+            })
+        elif r_qty != a_qty:
+            mismatches.append({
+                "symbol": symbol,
+                "expected_qty": str(a_qty),
+                "reconstructed_qty": str(r_qty),
+                "diff": str(r_qty - a_qty),
+            })
+
+    ok = not mismatches and not missing_from_reconstruction and not extra_in_reconstruction
+
+    return {
+        "ok": ok,
+        "base_date": earliest["period_end"],
+        "target_date": latest["period_end"],
+        "mismatches": mismatches,
+        "missing_from_reconstruction": missing_from_reconstruction,
+        "extra_in_reconstruction": extra_in_reconstruction,
+        "coverage_gap": coverage_gap,
+    }
