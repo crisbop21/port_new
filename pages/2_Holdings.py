@@ -9,7 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import pandas as pd
 import streamlit as st
 
-from src.db import get_statements, reconstruct_holdings
+from src.db import check_coverage_gap, get_statements, reconstruct_holdings
 
 st.title("Holdings")
 
@@ -21,7 +21,7 @@ if not statements:
     st.info("No statements uploaded yet. Go to **Upload** to import a PDF.")
     st.stop()
 
-# Group statements by account; track widest date range and latest statement
+# Group statements by account; track widest date range
 accounts: dict[str, dict] = {}
 for s in statements:
     acct = s["account_id"]
@@ -29,14 +29,12 @@ for s in statements:
     p_end = date.fromisoformat(s["period_end"])
     if acct not in accounts:
         accounts[acct] = {
-            "latest_id": s["id"],
             "period_start": p_start,
             "period_end": p_end,
         }
     else:
         info = accounts[acct]
         if p_end > info["period_end"]:
-            info["latest_id"] = s["id"]
             info["period_end"] = p_end
         if p_start < info["period_start"]:
             info["period_start"] = p_start
@@ -60,20 +58,40 @@ as_of = st.date_input(
     value=acct_info["period_end"],
     min_value=acct_info["period_start"],
     max_value=acct_info["period_end"],
-    help="Positions are reconstructed by reversing trades after this date.",
+    help="Positions are reconstructed from the nearest prior snapshot plus subsequent trades.",
 )
 
 is_historical = as_of < acct_info["period_end"]
+
+# ── Coverage-gap check ──────────────────────────────────────────────────────
+
+if is_historical:
+    if selected_account == "All Accounts":
+        gap_warnings = {
+            acct: check_coverage_gap(acct, as_of)
+            for acct in accounts
+        }
+        gap_warnings = {k: v for k, v in gap_warnings.items() if v is not None}
+    else:
+        gap_msg = check_coverage_gap(selected_account, as_of)
+        gap_warnings = {selected_account: gap_msg} if gap_msg else {}
+
+    if gap_warnings:
+        for acct, msg in gap_warnings.items():
+            st.warning(
+                f"**{acct}**: {msg} "
+                "Reconstructed holdings may be inaccurate — upload the missing statement(s)."
+            )
 
 # ── Reconstruct holdings ────────────────────────────────────────────────────
 
 with st.spinner("Reconstructing holdings..."):
     if selected_account == "All Accounts":
         rows = []
-        for acct, info in accounts.items():
-            rows.extend(reconstruct_holdings(info["latest_id"], as_of))
+        for acct in accounts:
+            rows.extend(reconstruct_holdings(acct, as_of))
     else:
-        rows = reconstruct_holdings(accounts[selected_account]["latest_id"], as_of)
+        rows = reconstruct_holdings(selected_account, as_of)
 
 if not rows:
     st.warning("No holdings found as of this date.")
