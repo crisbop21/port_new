@@ -123,6 +123,65 @@ else:
 
 st.divider()
 
+# ── Consolidated cost basis per symbol ─────────────────────────────────────
+
+st.subheader("Cost Basis by Symbol")
+
+# Build consolidated view: for options use strike*100*contracts, else qty*cost_basis
+consol_rows = []
+for _, row in df.iterrows():
+    if row["asset_class"] == "OPT":
+        value = float(row.get("strike", 0) or 0) * 100 * abs(float(row["quantity"]))
+    else:
+        value = abs(float(row["quantity"])) * float(row["cost_basis"])
+    consol_rows.append({"symbol": row["symbol"], "cost_value": value})
+
+consol_df = pd.DataFrame(consol_rows).groupby("symbol", as_index=False)["cost_value"].sum()
+total_cost = consol_df["cost_value"].sum()
+consol_df["pct_of_account"] = (
+    (consol_df["cost_value"] / total_cost * 100) if total_cost else 0.0
+)
+consol_df = consol_df.sort_values("cost_value", ascending=False).reset_index(drop=True)
+
+col_table, col_chart = st.columns([1, 1])
+
+with col_table:
+    st.dataframe(
+        consol_df.rename(columns={
+            "symbol": "Symbol",
+            "cost_value": "Cost Basis ($)",
+            "pct_of_account": "% of Account",
+        }),
+        use_container_width=True,
+        column_config={
+            "Cost Basis ($)": st.column_config.NumberColumn(format="$%.2f"),
+            "% of Account": st.column_config.NumberColumn(format="%.1f%%"),
+        },
+        hide_index=True,
+    )
+
+with col_chart:
+    import altair as alt
+
+    chart_data = consol_df.copy()
+    pie = (
+        alt.Chart(chart_data)
+        .mark_arc(innerRadius=50)
+        .encode(
+            theta=alt.Theta("cost_value:Q", title="Cost Basis"),
+            color=alt.Color("symbol:N", title="Symbol"),
+            tooltip=[
+                alt.Tooltip("symbol:N", title="Symbol"),
+                alt.Tooltip("cost_value:Q", title="Cost Basis", format="$,.2f"),
+                alt.Tooltip("pct_of_account:Q", title="% of Account", format=".1f"),
+            ],
+        )
+        .properties(height=350)
+    )
+    st.altair_chart(pie, use_container_width=True)
+
+st.divider()
+
 # ── Table grouped by asset class ────────────────────────────────────────────
 
 if has_market_data:
