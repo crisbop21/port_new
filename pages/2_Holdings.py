@@ -1,4 +1,4 @@
-"""Holdings page — reconstruct positions as of any date in the statement range."""
+"""Holdings page — view positions as of any snapshot date and reconcile."""
 
 import sys
 from datetime import date
@@ -10,94 +10,78 @@ import pandas as pd
 import streamlit as st
 
 from src.db import (
-    check_coverage_gap,
-    get_statements,
-    reconcile_holdings,
-    reconcile_holdings_detail,
-    reconstruct_holdings,
+    get_account_ids,
+    get_positions_as_of,
+    get_snapshot_dates,
+    reconcile_account,
+    reconcile_pair,
 )
 
 st.title("Holdings")
 
-# ── Statement selector ───────────────────────────────────────────────────────
+# ── Account selector ────────────────────────────────────────────────────────
 
-statements = get_statements()
+account_ids = get_account_ids()
 
-if not statements:
+if not account_ids:
     st.info("No statements uploaded yet. Go to **Upload** to import a PDF.")
     st.stop()
 
-# Group statements by account; track widest date range
-accounts: dict[str, dict] = {}
-for s in statements:
-    acct = s["account_id"]
-    p_start = date.fromisoformat(s["period_start"])
-    p_end = date.fromisoformat(s["period_end"])
-    if acct not in accounts:
-        accounts[acct] = {
-            "period_start": p_start,
-            "period_end": p_end,
-        }
-    else:
-        info = accounts[acct]
-        if p_end > info["period_end"]:
-            info["period_end"] = p_end
-        if p_start < info["period_start"]:
-            info["period_start"] = p_start
-
-account_list = list(accounts.keys())
-account_options = ["All Accounts"] + account_list
+account_options = ["All Accounts"] + account_ids
 selected_account = st.selectbox("Account", account_options)
 
+# ── Collect snapshot dates per account ──────────────────────────────────────
+
 if selected_account == "All Accounts":
-    # Merge date ranges across all accounts
-    all_start = min(info["period_start"] for info in accounts.values())
-    all_end = max(info["period_end"] for info in accounts.values())
-    acct_info = {"period_start": all_start, "period_end": all_end}
+    target_accounts = account_ids
 else:
-    acct_info = accounts[selected_account]
+    target_accounts = [selected_account]
 
-# ── Date picker ──────────────────────────────────────────────────────────────
+snapshot_dates_by_acct: dict[str, list[date]] = {}
+for acct in target_accounts:
+    snapshot_dates_by_acct[acct] = get_snapshot_dates(acct)
 
-as_of = st.date_input(
-    "As-of date",
-    value=acct_info["period_end"],
-    min_value=acct_info["period_start"],
-    max_value=acct_info["period_end"],
-    help="Positions are reconstructed from the nearest prior snapshot plus subsequent trades.",
+all_snapshot_dates = sorted(
+    {d for dates in snapshot_dates_by_acct.values() for d in dates}
 )
 
-is_historical = as_of < acct_info["period_end"]
+if not all_snapshot_dates:
+    st.warning("No position snapshots found. Upload a statement with positions.")
+    st.stop()
 
-# ── Coverage-gap check ──────────────────────────────────────────────────────
+# ── Date picker ─────────────────────────────────────────────────────────────
 
-if is_historical:
-    if selected_account == "All Accounts":
-        gap_warnings = {
-            acct: check_coverage_gap(acct, as_of)
-            for acct in accounts
-        }
-        gap_warnings = {k: v for k, v in gap_warnings.items() if v is not None}
-    else:
-        gap_msg = check_coverage_gap(selected_account, as_of)
-        gap_warnings = {selected_account: gap_msg} if gap_msg else {}
+as_of = st.date_input(
+    "As-of date (snapshot)",
+    value=all_snapshot_dates[-1],
+    min_value=all_snapshot_dates[0],
+    max_value=all_snapshot_dates[-1],
+    help="Select a date that matches a position snapshot (statement_date).",
+)
 
-    if gap_warnings:
-        for acct, msg in gap_warnings.items():
-            st.warning(
-                f"**{acct}**: {msg} "
-                "Reconstructed holdings may be inaccurate — upload the missing statement(s)."
-            )
+is_exact_snapshot = as_of in all_snapshot_dates
 
-# ── Reconstruct holdings ────────────────────────────────────────────────────
+if not is_exact_snapshot:
+    st.warning(
+        f"**{as_of}** does not match any snapshot date. "
+        f"Available snapshot dates: {', '.join(d.isoformat() for d in all_snapshot_dates)}"
+    )
+    st.stop()
 
-with st.spinner("Reconstructing holdings..."):
-    if selected_account == "All Accounts":
-        rows = []
-        for acct in accounts:
-            rows.extend(reconstruct_holdings(acct, as_of))
-    else:
-        rows = reconstruct_holdings(selected_account, as_of)
+# ── Load holdings ───────────────────────────────────────────────────────────
+
+with st.spinner("Loading holdings..."):
+    rows: list[dict] = []
+    for acct in target_accounts:
+        positions = get_positions_as_of(acct, as_of)
+        for p in positions:
+            multiplier = 100 if p.get("asset_class") == "OPT" else 1
+            cost_value = float(p["quantity"]) * float(p["cost_basis"]) * multiplier
+            rows.append({
+                **p,
+                "multiplier": multiplier,
+                "cost_value": cost_value,
+            })
 
 if not rows:
     st.warning("No holdings found as of this date.")
@@ -105,7 +89,7 @@ if not rows:
 
 df = pd.DataFrame(rows)
 
-# Convert numeric columns from strings
+# Convert numeric columns
 numeric_cols = [
     "quantity", "cost_basis", "cost_value",
     "market_price", "market_value", "unrealized_pnl", "strike",
@@ -114,20 +98,11 @@ for col in numeric_cols:
     if col in df.columns:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
-# ── Metric cards ─────────────────────────────────────────────────────────────
+# ── Metric cards ────────────────────────────────────────────────────────────
 
-if is_historical:
-    # No market data for historical dates — show cost-based metrics
-    total_cost_value = df["cost_value"].sum()
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Total Cost Value", f"${total_cost_value:,.2f}")
-    col2.metric("Positions", len(df))
-    col3.metric("As-of", str(as_of))
-    st.caption(
-        "Market value and unrealized P&L are unavailable for historical dates "
-        "(no price API). Cost value = quantity × cost basis × multiplier."
-    )
-else:
+has_market_data = "market_value" in df.columns and df["market_value"].notna().any()
+
+if has_market_data:
     total_market_value = df["market_value"].sum()
     total_unrealized = df["unrealized_pnl"].sum()
     col1, col2, col3 = st.columns(3)
@@ -135,21 +110,30 @@ else:
     col2.metric("Unrealized P&L", f"${total_unrealized:,.2f}",
                 delta=f"{total_unrealized:,.2f}")
     col3.metric("Positions", len(df))
+else:
+    total_cost_value = df["cost_value"].sum()
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Total Cost Value", f"${total_cost_value:,.2f}")
+    col2.metric("Positions", len(df))
+    col3.metric("As-of", str(as_of))
+    st.caption(
+        "Market value and unrealized P&L may be unavailable. "
+        "Cost value = quantity x cost basis x multiplier."
+    )
 
 st.divider()
 
-# ── Table grouped by asset class ─────────────────────────────────────────────
+# ── Table grouped by asset class ────────────────────────────────────────────
 
-if is_historical:
-    display_cols = ["symbol", "asset_class", "quantity", "cost_basis", "multiplier", "cost_value"]
-else:
+if has_market_data:
     display_cols = [
         "symbol", "asset_class", "quantity", "cost_basis",
         "multiplier", "cost_value",
         "market_price", "market_value", "unrealized_pnl",
     ]
+else:
+    display_cols = ["symbol", "asset_class", "quantity", "cost_basis", "multiplier", "cost_value"]
 
-# Include option fields if any options exist
 if df["asset_class"].eq("OPT").any():
     display_cols += ["expiry", "strike", "right"]
 
@@ -172,66 +156,55 @@ for asset_class, group in df.groupby("asset_class", sort=True):
         },
     )
 
-# ── Data integrity: reconciliation check ─────────────────────────────────────
+# ── Reconciliation ──────────────────────────────────────────────────────────
 
 st.divider()
-st.subheader("Data Integrity Check")
+st.subheader("Reconciliation")
 st.caption(
-    "Rolls forward from a base snapshot through all trades to a target "
-    "snapshot, then compares. Mismatches indicate missing trades, duplicate "
-    "entries, or corporate actions not captured in the statement."
+    "For each consecutive pair of position snapshots (by statement_date), "
+    "rolls forward from base holdings through trades and compares against "
+    "the next snapshot. Mismatches indicate missing trades, corporate actions, "
+    "or data gaps."
 )
 
-target_accounts = list(accounts.keys()) if selected_account == "All Accounts" else [selected_account]
-
-# Collect available statement dates per account for the date pickers
-_stmt_dates_by_acct: dict[str, list[date]] = {}
-for s in statements:
-    acct = s["account_id"]
-    if acct not in target_accounts:
-        continue
-    d = date.fromisoformat(s["period_end"])
-    _stmt_dates_by_acct.setdefault(acct, []).append(d)
-for acct in _stmt_dates_by_acct:
-    _stmt_dates_by_acct[acct] = sorted(set(_stmt_dates_by_acct[acct]))
-
-# Check if any individual account has enough statements to reconcile
-_any_account_reconcilable = any(
-    len(dates) >= 2 for dates in _stmt_dates_by_acct.values()
+# Check if any account has enough snapshots
+any_reconcilable = any(
+    len(dates) >= 2 for dates in snapshot_dates_by_acct.values()
 )
 
-if not _any_account_reconcilable:
+if not any_reconcilable:
     st.info(
-        "Each account needs at least 2 statements (different period ends) to "
-        "reconcile. Upload more statements to enable this check."
+        "Each account needs at least 2 position snapshots (different statement_dates) "
+        "to reconcile. Upload more statements to enable this."
     )
+    st.stop()
 
-# Combine all statement dates for the date pickers
-_all_stmt_dates = sorted(
-    {d for dates in _stmt_dates_by_acct.values() for d in dates}
+# Optional: pick a specific pair
+all_recon_dates = sorted(
+    {d for dates in snapshot_dates_by_acct.values() for d in dates}
 )
 
 use_custom_dates = False
 custom_base: date | None = None
 custom_target: date | None = None
 
-if _any_account_reconcilable and len(_all_stmt_dates) >= 2:
+if len(all_recon_dates) >= 2:
     use_custom_dates = st.checkbox(
         "Choose reconciliation dates",
-        help="Select specific base and target statement dates instead of earliest/latest.",
+        help="Select specific base and target snapshot dates instead of running all pairs.",
     )
 
-if use_custom_dates and len(_all_stmt_dates) >= 2:
+if use_custom_dates and len(all_recon_dates) >= 2:
     col_b, col_t = st.columns(2)
     with col_b:
         custom_base = st.selectbox(
             "Base date (start from)",
-            options=_all_stmt_dates[:-1],
+            options=all_recon_dates[:-1],
             index=0,
             format_func=lambda d: d.isoformat(),
         )
     with col_t:
-        valid_targets = [d for d in _all_stmt_dates if d > custom_base]
+        valid_targets = [d for d in all_recon_dates if d > custom_base]
         custom_target = st.selectbox(
             "Target date (compare against)",
             options=valid_targets,
@@ -239,162 +212,135 @@ if use_custom_dates and len(_all_stmt_dates) >= 2:
             format_func=lambda d: d.isoformat(),
         )
 
-# Gate reconciliation behind a button so users explicitly trigger it
-_run_reconciliation = False
-if _any_account_reconcilable:
-    _run_reconciliation = st.button("Run Reconciliation", type="primary")
+run_recon = st.button("Run Reconciliation", type="primary")
 
-if not _run_reconciliation:
+if not run_recon:
     st.stop()
 
 for acct in target_accounts:
-    result = reconcile_holdings(acct, base_date=custom_base, target_date=custom_target)
-
-    if result.get("skipped"):
-        st.info(f"**{acct}**: {result['skipped']}")
+    acct_dates = snapshot_dates_by_acct.get(acct, [])
+    if len(acct_dates) < 2:
+        st.info(f"**{acct}**: Only {len(acct_dates)} snapshot(s) — need at least 2 to reconcile.")
         continue
 
-    header = f"**{acct}** — {result['base_date']} → {result['target_date']}"
-
-    if result["coverage_gap"]:
-        st.warning(f"{header}: Coverage gap detected — {result['coverage_gap']}")
-
-    if result["ok"]:
-        st.success(f"{header}: Reconciliation passed — initial + trades = final snapshot.")
+    if use_custom_dates and custom_base and custom_target:
+        # Validate the chosen dates exist for this account
+        if custom_base not in acct_dates or custom_target not in acct_dates:
+            st.info(
+                f"**{acct}**: Selected dates not available for this account. "
+                f"Available: {', '.join(d.isoformat() for d in acct_dates)}"
+            )
+            continue
+        pair_results = [reconcile_pair(acct, custom_base, custom_target)]
     else:
-        st.error(f"{header}: Reconciliation FAILED — differences found below.")
+        pair_results = reconcile_account(acct)
 
-        if result["mismatches"]:
-            with st.expander(f"Quantity mismatches ({len(result['mismatches'])})", expanded=True):
-                st.dataframe(
-                    pd.DataFrame(result["mismatches"]),
-                    use_container_width=True,
-                    column_config={
-                        "expected_qty": "Snapshot Qty",
-                        "reconstructed_qty": "Reconstructed Qty",
-                        "diff": "Difference",
-                    },
-                )
+    st.markdown(f"### {acct}")
 
-        if result["missing_from_reconstruction"]:
+    for result in pair_results:
+        header = f"**{result['base_date']} -> {result['target_date']}**"
+
+        if result["ok"]:
+            st.success(f"{header}: All holdings reconcile.")
+        else:
+            st.error(f"{header}: Reconciliation FAILED — differences found.")
+
+        # Gaps summary
+        gaps = result.get("gaps", {})
+        if gaps.get("missing_from_target"):
             with st.expander(
-                f"In snapshot but not reconstructed ({len(result['missing_from_reconstruction'])})",
+                f"Reconstructed but not in target snapshot ({len(gaps['missing_from_target'])})",
+                expanded=True,
+            ):
+                st.caption(
+                    "These positions exist after rolling forward but are absent from "
+                    "the target snapshot. Possible causes: position closed by a missing "
+                    "trade, option expired/exercised, or corporate action."
+                )
+                st.dataframe(pd.DataFrame(gaps["missing_from_target"]), use_container_width=True)
+
+        if gaps.get("missing_from_reconstruction"):
+            with st.expander(
+                f"In target but not reconstructed ({len(gaps['missing_from_reconstruction'])})",
                 expanded=True,
             ):
                 st.caption(
                     "These positions appear in the target snapshot but could not be "
                     "built from the base snapshot + trades. Possible causes: "
-                    "missing statement covering the period when these were bought, "
-                    "or corporate action (spin-off, merger)."
+                    "missing statement, transfer-in, or corporate action."
                 )
                 st.dataframe(
-                    pd.DataFrame(result["missing_from_reconstruction"]),
+                    pd.DataFrame(gaps["missing_from_reconstruction"]),
                     use_container_width=True,
                 )
 
-        if result["extra_in_reconstruction"]:
-            with st.expander(
-                f"Reconstructed but not in snapshot ({len(result['extra_in_reconstruction'])})",
-                expanded=True,
-            ):
-                st.caption(
-                    "These positions show up when rolling forward but are absent "
-                    "from the target snapshot. Possible causes: position was closed "
-                    "by a trade missing from the database, option expired/exercised, "
-                    "or corporate action."
-                )
+        # Per-holding detail
+        if result["holdings"]:
+            summary_rows = []
+            for symbol, h in result["holdings"].items():
+                summary_rows.append({
+                    "Symbol": symbol,
+                    "Base Qty": h["base_qty"],
+                    "Trades": len(h["trades"]),
+                    "Reconstructed Qty": h["reconstructed_qty"],
+                    "Expected Qty": h["expected_qty"],
+                    "Diff": h["diff"],
+                    "Match": h["match"],
+                })
+
+            summary_df = pd.DataFrame(summary_rows)
+            for col in ["Base Qty", "Reconstructed Qty", "Expected Qty", "Diff"]:
+                summary_df[col] = pd.to_numeric(summary_df[col], errors="coerce")
+
+            mismatched = summary_df[~summary_df["Match"]].reset_index(drop=True)
+            matched = summary_df[summary_df["Match"]].reset_index(drop=True)
+
+            if not mismatched.empty:
+                st.error(f"{len(mismatched)} holding(s) do not match:")
                 st.dataframe(
-                    pd.DataFrame(result["extra_in_reconstruction"]),
-                    use_container_width=True,
-                )
-
-# ── Per-holding reconciliation detail ────────────────────────────────────────
-
-st.divider()
-st.subheader("Per-Holding Reconciliation Detail")
-st.caption(
-    "Shows the starting quantity from the base snapshot, every trade applied "
-    "with a running balance, and whether the final quantity matches the "
-    "target snapshot. Expand any holding to see its full trade ledger."
-)
-
-for acct in target_accounts:
-    detail = reconcile_holdings_detail(acct, base_date=custom_base, target_date=custom_target)
-
-    if detail.get("skipped"):
-        st.info(f"**{acct}**: {detail['skipped']}")
-        continue
-
-    st.markdown(f"**{acct}** — {detail['base_date']} to {detail['target_date']}")
-
-    if not detail["holdings"]:
-        st.info("No holdings to reconcile.")
-        continue
-
-    # Build summary table
-    summary_rows = []
-    for symbol, h in detail["holdings"].items():
-        summary_rows.append({
-            "Symbol": symbol,
-            "Base Qty": h["base_qty"],
-            "Trades": len(h["trades"]),
-            "Final Qty": h["final_qty"],
-            "Expected Qty": h["expected_qty"],
-            "Match": h["match"],
-        })
-
-    summary_df = pd.DataFrame(summary_rows)
-    for col in ["Base Qty", "Final Qty", "Expected Qty"]:
-        summary_df[col] = pd.to_numeric(summary_df[col], errors="coerce")
-
-    # Show mismatches first
-    mismatched = summary_df[~summary_df["Match"]].reset_index(drop=True)
-    matched = summary_df[summary_df["Match"]].reset_index(drop=True)
-
-    if not mismatched.empty:
-        st.error(f"{len(mismatched)} holding(s) do not match:")
-        st.dataframe(
-            mismatched,
-            use_container_width=True,
-            column_config={
-                "Base Qty": st.column_config.NumberColumn(format="%.4f"),
-                "Final Qty": st.column_config.NumberColumn(format="%.4f"),
-                "Expected Qty": st.column_config.NumberColumn(format="%.4f"),
-            },
-        )
-
-    if not matched.empty:
-        with st.expander(f"{len(matched)} holding(s) match", expanded=False):
-            st.dataframe(
-                matched,
-                use_container_width=True,
-                column_config={
-                    "Base Qty": st.column_config.NumberColumn(format="%.4f"),
-                    "Final Qty": st.column_config.NumberColumn(format="%.4f"),
-                    "Expected Qty": st.column_config.NumberColumn(format="%.4f"),
-                },
-            )
-
-    # Per-holding trade ledger expanders
-    for symbol, h in detail["holdings"].items():
-        status = "OK" if h["match"] else "MISMATCH"
-        with st.expander(
-            f"{symbol}: {h['base_qty']} -> {h['final_qty']} "
-            f"(expected {h['expected_qty']}) [{status}]",
-            expanded=not h["match"],
-        ):
-            if not h["trades"]:
-                st.caption("No trades in this period.")
-            else:
-                ledger_df = pd.DataFrame(h["trades"])
-                ledger_df.columns = ["Date", "Side", "Quantity", "Running Qty"]
-                for col in ["Quantity", "Running Qty"]:
-                    ledger_df[col] = pd.to_numeric(ledger_df[col], errors="coerce")
-                st.dataframe(
-                    ledger_df,
+                    mismatched,
                     use_container_width=True,
                     column_config={
-                        "Quantity": st.column_config.NumberColumn(format="%.4f"),
-                        "Running Qty": st.column_config.NumberColumn(format="%.4f"),
+                        "Base Qty": st.column_config.NumberColumn(format="%.4f"),
+                        "Reconstructed Qty": st.column_config.NumberColumn(format="%.4f"),
+                        "Expected Qty": st.column_config.NumberColumn(format="%.4f"),
+                        "Diff": st.column_config.NumberColumn(format="%.4f"),
                     },
                 )
+
+            if not matched.empty:
+                with st.expander(f"{len(matched)} holding(s) match", expanded=False):
+                    st.dataframe(
+                        matched,
+                        use_container_width=True,
+                        column_config={
+                            "Base Qty": st.column_config.NumberColumn(format="%.4f"),
+                            "Reconstructed Qty": st.column_config.NumberColumn(format="%.4f"),
+                            "Expected Qty": st.column_config.NumberColumn(format="%.4f"),
+                            "Diff": st.column_config.NumberColumn(format="%.4f"),
+                        },
+                    )
+
+            # Per-holding trade ledger expanders
+            for symbol, h in result["holdings"].items():
+                status = "OK" if h["match"] else "MISMATCH"
+                with st.expander(
+                    f"{symbol}: {h['base_qty']} -> {h['reconstructed_qty']} "
+                    f"(expected {h['expected_qty']}) [{status}]",
+                    expanded=not h["match"],
+                ):
+                    if not h["trades"]:
+                        st.caption("No trades in this period.")
+                    else:
+                        ledger_df = pd.DataFrame(h["trades"])
+                        ledger_df.columns = ["Date", "Side", "Quantity", "Running Qty"]
+                        for col in ["Quantity", "Running Qty"]:
+                            ledger_df[col] = pd.to_numeric(ledger_df[col], errors="coerce")
+                        st.dataframe(
+                            ledger_df,
+                            use_container_width=True,
+                            column_config={
+                                "Quantity": st.column_config.NumberColumn(format="%.4f"),
+                                "Running Qty": st.column_config.NumberColumn(format="%.4f"),
+                            },
+                        )

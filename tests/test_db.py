@@ -487,45 +487,38 @@ class TestFingerprints:
         )
 
 
-# ── reconcile_holdings tests ──────────────────────────────────────────────
+# ── reconcile_pair tests ──────────────────────────────────────────────────
 
 
-class TestReconcileHoldings:
-    """Tests for reconcile_holdings with optional base_date/target_date.
+class TestReconcilePair:
+    """Tests for reconcile_pair — statement_date-driven reconciliation."""
 
-    Mocks the internal helpers directly rather than the Supabase client to
-    keep tests focused on the reconciliation logic.
-    """
+    @patch("src.db.get_trades_between", return_value=[])
+    @patch("src.db.get_positions_as_of")
+    def test_exact_match(self, mock_pos, mock_trades):
+        from src.db import reconcile_pair
 
-    @patch("src.db.check_coverage_gap", return_value=None)
-    @patch("src.db._get_account_trades_between", return_value=[])
-    @patch("src.db.get_positions", return_value=[])
-    @patch("src.db._get_account_statements")
-    def test_single_statement_skips(self, mock_stmts, mock_pos, mock_trades, mock_cov):
-        from src.db import reconcile_holdings
+        def _positions(account_id, as_of_date):
+            if as_of_date == date(2026, 1, 31):
+                return [{"symbol": "AAPL", "asset_class": "STK", "quantity": "100",
+                         "expiry": None, "strike": None, "right": None}]
+            return [{"symbol": "AAPL", "asset_class": "STK", "quantity": "100",
+                     "expiry": None, "strike": None, "right": None}]
 
-        mock_stmts.return_value = [
-            {"id": "s1", "period_start": "2026-01-01", "period_end": "2026-01-31"},
-        ]
-        result = reconcile_holdings("ACCT1")
+        mock_pos.side_effect = _positions
+        result = reconcile_pair("ACCT1", date(2026, 1, 31), date(2026, 2, 28))
         assert result["ok"] is True
-        assert "Need at least 2" in result.get("skipped", "")
+        assert result["base_date"] == "2026-01-31"
+        assert result["target_date"] == "2026-02-28"
 
-    @patch("src.db.check_coverage_gap", return_value=None)
-    @patch("src.db._get_account_trades_between")
-    @patch("src.db.get_positions")
-    @patch("src.db._get_account_statements")
-    def test_default_earliest_to_latest(self, mock_stmts, mock_pos, mock_trades, mock_cov):
-        """Without dates, reconciles earliest -> latest."""
-        from src.db import reconcile_holdings
+    @patch("src.db.get_trades_between")
+    @patch("src.db.get_positions_as_of")
+    def test_buy_adds_quantity(self, mock_pos, mock_trades):
+        """BOT trade increases position quantity."""
+        from src.db import reconcile_pair
 
-        mock_stmts.return_value = [
-            {"id": "s1", "period_start": "2026-01-01", "period_end": "2026-01-31"},
-            {"id": "s2", "period_start": "2026-02-01", "period_end": "2026-02-28"},
-        ]
-
-        def _positions(stmt_id):
-            if stmt_id == "s1":
+        def _positions(account_id, as_of_date):
+            if as_of_date == date(2026, 1, 31):
                 return [{"symbol": "AAPL", "asset_class": "STK", "quantity": "100",
                          "expiry": None, "strike": None, "right": None}]
             return [{"symbol": "AAPL", "asset_class": "STK", "quantity": "150",
@@ -539,143 +532,22 @@ class TestReconcileHoldings:
              "expiry": None, "strike": None, "right": None},
         ]
 
-        result = reconcile_holdings("ACCT1")
+        result = reconcile_pair("ACCT1", date(2026, 1, 31), date(2026, 2, 28))
         assert result["ok"] is True
-        assert result["base_date"] == "2026-01-31"
-        assert result["target_date"] == "2026-02-28"
+        aapl = result["holdings"]["AAPL"]
+        assert aapl["base_qty"] == "100"
+        assert aapl["reconstructed_qty"] == "150"
+        assert aapl["expected_qty"] == "150"
+        assert aapl["match"] is True
 
-    @patch("src.db.check_coverage_gap", return_value=None)
-    @patch("src.db._get_account_trades_between")
-    @patch("src.db.get_positions")
-    @patch("src.db._get_account_statements")
-    def test_custom_dates_pass(self, mock_stmts, mock_pos, mock_trades, mock_cov):
-        """Reconcile with explicit base and target dates."""
-        from src.db import reconcile_holdings
+    @patch("src.db.get_trades_between")
+    @patch("src.db.get_positions_as_of")
+    def test_sell_reduces_quantity(self, mock_pos, mock_trades):
+        """SLD trade reduces position quantity."""
+        from src.db import reconcile_pair
 
-        mock_stmts.return_value = [
-            {"id": "s1", "period_start": "2026-01-01", "period_end": "2026-01-31"},
-            {"id": "s2", "period_start": "2026-02-01", "period_end": "2026-02-28"},
-            {"id": "s3", "period_start": "2026-03-01", "period_end": "2026-03-31"},
-        ]
-
-        def _positions(stmt_id):
-            data = {
-                "s1": [{"symbol": "AAPL", "asset_class": "STK", "quantity": "100",
-                        "expiry": None, "strike": None, "right": None}],
-                "s2": [{"symbol": "AAPL", "asset_class": "STK", "quantity": "150",
-                        "expiry": None, "strike": None, "right": None}],
-                "s3": [{"symbol": "AAPL", "asset_class": "STK", "quantity": "200",
-                        "expiry": None, "strike": None, "right": None}],
-            }
-            return data.get(stmt_id, [])
-
-        mock_pos.side_effect = _positions
-        mock_trades.return_value = [
-            {"symbol": "AAPL", "asset_class": "STK", "side": "BOT",
-             "quantity": "50", "price": "175.00",
-             "trade_date": "2026-02-10T10:00:00",
-             "expiry": None, "strike": None, "right": None},
-        ]
-
-        result = reconcile_holdings(
-            "ACCT1",
-            base_date=date(2026, 1, 31),
-            target_date=date(2026, 2, 28),
-        )
-        assert result["ok"] is True
-        assert result["base_date"] == "2026-01-31"
-        assert result["target_date"] == "2026-02-28"
-
-    @patch("src.db.check_coverage_gap", return_value=None)
-    @patch("src.db._get_account_trades_between", return_value=[])
-    @patch("src.db.get_positions")
-    @patch("src.db._get_account_statements")
-    def test_custom_dates_mismatch(self, mock_stmts, mock_pos, mock_trades, mock_cov):
-        """Detects mismatch when trades don't explain the difference."""
-        from src.db import reconcile_holdings
-
-        mock_stmts.return_value = [
-            {"id": "s1", "period_start": "2026-01-01", "period_end": "2026-01-31"},
-            {"id": "s2", "period_start": "2026-02-01", "period_end": "2026-02-28"},
-        ]
-
-        def _positions(stmt_id):
-            if stmt_id == "s1":
-                return [{"symbol": "AAPL", "asset_class": "STK", "quantity": "100",
-                         "expiry": None, "strike": None, "right": None}]
-            return [{"symbol": "AAPL", "asset_class": "STK", "quantity": "200",
-                     "expiry": None, "strike": None, "right": None}]
-
-        mock_pos.side_effect = _positions
-
-        result = reconcile_holdings(
-            "ACCT1",
-            base_date=date(2026, 1, 31),
-            target_date=date(2026, 2, 28),
-        )
-        assert result["ok"] is False
-        assert len(result["mismatches"]) == 1
-        assert result["mismatches"][0]["symbol"] == "AAPL"
-        assert result["mismatches"][0]["expected_qty"] == "200"
-        assert result["mismatches"][0]["reconstructed_qty"] == "100"
-
-    @patch("src.db.check_coverage_gap", return_value=None)
-    @patch("src.db._get_account_trades_between", return_value=[])
-    @patch("src.db.get_positions", return_value=[])
-    @patch("src.db._get_account_statements")
-    def test_invalid_base_date(self, mock_stmts, mock_pos, mock_trades, mock_cov):
-        """Base date that doesn't match any statement returns skipped."""
-        from src.db import reconcile_holdings
-
-        mock_stmts.return_value = [
-            {"id": "s1", "period_start": "2026-01-01", "period_end": "2026-01-31"},
-            {"id": "s2", "period_start": "2026-02-01", "period_end": "2026-02-28"},
-        ]
-
-        result = reconcile_holdings(
-            "ACCT1",
-            base_date=date(2026, 3, 15),
-            target_date=date(2026, 2, 28),
-        )
-        assert result["ok"] is False
-        assert "No statement found" in result.get("skipped", "")
-
-    @patch("src.db.check_coverage_gap", return_value=None)
-    @patch("src.db._get_account_trades_between", return_value=[])
-    @patch("src.db.get_positions", return_value=[])
-    @patch("src.db._get_account_statements")
-    def test_base_after_target_skips(self, mock_stmts, mock_pos, mock_trades, mock_cov):
-        """Base date >= target date returns skipped."""
-        from src.db import reconcile_holdings
-
-        mock_stmts.return_value = [
-            {"id": "s1", "period_start": "2026-01-01", "period_end": "2026-01-31"},
-            {"id": "s2", "period_start": "2026-02-01", "period_end": "2026-02-28"},
-        ]
-
-        result = reconcile_holdings(
-            "ACCT1",
-            base_date=date(2026, 2, 28),
-            target_date=date(2026, 1, 31),
-        )
-        assert "skipped" in result
-        assert "before" in result["skipped"].lower()
-
-    @patch("src.db.check_coverage_gap", return_value=None)
-    @patch("src.db._get_account_trades_between")
-    @patch("src.db.get_positions")
-    @patch("src.db._get_account_statements")
-    def test_sell_reduces_position(self, mock_stmts, mock_pos, mock_trades, mock_cov):
-        """SLD trade reduces position quantity during reconciliation."""
-        from src.db import reconcile_holdings
-
-        mock_stmts.return_value = [
-            {"id": "s1", "period_start": "2026-01-01", "period_end": "2026-01-31"},
-            {"id": "s2", "period_start": "2026-02-01", "period_end": "2026-02-28"},
-        ]
-
-        def _positions(stmt_id):
-            if stmt_id == "s1":
+        def _positions(account_id, as_of_date):
+            if as_of_date == date(2026, 1, 31):
                 return [{"symbol": "AAPL", "asset_class": "STK", "quantity": "100",
                          "expiry": None, "strike": None, "right": None}]
             return [{"symbol": "AAPL", "asset_class": "STK", "quantity": "70",
@@ -689,24 +561,40 @@ class TestReconcileHoldings:
              "expiry": None, "strike": None, "right": None},
         ]
 
-        result = reconcile_holdings("ACCT1")
+        result = reconcile_pair("ACCT1", date(2026, 1, 31), date(2026, 2, 28))
         assert result["ok"] is True
 
-    @patch("src.db.check_coverage_gap", return_value=None)
-    @patch("src.db._get_account_trades_between")
-    @patch("src.db.get_positions")
-    @patch("src.db._get_account_statements")
-    def test_new_position_from_trade(self, mock_stmts, mock_pos, mock_trades, mock_cov):
+    @patch("src.db.get_trades_between", return_value=[])
+    @patch("src.db.get_positions_as_of")
+    def test_mismatch_detected(self, mock_pos, mock_trades):
+        """Detects mismatch when trades don't explain the difference."""
+        from src.db import reconcile_pair
+
+        def _positions(account_id, as_of_date):
+            if as_of_date == date(2026, 1, 31):
+                return [{"symbol": "AAPL", "asset_class": "STK", "quantity": "100",
+                         "expiry": None, "strike": None, "right": None}]
+            return [{"symbol": "AAPL", "asset_class": "STK", "quantity": "200",
+                     "expiry": None, "strike": None, "right": None}]
+
+        mock_pos.side_effect = _positions
+
+        result = reconcile_pair("ACCT1", date(2026, 1, 31), date(2026, 2, 28))
+        assert result["ok"] is False
+        aapl = result["holdings"]["AAPL"]
+        assert aapl["reconstructed_qty"] == "100"
+        assert aapl["expected_qty"] == "200"
+        assert aapl["diff"] == "-100"
+        assert aapl["match"] is False
+
+    @patch("src.db.get_trades_between")
+    @patch("src.db.get_positions_as_of")
+    def test_new_position_from_trade(self, mock_pos, mock_trades):
         """A trade opening a new position that appears in the target snapshot."""
-        from src.db import reconcile_holdings
+        from src.db import reconcile_pair
 
-        mock_stmts.return_value = [
-            {"id": "s1", "period_start": "2026-01-01", "period_end": "2026-01-31"},
-            {"id": "s2", "period_start": "2026-02-01", "period_end": "2026-02-28"},
-        ]
-
-        def _positions(stmt_id):
-            if stmt_id == "s1":
+        def _positions(account_id, as_of_date):
+            if as_of_date == date(2026, 1, 31):
                 return []
             return [{"symbol": "MSFT", "asset_class": "STK", "quantity": "50",
                      "expiry": None, "strike": None, "right": None}]
@@ -719,46 +607,40 @@ class TestReconcileHoldings:
              "expiry": None, "strike": None, "right": None},
         ]
 
-        result = reconcile_holdings("ACCT1")
+        result = reconcile_pair("ACCT1", date(2026, 1, 31), date(2026, 2, 28))
         assert result["ok"] is True
 
+    @patch("src.db.get_trades_between", return_value=[])
+    @patch("src.db.get_positions_as_of")
+    def test_position_only_in_target_gap(self, mock_pos, mock_trades):
+        """A position only in target with no trades is flagged as a gap."""
+        from src.db import reconcile_pair
 
-# ── reconcile_holdings_detail tests ──────────────────────────────────────
+        def _positions(account_id, as_of_date):
+            if as_of_date == date(2026, 1, 31):
+                return []
+            return [{"symbol": "GOOG", "asset_class": "STK", "quantity": "25",
+                     "expiry": None, "strike": None, "right": None}]
 
+        mock_pos.side_effect = _positions
 
-class TestReconcileHoldingsDetail:
-    """Tests for reconcile_holdings_detail — per-holding daily ledger."""
+        result = reconcile_pair("ACCT1", date(2026, 1, 31), date(2026, 2, 28))
+        assert result["ok"] is False
+        goog = result["holdings"]["GOOG"]
+        assert goog["base_qty"] == "0"
+        assert goog["reconstructed_qty"] == "0"
+        assert goog["expected_qty"] == "25"
+        assert goog["match"] is False
+        assert len(result["gaps"]["missing_from_reconstruction"]) == 1
 
-    @patch("src.db.check_coverage_gap", return_value=None)
-    @patch("src.db._get_account_trades_between", return_value=[])
-    @patch("src.db.get_positions", return_value=[])
-    @patch("src.db._get_account_statements")
-    def test_single_statement_skips(self, mock_stmts, mock_pos, mock_trades, mock_cov):
-        from src.db import reconcile_holdings_detail
-
-        mock_stmts.return_value = [
-            {"id": "s1", "period_start": "2026-01-01", "period_end": "2026-01-31"},
-        ]
-        result = reconcile_holdings_detail("ACCT1")
-        assert result["ok"] is True
-        assert "Need at least 2" in result.get("skipped", "")
-        assert result["holdings"] == {}
-
-    @patch("src.db.check_coverage_gap", return_value=None)
-    @patch("src.db._get_account_trades_between")
-    @patch("src.db.get_positions")
-    @patch("src.db._get_account_statements")
-    def test_ledger_shows_trades(self, mock_stmts, mock_pos, mock_trades, mock_cov):
+    @patch("src.db.get_trades_between")
+    @patch("src.db.get_positions_as_of")
+    def test_ledger_shows_trades_with_running_qty(self, mock_pos, mock_trades):
         """Each trade appears in the per-holding ledger with running qty."""
-        from src.db import reconcile_holdings_detail
+        from src.db import reconcile_pair
 
-        mock_stmts.return_value = [
-            {"id": "s1", "period_start": "2026-01-01", "period_end": "2026-01-31"},
-            {"id": "s2", "period_start": "2026-02-01", "period_end": "2026-02-28"},
-        ]
-
-        def _positions(stmt_id):
-            if stmt_id == "s1":
+        def _positions(account_id, as_of_date):
+            if as_of_date == date(2026, 1, 31):
                 return [{"symbol": "AAPL", "asset_class": "STK", "quantity": "100",
                          "expiry": None, "strike": None, "right": None}]
             return [{"symbol": "AAPL", "asset_class": "STK", "quantity": "170",
@@ -780,7 +662,7 @@ class TestReconcileHoldingsDetail:
              "expiry": None, "strike": None, "right": None},
         ]
 
-        result = reconcile_holdings_detail("ACCT1")
+        result = reconcile_pair("ACCT1", date(2026, 1, 31), date(2026, 2, 28))
         assert result["ok"] is True
 
         aapl = result["holdings"]["AAPL"]
@@ -792,82 +674,17 @@ class TestReconcileHoldingsDetail:
         assert aapl["trades"][0]["running_qty"] == "150"
         assert aapl["trades"][1]["running_qty"] == "180"
         assert aapl["trades"][2]["running_qty"] == "170"
-        assert aapl["final_qty"] == "170"
+        assert aapl["reconstructed_qty"] == "170"
         assert aapl["expected_qty"] == "170"
 
-    @patch("src.db.check_coverage_gap", return_value=None)
-    @patch("src.db._get_account_trades_between", return_value=[])
-    @patch("src.db.get_positions")
-    @patch("src.db._get_account_statements")
-    def test_mismatch_detected(self, mock_stmts, mock_pos, mock_trades, mock_cov):
-        """Holdings that don't match show match=False."""
-        from src.db import reconcile_holdings_detail
-
-        mock_stmts.return_value = [
-            {"id": "s1", "period_start": "2026-01-01", "period_end": "2026-01-31"},
-            {"id": "s2", "period_start": "2026-02-01", "period_end": "2026-02-28"},
-        ]
-
-        def _positions(stmt_id):
-            if stmt_id == "s1":
-                return [{"symbol": "AAPL", "asset_class": "STK", "quantity": "100",
-                         "expiry": None, "strike": None, "right": None}]
-            return [{"symbol": "AAPL", "asset_class": "STK", "quantity": "200",
-                     "expiry": None, "strike": None, "right": None}]
-
-        mock_pos.side_effect = _positions
-
-        result = reconcile_holdings_detail("ACCT1")
-        assert result["ok"] is False
-        assert result["holdings"]["AAPL"]["match"] is False
-        assert result["holdings"]["AAPL"]["final_qty"] == "100"
-        assert result["holdings"]["AAPL"]["expected_qty"] == "200"
-
-    @patch("src.db.check_coverage_gap", return_value=None)
-    @patch("src.db._get_account_trades_between")
-    @patch("src.db.get_positions")
-    @patch("src.db._get_account_statements")
-    def test_new_position_only_in_target(self, mock_stmts, mock_pos, mock_trades, mock_cov):
-        """A position only in the target snapshot shows base_qty=0 and mismatch."""
-        from src.db import reconcile_holdings_detail
-
-        mock_stmts.return_value = [
-            {"id": "s1", "period_start": "2026-01-01", "period_end": "2026-01-31"},
-            {"id": "s2", "period_start": "2026-02-01", "period_end": "2026-02-28"},
-        ]
-
-        def _positions(stmt_id):
-            if stmt_id == "s1":
-                return []
-            return [{"symbol": "GOOG", "asset_class": "STK", "quantity": "25",
-                     "expiry": None, "strike": None, "right": None}]
-
-        mock_pos.side_effect = _positions
-        mock_trades.return_value = []
-
-        result = reconcile_holdings_detail("ACCT1")
-        assert result["ok"] is False
-        goog = result["holdings"]["GOOG"]
-        assert goog["base_qty"] == "0"
-        assert goog["final_qty"] == "0"
-        assert goog["expected_qty"] == "25"
-        assert goog["match"] is False
-
-    @patch("src.db.check_coverage_gap", return_value=None)
-    @patch("src.db._get_account_trades_between")
-    @patch("src.db.get_positions")
-    @patch("src.db._get_account_statements")
-    def test_trade_dates_in_ledger(self, mock_stmts, mock_pos, mock_trades, mock_cov):
+    @patch("src.db.get_trades_between")
+    @patch("src.db.get_positions_as_of")
+    def test_trade_dates_in_ledger(self, mock_pos, mock_trades):
         """Trade dates are extracted correctly (date-only portion)."""
-        from src.db import reconcile_holdings_detail
+        from src.db import reconcile_pair
 
-        mock_stmts.return_value = [
-            {"id": "s1", "period_start": "2026-01-01", "period_end": "2026-01-31"},
-            {"id": "s2", "period_start": "2026-02-01", "period_end": "2026-02-28"},
-        ]
-
-        def _positions(stmt_id):
-            if stmt_id == "s1":
+        def _positions(account_id, as_of_date):
+            if as_of_date == date(2026, 1, 31):
                 return [{"symbol": "MSFT", "asset_class": "STK", "quantity": "50",
                          "expiry": None, "strike": None, "right": None}]
             return [{"symbol": "MSFT", "asset_class": "STK", "quantity": "80",
@@ -881,11 +698,78 @@ class TestReconcileHoldingsDetail:
              "expiry": None, "strike": None, "right": None},
         ]
 
-        result = reconcile_holdings_detail("ACCT1")
+        result = reconcile_pair("ACCT1", date(2026, 1, 31), date(2026, 2, 28))
         assert result["ok"] is True
         msft = result["holdings"]["MSFT"]
         assert msft["trades"][0]["date"] == "2026-02-12"
         assert msft["trades"][0]["side"] == "BOT"
+
+    @patch("src.db.get_trades_between")
+    @patch("src.db.get_positions_as_of")
+    def test_position_in_base_not_in_target_gap(self, mock_pos, mock_trades):
+        """A position fully sold but still showing in reconstruction is flagged."""
+        from src.db import reconcile_pair
+
+        def _positions(account_id, as_of_date):
+            if as_of_date == date(2026, 1, 31):
+                return [{"symbol": "TSLA", "asset_class": "STK", "quantity": "50",
+                         "expiry": None, "strike": None, "right": None}]
+            return []  # TSLA gone from target
+
+        mock_pos.side_effect = _positions
+        # Only sold 30 of 50, so 20 remain in reconstruction but not in target
+        mock_trades.return_value = [
+            {"symbol": "TSLA", "asset_class": "STK", "side": "SLD",
+             "quantity": "30", "price": "200.00",
+             "trade_date": "2026-02-10T10:00:00",
+             "expiry": None, "strike": None, "right": None},
+        ]
+
+        result = reconcile_pair("ACCT1", date(2026, 1, 31), date(2026, 2, 28))
+        assert result["ok"] is False
+        assert len(result["gaps"]["missing_from_target"]) == 1
+        assert result["gaps"]["missing_from_target"][0]["symbol"] == "TSLA"
+
+
+# ── reconcile_account tests ──────────────────────────────────────────────
+
+
+class TestReconcileAccount:
+    """Tests for reconcile_account — runs all consecutive pairs."""
+
+    @patch("src.db.get_snapshot_dates")
+    def test_single_snapshot_returns_empty(self, mock_dates):
+        from src.db import reconcile_account
+
+        mock_dates.return_value = [date(2026, 1, 31)]
+        result = reconcile_account("ACCT1")
+        assert result == []
+
+    @patch("src.db.reconcile_pair")
+    @patch("src.db.get_snapshot_dates")
+    def test_two_snapshots_one_pair(self, mock_dates, mock_pair):
+        from src.db import reconcile_account
+
+        mock_dates.return_value = [date(2026, 1, 31), date(2026, 2, 28)]
+        mock_pair.return_value = {"ok": True, "base_date": "2026-01-31", "target_date": "2026-02-28"}
+
+        result = reconcile_account("ACCT1")
+        assert len(result) == 1
+        mock_pair.assert_called_once_with("ACCT1", date(2026, 1, 31), date(2026, 2, 28))
+
+    @patch("src.db.reconcile_pair")
+    @patch("src.db.get_snapshot_dates")
+    def test_three_snapshots_two_pairs(self, mock_dates, mock_pair):
+        from src.db import reconcile_account
+
+        mock_dates.return_value = [
+            date(2026, 1, 31), date(2026, 2, 28), date(2026, 3, 31),
+        ]
+        mock_pair.return_value = {"ok": True}
+
+        result = reconcile_account("ACCT1")
+        assert len(result) == 2
+        assert mock_pair.call_count == 2
 
 
 # ── check_duplicates tests ───────────────────────────────────────────────

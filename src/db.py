@@ -6,7 +6,7 @@ All financial columns use Postgres numeric via Python Decimal.
 
 import logging
 import os
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from decimal import Decimal
 
 import streamlit as st
@@ -365,7 +365,8 @@ def clear_query_caches() -> None:
     get_trades.clear()
     get_account_ids.clear()
     _get_account_statements.clear()
-    reconstruct_holdings.clear()
+    get_snapshot_dates.clear()
+    get_positions_as_of.clear()
 
 
 # ── Queries ──────────────────────────────────────────────────────────────────
@@ -484,35 +485,6 @@ def get_trades(
         return []
 
 
-# ── Holdings reconstruction ──────────────────────────────────────────────────
-
-def _get_account_trades_between(account_id: str, after_date: date, up_to_date: date) -> list[dict]:
-    """Fetch deduplicated trades for an account strictly after *after_date* up to *up_to_date*."""
-    stmt_ids = _get_account_statement_ids(account_id)
-    if not stmt_ids:
-        return []
-
-    result = (
-        get_client()
-        .table("trades")
-        .select("*")
-        .in_("statement_id", stmt_ids)
-        .gt("trade_date", after_date.isoformat())
-        .lte("trade_date", f"{up_to_date.isoformat()}T23:59:59")
-        .order("trade_date", desc=False)
-        .execute()
-    )
-
-    seen: set[tuple] = set()
-    unique: list[dict] = []
-    for t in result.data:
-        fp = _trade_fingerprint(t)
-        if fp not in seen:
-            seen.add(fp)
-            unique.append(t)
-    return unique
-
-
 @st.cache_data(ttl=60)
 def _get_account_statements(account_id: str) -> list[dict]:
     """Fetch all statements for an account, ordered by period_end ascending."""
@@ -531,509 +503,133 @@ def _get_account_statements(account_id: str) -> list[dict]:
         return []
 
 
-def _find_best_base(account_id: str, as_of_date: date) -> dict | None:
-    """Find the statement whose period_end is closest to *as_of_date* without exceeding it.
-
-    Returns the statement dict (id, period_start, period_end) or None.
-    """
-    stmts = _get_account_statements(account_id)
-    best = None
-    for s in stmts:
-        p_end = date.fromisoformat(s["period_end"])
-        if p_end <= as_of_date:
-            best = s  # list is sorted asc, so last match wins
-    return best
-
-
-def check_coverage_gap(account_id: str, as_of_date: date) -> str | None:
-    """Check whether we can accurately reconstruct holdings as of *as_of_date*.
-
-    Returns a human-readable gap description if there is a problem, or None
-    if coverage is sufficient.
-    """
-    stmts = _get_account_statements(account_id)
-    if not stmts:
-        return "No statements uploaded for this account."
-
-    # Find best base snapshot
-    base = _find_best_base(account_id, as_of_date)
-    if base is None:
-        earliest_end = date.fromisoformat(stmts[0]["period_end"])
-        # as_of_date is before all snapshots — check backward coverage
-        earliest_start = date.fromisoformat(stmts[0]["period_start"])
-        if as_of_date < earliest_start:
-            return (
-                f"Date {as_of_date} is before the earliest statement period "
-                f"({earliest_start}). No trade data available before that."
-            )
-        # as_of_date is within the first statement period but before its end —
-        # we can reverse from the earliest snapshot
-        return None
-
-    base_end = date.fromisoformat(base["period_end"])
-    if base_end == as_of_date:
-        return None  # Exact snapshot match
-
-    # Forward reconstruction: need trade coverage from base_end to as_of_date
-    # Check that statement periods continuously cover [base_end, as_of_date]
-    periods = [
-        (date.fromisoformat(s["period_start"]), date.fromisoformat(s["period_end"]))
-        for s in stmts
-    ]
-    # Filter to periods that overlap with [base_end, as_of_date]
-    relevant = [
-        (s, e) for s, e in periods if e >= base_end and s <= as_of_date
-    ]
-    if not relevant:
-        return (
-            f"No statement covers the period between {base_end} and {as_of_date}."
-        )
-
-    # Merge overlapping/adjacent intervals
-    merged: list[tuple[date, date]] = []
-    for s, e in sorted(relevant):
-        if merged and s <= merged[-1][1] + timedelta(days=1):
-            merged[-1] = (merged[-1][0], max(merged[-1][1], e))
-        else:
-            merged.append((s, e))
-
-    if len(merged) > 1:
-        # Find the actual gap(s)
-        gaps = []
-        for i in range(len(merged) - 1):
-            gap_start = merged[i][1] + timedelta(days=1)
-            gap_end = merged[i + 1][0] - timedelta(days=1)
-            gaps.append(f"{gap_start} to {gap_end}")
-        return (
-            f"Missing statement coverage for: {'; '.join(gaps)}. "
-            "Trades in these periods are unknown."
-        )
-
-    if merged[0][0] > base_end + timedelta(days=1):
-        return (
-            f"No statement covers {base_end + timedelta(days=1)} to "
-            f"{merged[0][0] - timedelta(days=1)}."
-        )
-
-    return None
+# ── Reconciliation (statement_date-driven) ───────────────────────────────────
 
 
 @st.cache_data(ttl=60)
-def reconstruct_holdings(account_id: str, as_of_date: date) -> list[dict]:
-    """Reconstruct holdings as of *as_of_date* using a forward-roll approach.
-
-    Algorithm:
-    1. Find the best base snapshot — the statement whose period_end is
-       closest to as_of_date without exceeding it.
-    2. If as_of_date == base snapshot date → return the snapshot as-is.
-    3. If as_of_date > base snapshot → roll FORWARD by applying trades
-       from base_date to as_of_date (BOT adds qty, SLD subtracts qty).
-    4. If as_of_date < all snapshots → fall back to reversing trades from
-       as_of_date back to the earliest snapshot.
-
-    Options with expiry < as_of_date are filtered out.
-    A ``multiplier`` field (100 for OPT, 1 otherwise) and ``cost_value``
-    (quantity × cost_basis × multiplier) are added to each row.
-    """
-    client = get_client()
-
-    # Find all statements for this account
-    stmts = _get_account_statements(account_id)
-    if not stmts:
+def get_snapshot_dates(account_id: str) -> list[date]:
+    """Return sorted distinct statement_date values from positions for an account."""
+    stmt_ids = _get_account_statement_ids(account_id)
+    if not stmt_ids:
         return []
 
-    base = _find_best_base(account_id, as_of_date)
+    try:
+        result = (
+            get_client()
+            .table("positions")
+            .select("statement_date")
+            .in_("statement_id", stmt_ids)
+            .order("statement_date", desc=False)
+            .execute()
+        )
+        seen: set[str] = set()
+        dates: list[date] = []
+        for row in result.data:
+            d = row["statement_date"]
+            if d not in seen:
+                seen.add(d)
+                dates.append(date.fromisoformat(d) if isinstance(d, str) else d)
+        return dates
+    except Exception as e:
+        logger.exception("Failed to fetch snapshot dates for %s", account_id)
+        st.error(f"Database error fetching snapshot dates: {e}")
+        return []
 
-    if base is not None:
-        # ── Forward roll (or exact snapshot) ──────────────────────────────
-        base_id = base["id"]
-        base_end = date.fromisoformat(base["period_end"])
 
-        positions = get_positions(base_id)
-        pos_map: dict[tuple, dict] = {}
-        for p in positions:
+@st.cache_data(ttl=60)
+def get_positions_as_of(account_id: str, as_of_date: date) -> list[dict]:
+    """Fetch all positions for an account at a specific statement_date.
+
+    Deduplicates by position key (symbol + option fields) keeping the last
+    occurrence (in case overlapping PDFs inserted duplicates).
+    """
+    stmt_ids = _get_account_statement_ids(account_id)
+    if not stmt_ids:
+        return []
+
+    try:
+        result = (
+            get_client()
+            .table("positions")
+            .select("*")
+            .in_("statement_id", stmt_ids)
+            .eq("statement_date", as_of_date.isoformat())
+            .execute()
+        )
+        # Deduplicate by position key — last wins
+        deduped: dict[tuple, dict] = {}
+        for p in result.data:
             key = _position_key(p)
-            pos_map[key] = {
-                "symbol": p["symbol"],
-                "asset_class": p["asset_class"],
-                "quantity": Decimal(str(p["quantity"])),
-                "cost_basis": Decimal(str(p["cost_basis"])),
-                "currency": p.get("currency", "USD"),
-                "expiry": p.get("expiry"),
-                "strike": p.get("strike"),
-                "right": p.get("right"),
-                "market_price": p.get("market_price"),
-                "market_value": p.get("market_value"),
-                "unrealized_pnl": p.get("unrealized_pnl"),
-            }
-
-        is_snapshot = as_of_date == base_end
-
-        if not is_snapshot:
-            # Apply trades FORWARD from base_end to as_of_date
-            trades = _get_account_trades_between(account_id, base_end, as_of_date)
-
-            for t in trades:
-                key = _position_key(t)
-                qty = Decimal(str(t["quantity"]))
-
-                if key not in pos_map:
-                    # New position opened after the base snapshot
-                    pos_map[key] = {
-                        "symbol": t["symbol"],
-                        "asset_class": t["asset_class"],
-                        "quantity": Decimal("0"),
-                        "cost_basis": Decimal(str(t["price"])),
-                        "currency": t.get("currency", "USD"),
-                        "expiry": t.get("expiry"),
-                        "strike": t.get("strike"),
-                        "right": t.get("right"),
-                        "market_price": None,
-                        "market_value": None,
-                        "unrealized_pnl": None,
-                    }
-
-                if t["side"] == "BOT":
-                    pos_map[key]["quantity"] += qty   # bought → add
-                else:  # SLD
-                    pos_map[key]["quantity"] -= qty   # sold → subtract
-
-            # Market data from the base snapshot is stale after rolling forward
-            for pos in pos_map.values():
-                pos["market_price"] = None
-                pos["market_value"] = None
-                pos["unrealized_pnl"] = None
-
-    else:
-        # ── Fallback: reverse from earliest snapshot ──────────────────────
-        earliest = stmts[0]
-        earliest_id = earliest["id"]
-        earliest_end = date.fromisoformat(earliest["period_end"])
-
-        positions = get_positions(earliest_id)
-        pos_map = {}
-        for p in positions:
-            key = _position_key(p)
-            pos_map[key] = {
-                "symbol": p["symbol"],
-                "asset_class": p["asset_class"],
-                "quantity": Decimal(str(p["quantity"])),
-                "cost_basis": Decimal(str(p["cost_basis"])),
-                "currency": p.get("currency", "USD"),
-                "expiry": p.get("expiry"),
-                "strike": p.get("strike"),
-                "right": p.get("right"),
-                "market_price": None,
-                "market_value": None,
-                "unrealized_pnl": None,
-            }
-
-        # Reverse trades between as_of_date and earliest_end
-        trades = _get_account_trades_between(account_id, as_of_date, earliest_end)
-        for t in trades:
-            key = _position_key(t)
-            qty = Decimal(str(t["quantity"]))
-
-            if key not in pos_map:
-                pos_map[key] = {
-                    "symbol": t["symbol"],
-                    "asset_class": t["asset_class"],
-                    "quantity": Decimal("0"),
-                    "cost_basis": Decimal(str(t["price"])),
-                    "currency": t.get("currency", "USD"),
-                    "expiry": t.get("expiry"),
-                    "strike": t.get("strike"),
-                    "right": t.get("right"),
-                    "market_price": None,
-                    "market_value": None,
-                    "unrealized_pnl": None,
-                }
-
-            if t["side"] == "BOT":
-                pos_map[key]["quantity"] -= qty   # hadn't bought yet
-            else:  # SLD
-                pos_map[key]["quantity"] += qty   # hadn't sold yet
-
-    # ── Filter and build result ───────────────────────────────────────────
-    result: list[dict] = []
-    for pos in pos_map.values():
-        if pos["quantity"] <= 0:
-            continue
-
-        # Drop expired options
-        if pos["asset_class"] == "OPT" and pos.get("expiry"):
-            expiry_val = pos["expiry"]
-            expiry_date = (
-                date.fromisoformat(expiry_val) if isinstance(expiry_val, str) else expiry_val
-            )
-            if expiry_date < as_of_date:
-                continue
-
-        multiplier = OPTION_MULTIPLIER if pos["asset_class"] == "OPT" else 1
-        cost_value = pos["quantity"] * pos["cost_basis"] * multiplier
-
-        is_snapshot = base is not None and as_of_date == date.fromisoformat(base["period_end"])
-
-        result.append({
-            "symbol": pos["symbol"],
-            "asset_class": pos["asset_class"],
-            "quantity": str(pos["quantity"]),
-            "cost_basis": str(pos["cost_basis"]),
-            "currency": pos["currency"],
-            "expiry": pos.get("expiry"),
-            "strike": pos.get("strike"),
-            "right": pos.get("right"),
-            "multiplier": multiplier,
-            "cost_value": str(cost_value),
-            "market_price": pos.get("market_price") if is_snapshot else None,
-            "market_value": pos.get("market_value") if is_snapshot else None,
-            "unrealized_pnl": pos.get("unrealized_pnl") if is_snapshot else None,
-        })
-
-    return sorted(result, key=lambda r: r["symbol"])
+            deduped[key] = p
+        return list(deduped.values())
+    except Exception as e:
+        logger.exception("Failed to fetch positions as of %s for %s", as_of_date, account_id)
+        st.error(f"Database error fetching positions: {e}")
+        return []
 
 
-def reconcile_holdings(
+def get_trades_between(account_id: str, after_date: date, up_to_date: date) -> list[dict]:
+    """Fetch deduplicated trades for an account where after_date < trade_date <= up_to_date."""
+    stmt_ids = _get_account_statement_ids(account_id)
+    if not stmt_ids:
+        return []
+
+    try:
+        result = (
+            get_client()
+            .table("trades")
+            .select("*")
+            .in_("statement_id", stmt_ids)
+            .gt("trade_date", after_date.isoformat())
+            .lte("trade_date", f"{up_to_date.isoformat()}T23:59:59")
+            .order("trade_date", desc=False)
+            .execute()
+        )
+    except Exception as e:
+        logger.exception("Failed to fetch trades between %s and %s", after_date, up_to_date)
+        st.error(f"Database error fetching trades: {e}")
+        return []
+
+    seen: set[tuple] = set()
+    unique: list[dict] = []
+    for t in result.data:
+        fp = _trade_fingerprint(t)
+        if fp not in seen:
+            seen.add(fp)
+            unique.append(t)
+    return unique
+
+
+def reconcile_pair(
     account_id: str,
-    base_date: date | None = None,
-    target_date: date | None = None,
+    base_date: date,
+    target_date: date,
 ) -> dict:
-    """Verify data integrity by rolling forward from a base snapshot through
-    trades and comparing against a target snapshot.
+    """Reconcile holdings between two snapshot dates for an account.
 
-    When *base_date* and *target_date* are omitted the function falls back to
-    earliest → latest (original behaviour).  When provided, each date must
-    match a statement's ``period_end`` exactly.
+    Rolls forward from holdings at *base_date* through all trades in
+    (base_date, target_date] and compares the result against the actual
+    holdings snapshot at *target_date*.
 
     Returns a dict with:
+        base_date: str
+        target_date: str
         ok: bool — True if reconstructed matches the actual snapshot
-        base_date: str — period_end of the base snapshot used
-        target_date: str — period_end of the target snapshot compared against
-        mismatches: list[dict] — per-symbol details where qty differs
-            Each dict has: symbol, expected_qty (from snapshot), reconstructed_qty, diff
-        missing_from_reconstruction: list[dict] — in snapshot but not reconstructed
-        extra_in_reconstruction: list[dict] — reconstructed but not in snapshot
-        coverage_gap: str | None — gap warning if applicable
+        holdings: dict[str, dict] — keyed by symbol, each containing:
+            base_qty: str
+            trades: list[dict] — each trade with date, side, qty, running_qty
+            reconstructed_qty: str — running qty after all trades
+            expected_qty: str — qty in the target snapshot (or "0" if absent)
+            match: bool
+            diff: str — reconstructed - expected
+        gaps: dict with:
+            missing_from_target: list[dict] — reconstructed but not in target
+            missing_from_reconstruction: list[dict] — in target but not reconstructed
     """
-    stmts = _get_account_statements(account_id)
-    if len(stmts) < 2:
-        return {
-            "ok": True,
-            "base_date": stmts[0]["period_end"] if stmts else None,
-            "target_date": stmts[0]["period_end"] if stmts else None,
-            "mismatches": [],
-            "missing_from_reconstruction": [],
-            "extra_in_reconstruction": [],
-            "coverage_gap": None,
-            "skipped": "Need at least 2 statements to reconcile.",
-        }
-
-    # Build lookup: period_end → statement dict
-    stmts_by_date = {s["period_end"]: s for s in stmts}
-
-    if base_date is not None and base_date.isoformat() not in stmts_by_date:
-        return {
-            "ok": False,
-            "base_date": base_date.isoformat(),
-            "target_date": (target_date.isoformat() if target_date else None),
-            "mismatches": [],
-            "missing_from_reconstruction": [],
-            "extra_in_reconstruction": [],
-            "coverage_gap": None,
-            "skipped": f"No statement found with period_end = {base_date}.",
-        }
-
-    if target_date is not None and target_date.isoformat() not in stmts_by_date:
-        return {
-            "ok": False,
-            "base_date": (base_date.isoformat() if base_date else None),
-            "target_date": target_date.isoformat(),
-            "mismatches": [],
-            "missing_from_reconstruction": [],
-            "extra_in_reconstruction": [],
-            "coverage_gap": None,
-            "skipped": f"No statement found with period_end = {target_date}.",
-        }
-
-    earliest = stmts_by_date.get(base_date.isoformat()) if base_date else stmts[0]
-    latest = stmts_by_date.get(target_date.isoformat()) if target_date else stmts[-1]
-    earliest_end = date.fromisoformat(earliest["period_end"])
-    latest_end = date.fromisoformat(latest["period_end"])
-
-    if earliest_end >= latest_end:
-        return {
-            "ok": True,
-            "base_date": earliest["period_end"],
-            "target_date": latest["period_end"],
-            "mismatches": [],
-            "missing_from_reconstruction": [],
-            "extra_in_reconstruction": [],
-            "coverage_gap": None,
-            "skipped": "Base date must be before target date.",
-        }
-
-    # Check coverage between earliest and latest
-    coverage_gap = check_coverage_gap(account_id, latest_end)
-
-    # Build reconstructed positions: earliest snapshot + all trades forward
-    base_positions = get_positions(earliest["id"])
-    pos_map: dict[tuple, dict] = {}
-    for p in base_positions:
-        key = _position_key(p)
-        pos_map[key] = {
-            "symbol": p["symbol"],
-            "asset_class": p["asset_class"],
-            "quantity": Decimal(str(p["quantity"])),
-        }
-
-    trades = _get_account_trades_between(account_id, earliest_end, latest_end)
-    for t in trades:
-        key = _position_key(t)
-        qty = Decimal(str(t["quantity"]))
-        if key not in pos_map:
-            pos_map[key] = {
-                "symbol": t["symbol"],
-                "asset_class": t["asset_class"],
-                "quantity": Decimal("0"),
-            }
-        if t["side"] == "BOT":
-            pos_map[key]["quantity"] += qty
-        else:
-            pos_map[key]["quantity"] -= qty
-
-    # Filter out zero/negative and expired options
-    reconstructed: dict[tuple, Decimal] = {}
-    for key, pos in pos_map.items():
-        if pos["quantity"] <= 0:
-            continue
-        # Skip expired options
-        if pos["asset_class"] == "OPT" and len(key) == 4 and key[1]:
-            expiry_val = key[1]
-            expiry_date = (
-                date.fromisoformat(expiry_val) if isinstance(expiry_val, str) else expiry_val
-            )
-            if expiry_date < latest_end:
-                continue
-        reconstructed[key] = pos["quantity"]
-
-    # Build actual latest snapshot
-    actual_positions = get_positions(latest["id"])
-    actual: dict[tuple, Decimal] = {}
-    for p in actual_positions:
-        key = _position_key(p)
-        actual[key] = Decimal(str(p["quantity"]))
-
-    # Compare
-    all_keys = set(reconstructed.keys()) | set(actual.keys())
-    mismatches = []
-    missing_from_reconstruction = []
-    extra_in_reconstruction = []
-
-    for key in sorted(all_keys, key=lambda k: k[0]):
-        r_qty = reconstructed.get(key, Decimal("0"))
-        a_qty = actual.get(key, Decimal("0"))
-
-        symbol = key[0]
-
-        if key not in reconstructed and key in actual:
-            missing_from_reconstruction.append({
-                "symbol": symbol,
-                "expected_qty": str(a_qty),
-            })
-        elif key in reconstructed and key not in actual:
-            extra_in_reconstruction.append({
-                "symbol": symbol,
-                "reconstructed_qty": str(r_qty),
-            })
-        elif r_qty != a_qty:
-            mismatches.append({
-                "symbol": symbol,
-                "expected_qty": str(a_qty),
-                "reconstructed_qty": str(r_qty),
-                "diff": str(r_qty - a_qty),
-            })
-
-    ok = not mismatches and not missing_from_reconstruction and not extra_in_reconstruction
-
-    return {
-        "ok": ok,
-        "base_date": earliest["period_end"],
-        "target_date": latest["period_end"],
-        "mismatches": mismatches,
-        "missing_from_reconstruction": missing_from_reconstruction,
-        "extra_in_reconstruction": extra_in_reconstruction,
-        "coverage_gap": coverage_gap,
-    }
-
-
-def reconcile_holdings_detail(
-    account_id: str,
-    base_date: date | None = None,
-    target_date: date | None = None,
-) -> dict:
-    """Per-holding daily ledger showing how each position evolves from a base
-    snapshot through every trade to the target snapshot.
-
-    Returns a dict with:
-        ok: bool
-        base_date / target_date: str
-        holdings: dict[str, dict]  — keyed by symbol, each containing:
-            base_qty: str        — quantity in the base snapshot
-            trades: list[dict]   — each trade applied, with date, side, qty, running_qty
-            final_qty: str       — running quantity after all trades
-            expected_qty: str    — quantity in the target snapshot (or "0" if absent)
-            match: bool          — final_qty == expected_qty
-        skipped: str | None
-    """
-    stmts = _get_account_statements(account_id)
-    if len(stmts) < 2:
-        return {
-            "ok": True,
-            "base_date": stmts[0]["period_end"] if stmts else None,
-            "target_date": stmts[0]["period_end"] if stmts else None,
-            "holdings": {},
-            "skipped": "Need at least 2 statements to reconcile.",
-        }
-
-    stmts_by_date = {s["period_end"]: s for s in stmts}
-
-    if base_date is not None and base_date.isoformat() not in stmts_by_date:
-        return {
-            "ok": False,
-            "base_date": base_date.isoformat(),
-            "target_date": (target_date.isoformat() if target_date else None),
-            "holdings": {},
-            "skipped": f"No statement found with period_end = {base_date}.",
-        }
-
-    if target_date is not None and target_date.isoformat() not in stmts_by_date:
-        return {
-            "ok": False,
-            "base_date": (base_date.isoformat() if base_date else None),
-            "target_date": target_date.isoformat(),
-            "holdings": {},
-            "skipped": f"No statement found with period_end = {target_date}.",
-        }
-
-    earliest = stmts_by_date.get(base_date.isoformat()) if base_date else stmts[0]
-    latest = stmts_by_date.get(target_date.isoformat()) if target_date else stmts[-1]
-    earliest_end = date.fromisoformat(earliest["period_end"])
-    latest_end = date.fromisoformat(latest["period_end"])
-
-    if earliest_end >= latest_end:
-        return {
-            "ok": True,
-            "base_date": earliest["period_end"],
-            "target_date": latest["period_end"],
-            "holdings": {},
-            "skipped": "Base date must be before target date.",
-        }
-
-    # ── Build per-holding ledger ─────────────────────────────────────────────
-    base_positions = get_positions(earliest["id"])
+    # ── Load base snapshot ───────────────────────────────────────────────────
+    base_positions = get_positions_as_of(account_id, base_date)
 
     # ledger keyed by position key
-    # Each entry: { symbol, asset_class, base_qty, trades: [], running_qty }
     ledger: dict[tuple, dict] = {}
     for p in base_positions:
         key = _position_key(p)
@@ -1045,7 +641,8 @@ def reconcile_holdings_detail(
             "running_qty": Decimal(str(p["quantity"])),
         }
 
-    trades = _get_account_trades_between(account_id, earliest_end, latest_end)
+    # ── Apply trades ─────────────────────────────────────────────────────────
+    trades = get_trades_between(account_id, base_date, target_date)
     for t in trades:
         key = _position_key(t)
         qty = Decimal(str(t["quantity"]))
@@ -1064,7 +661,6 @@ def reconcile_holdings_detail(
         else:
             ledger[key]["running_qty"] -= qty
 
-        # Parse trade_date to date-only for display
         td_raw = t.get("trade_date", "")
         trade_dt = td_raw[:10] if isinstance(td_raw, str) else str(td_raw)
 
@@ -1075,13 +671,12 @@ def reconcile_holdings_detail(
             "running_qty": str(ledger[key]["running_qty"]),
         })
 
-    # ── Build actual target snapshot ─────────────────────────────────────────
-    actual_positions = get_positions(latest["id"])
+    # ── Load target snapshot ─────────────────────────────────────────────────
+    target_positions = get_positions_as_of(account_id, target_date)
     actual: dict[tuple, Decimal] = {}
-    for p in actual_positions:
+    for p in target_positions:
         key = _position_key(p)
         actual[key] = Decimal(str(p["quantity"]))
-        # Ensure positions that only exist in the target appear in the ledger
         if key not in ledger:
             ledger[key] = {
                 "symbol": p["symbol"],
@@ -1091,43 +686,82 @@ def reconcile_holdings_detail(
                 "running_qty": Decimal("0"),
             }
 
-    # ── Assemble output ──────────────────────────────────────────────────────
+    # ── Compare and build result ─────────────────────────────────────────────
     all_ok = True
     holdings: dict[str, dict] = {}
+    missing_from_target: list[dict] = []
+    missing_from_reconstruction: list[dict] = []
 
     for key in sorted(ledger.keys(), key=lambda k: k[0]):
         entry = ledger[key]
-        final_qty = entry["running_qty"]
+        reconstructed_qty = entry["running_qty"]
         expected_qty = actual.get(key, Decimal("0"))
 
         # Skip expired options with zero quantity on both sides
         if entry["asset_class"] == "OPT" and len(key) == 4 and key[1]:
             expiry_val = key[1]
             expiry_date = (
-                date.fromisoformat(expiry_val) if isinstance(expiry_val, str) else expiry_val
+                date.fromisoformat(expiry_val)
+                if isinstance(expiry_val, str) else expiry_val
             )
-            if expiry_date < latest_end and final_qty <= 0 and expected_qty <= 0:
+            if expiry_date < target_date and reconstructed_qty <= 0 and expected_qty <= 0:
                 continue
 
-        match = final_qty == expected_qty
+        match = reconstructed_qty == expected_qty
         if not match:
             all_ok = False
 
-        # Use symbol as display key; for options include option details
+        diff = reconstructed_qty - expected_qty
         display_key = entry["symbol"]
 
         holdings[display_key] = {
             "base_qty": str(entry["base_qty"]),
             "trades": entry["trades"],
-            "final_qty": str(final_qty),
+            "reconstructed_qty": str(reconstructed_qty),
             "expected_qty": str(expected_qty),
             "match": match,
+            "diff": str(diff),
         }
 
+        # Categorise gaps
+        if key not in actual and reconstructed_qty > 0:
+            missing_from_target.append({
+                "symbol": display_key,
+                "reconstructed_qty": str(reconstructed_qty),
+            })
+        elif key in actual and reconstructed_qty <= 0 and expected_qty > 0:
+            missing_from_reconstruction.append({
+                "symbol": display_key,
+                "expected_qty": str(expected_qty),
+            })
+
     return {
+        "base_date": base_date.isoformat(),
+        "target_date": target_date.isoformat(),
         "ok": all_ok,
-        "base_date": earliest["period_end"],
-        "target_date": latest["period_end"],
         "holdings": holdings,
-        "skipped": None,
+        "gaps": {
+            "missing_from_target": missing_from_target,
+            "missing_from_reconstruction": missing_from_reconstruction,
+        },
     }
+
+
+def reconcile_account(account_id: str) -> list[dict]:
+    """Run reconciliation across ALL consecutive snapshot pairs for an account.
+
+    Returns a list of per-pair results (same shape as reconcile_pair output),
+    one for each consecutive pair of snapshot dates.  Returns an empty list
+    if fewer than 2 snapshot dates exist.
+    """
+    snapshot_dates = get_snapshot_dates(account_id)
+    if len(snapshot_dates) < 2:
+        return []
+
+    results: list[dict] = []
+    for i in range(len(snapshot_dates) - 1):
+        pair_result = reconcile_pair(
+            account_id, snapshot_dates[i], snapshot_dates[i + 1],
+        )
+        results.append(pair_result)
+    return results
