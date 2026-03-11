@@ -793,14 +793,22 @@ def reconstruct_holdings(account_id: str, as_of_date: date) -> list[dict]:
     return sorted(result, key=lambda r: r["symbol"])
 
 
-def reconcile_holdings(account_id: str) -> dict:
-    """Verify data integrity by rolling forward from the earliest snapshot to
-    the latest and comparing against the actual latest snapshot.
+def reconcile_holdings(
+    account_id: str,
+    base_date: date | None = None,
+    target_date: date | None = None,
+) -> dict:
+    """Verify data integrity by rolling forward from a base snapshot through
+    trades and comparing against a target snapshot.
+
+    When *base_date* and *target_date* are omitted the function falls back to
+    earliest → latest (original behaviour).  When provided, each date must
+    match a statement's ``period_end`` exactly.
 
     Returns a dict with:
         ok: bool — True if reconstructed matches the actual snapshot
-        base_date: str — period_end of the earliest snapshot used
-        target_date: str — period_end of the latest snapshot compared against
+        base_date: str — period_end of the base snapshot used
+        target_date: str — period_end of the target snapshot compared against
         mismatches: list[dict] — per-symbol details where qty differs
             Each dict has: symbol, expected_qty (from snapshot), reconstructed_qty, diff
         missing_from_reconstruction: list[dict] — in snapshot but not reconstructed
@@ -820,10 +828,49 @@ def reconcile_holdings(account_id: str) -> dict:
             "skipped": "Need at least 2 statements to reconcile.",
         }
 
-    earliest = stmts[0]
-    latest = stmts[-1]
+    # Build lookup: period_end → statement dict
+    stmts_by_date = {s["period_end"]: s for s in stmts}
+
+    if base_date is not None and base_date.isoformat() not in stmts_by_date:
+        return {
+            "ok": False,
+            "base_date": base_date.isoformat(),
+            "target_date": (target_date.isoformat() if target_date else None),
+            "mismatches": [],
+            "missing_from_reconstruction": [],
+            "extra_in_reconstruction": [],
+            "coverage_gap": None,
+            "skipped": f"No statement found with period_end = {base_date}.",
+        }
+
+    if target_date is not None and target_date.isoformat() not in stmts_by_date:
+        return {
+            "ok": False,
+            "base_date": (base_date.isoformat() if base_date else None),
+            "target_date": target_date.isoformat(),
+            "mismatches": [],
+            "missing_from_reconstruction": [],
+            "extra_in_reconstruction": [],
+            "coverage_gap": None,
+            "skipped": f"No statement found with period_end = {target_date}.",
+        }
+
+    earliest = stmts_by_date.get(base_date.isoformat()) if base_date else stmts[0]
+    latest = stmts_by_date.get(target_date.isoformat()) if target_date else stmts[-1]
     earliest_end = date.fromisoformat(earliest["period_end"])
     latest_end = date.fromisoformat(latest["period_end"])
+
+    if earliest_end >= latest_end:
+        return {
+            "ok": True,
+            "base_date": earliest["period_end"],
+            "target_date": latest["period_end"],
+            "mismatches": [],
+            "missing_from_reconstruction": [],
+            "extra_in_reconstruction": [],
+            "coverage_gap": None,
+            "skipped": "Base date must be before target date.",
+        }
 
     # Check coverage between earliest and latest
     coverage_gap = check_coverage_gap(account_id, latest_end)

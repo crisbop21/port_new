@@ -487,6 +487,242 @@ class TestFingerprints:
         )
 
 
+# ── reconcile_holdings tests ──────────────────────────────────────────────
+
+
+class TestReconcileHoldings:
+    """Tests for reconcile_holdings with optional base_date/target_date.
+
+    Mocks the internal helpers directly rather than the Supabase client to
+    keep tests focused on the reconciliation logic.
+    """
+
+    @patch("src.db.check_coverage_gap", return_value=None)
+    @patch("src.db._get_account_trades_between", return_value=[])
+    @patch("src.db.get_positions", return_value=[])
+    @patch("src.db._get_account_statements")
+    def test_single_statement_skips(self, mock_stmts, mock_pos, mock_trades, mock_cov):
+        from src.db import reconcile_holdings
+
+        mock_stmts.return_value = [
+            {"id": "s1", "period_start": "2026-01-01", "period_end": "2026-01-31"},
+        ]
+        result = reconcile_holdings("ACCT1")
+        assert result["ok"] is True
+        assert "Need at least 2" in result.get("skipped", "")
+
+    @patch("src.db.check_coverage_gap", return_value=None)
+    @patch("src.db._get_account_trades_between")
+    @patch("src.db.get_positions")
+    @patch("src.db._get_account_statements")
+    def test_default_earliest_to_latest(self, mock_stmts, mock_pos, mock_trades, mock_cov):
+        """Without dates, reconciles earliest -> latest."""
+        from src.db import reconcile_holdings
+
+        mock_stmts.return_value = [
+            {"id": "s1", "period_start": "2026-01-01", "period_end": "2026-01-31"},
+            {"id": "s2", "period_start": "2026-02-01", "period_end": "2026-02-28"},
+        ]
+
+        def _positions(stmt_id):
+            if stmt_id == "s1":
+                return [{"symbol": "AAPL", "asset_class": "STK", "quantity": "100",
+                         "expiry": None, "strike": None, "right": None}]
+            return [{"symbol": "AAPL", "asset_class": "STK", "quantity": "150",
+                     "expiry": None, "strike": None, "right": None}]
+
+        mock_pos.side_effect = _positions
+        mock_trades.return_value = [
+            {"symbol": "AAPL", "asset_class": "STK", "side": "BOT",
+             "quantity": "50", "price": "175.00",
+             "trade_date": "2026-02-10T10:00:00",
+             "expiry": None, "strike": None, "right": None},
+        ]
+
+        result = reconcile_holdings("ACCT1")
+        assert result["ok"] is True
+        assert result["base_date"] == "2026-01-31"
+        assert result["target_date"] == "2026-02-28"
+
+    @patch("src.db.check_coverage_gap", return_value=None)
+    @patch("src.db._get_account_trades_between")
+    @patch("src.db.get_positions")
+    @patch("src.db._get_account_statements")
+    def test_custom_dates_pass(self, mock_stmts, mock_pos, mock_trades, mock_cov):
+        """Reconcile with explicit base and target dates."""
+        from src.db import reconcile_holdings
+
+        mock_stmts.return_value = [
+            {"id": "s1", "period_start": "2026-01-01", "period_end": "2026-01-31"},
+            {"id": "s2", "period_start": "2026-02-01", "period_end": "2026-02-28"},
+            {"id": "s3", "period_start": "2026-03-01", "period_end": "2026-03-31"},
+        ]
+
+        def _positions(stmt_id):
+            data = {
+                "s1": [{"symbol": "AAPL", "asset_class": "STK", "quantity": "100",
+                        "expiry": None, "strike": None, "right": None}],
+                "s2": [{"symbol": "AAPL", "asset_class": "STK", "quantity": "150",
+                        "expiry": None, "strike": None, "right": None}],
+                "s3": [{"symbol": "AAPL", "asset_class": "STK", "quantity": "200",
+                        "expiry": None, "strike": None, "right": None}],
+            }
+            return data.get(stmt_id, [])
+
+        mock_pos.side_effect = _positions
+        mock_trades.return_value = [
+            {"symbol": "AAPL", "asset_class": "STK", "side": "BOT",
+             "quantity": "50", "price": "175.00",
+             "trade_date": "2026-02-10T10:00:00",
+             "expiry": None, "strike": None, "right": None},
+        ]
+
+        result = reconcile_holdings(
+            "ACCT1",
+            base_date=date(2026, 1, 31),
+            target_date=date(2026, 2, 28),
+        )
+        assert result["ok"] is True
+        assert result["base_date"] == "2026-01-31"
+        assert result["target_date"] == "2026-02-28"
+
+    @patch("src.db.check_coverage_gap", return_value=None)
+    @patch("src.db._get_account_trades_between", return_value=[])
+    @patch("src.db.get_positions")
+    @patch("src.db._get_account_statements")
+    def test_custom_dates_mismatch(self, mock_stmts, mock_pos, mock_trades, mock_cov):
+        """Detects mismatch when trades don't explain the difference."""
+        from src.db import reconcile_holdings
+
+        mock_stmts.return_value = [
+            {"id": "s1", "period_start": "2026-01-01", "period_end": "2026-01-31"},
+            {"id": "s2", "period_start": "2026-02-01", "period_end": "2026-02-28"},
+        ]
+
+        def _positions(stmt_id):
+            if stmt_id == "s1":
+                return [{"symbol": "AAPL", "asset_class": "STK", "quantity": "100",
+                         "expiry": None, "strike": None, "right": None}]
+            return [{"symbol": "AAPL", "asset_class": "STK", "quantity": "200",
+                     "expiry": None, "strike": None, "right": None}]
+
+        mock_pos.side_effect = _positions
+
+        result = reconcile_holdings(
+            "ACCT1",
+            base_date=date(2026, 1, 31),
+            target_date=date(2026, 2, 28),
+        )
+        assert result["ok"] is False
+        assert len(result["mismatches"]) == 1
+        assert result["mismatches"][0]["symbol"] == "AAPL"
+        assert result["mismatches"][0]["expected_qty"] == "200"
+        assert result["mismatches"][0]["reconstructed_qty"] == "100"
+
+    @patch("src.db.check_coverage_gap", return_value=None)
+    @patch("src.db._get_account_trades_between", return_value=[])
+    @patch("src.db.get_positions", return_value=[])
+    @patch("src.db._get_account_statements")
+    def test_invalid_base_date(self, mock_stmts, mock_pos, mock_trades, mock_cov):
+        """Base date that doesn't match any statement returns skipped."""
+        from src.db import reconcile_holdings
+
+        mock_stmts.return_value = [
+            {"id": "s1", "period_start": "2026-01-01", "period_end": "2026-01-31"},
+            {"id": "s2", "period_start": "2026-02-01", "period_end": "2026-02-28"},
+        ]
+
+        result = reconcile_holdings(
+            "ACCT1",
+            base_date=date(2026, 3, 15),
+            target_date=date(2026, 2, 28),
+        )
+        assert result["ok"] is False
+        assert "No statement found" in result.get("skipped", "")
+
+    @patch("src.db.check_coverage_gap", return_value=None)
+    @patch("src.db._get_account_trades_between", return_value=[])
+    @patch("src.db.get_positions", return_value=[])
+    @patch("src.db._get_account_statements")
+    def test_base_after_target_skips(self, mock_stmts, mock_pos, mock_trades, mock_cov):
+        """Base date >= target date returns skipped."""
+        from src.db import reconcile_holdings
+
+        mock_stmts.return_value = [
+            {"id": "s1", "period_start": "2026-01-01", "period_end": "2026-01-31"},
+            {"id": "s2", "period_start": "2026-02-01", "period_end": "2026-02-28"},
+        ]
+
+        result = reconcile_holdings(
+            "ACCT1",
+            base_date=date(2026, 2, 28),
+            target_date=date(2026, 1, 31),
+        )
+        assert "skipped" in result
+        assert "before" in result["skipped"].lower()
+
+    @patch("src.db.check_coverage_gap", return_value=None)
+    @patch("src.db._get_account_trades_between")
+    @patch("src.db.get_positions")
+    @patch("src.db._get_account_statements")
+    def test_sell_reduces_position(self, mock_stmts, mock_pos, mock_trades, mock_cov):
+        """SLD trade reduces position quantity during reconciliation."""
+        from src.db import reconcile_holdings
+
+        mock_stmts.return_value = [
+            {"id": "s1", "period_start": "2026-01-01", "period_end": "2026-01-31"},
+            {"id": "s2", "period_start": "2026-02-01", "period_end": "2026-02-28"},
+        ]
+
+        def _positions(stmt_id):
+            if stmt_id == "s1":
+                return [{"symbol": "AAPL", "asset_class": "STK", "quantity": "100",
+                         "expiry": None, "strike": None, "right": None}]
+            return [{"symbol": "AAPL", "asset_class": "STK", "quantity": "70",
+                     "expiry": None, "strike": None, "right": None}]
+
+        mock_pos.side_effect = _positions
+        mock_trades.return_value = [
+            {"symbol": "AAPL", "asset_class": "STK", "side": "SLD",
+             "quantity": "30", "price": "180.00",
+             "trade_date": "2026-02-15T10:00:00",
+             "expiry": None, "strike": None, "right": None},
+        ]
+
+        result = reconcile_holdings("ACCT1")
+        assert result["ok"] is True
+
+    @patch("src.db.check_coverage_gap", return_value=None)
+    @patch("src.db._get_account_trades_between")
+    @patch("src.db.get_positions")
+    @patch("src.db._get_account_statements")
+    def test_new_position_from_trade(self, mock_stmts, mock_pos, mock_trades, mock_cov):
+        """A trade opening a new position that appears in the target snapshot."""
+        from src.db import reconcile_holdings
+
+        mock_stmts.return_value = [
+            {"id": "s1", "period_start": "2026-01-01", "period_end": "2026-01-31"},
+            {"id": "s2", "period_start": "2026-02-01", "period_end": "2026-02-28"},
+        ]
+
+        def _positions(stmt_id):
+            if stmt_id == "s1":
+                return []
+            return [{"symbol": "MSFT", "asset_class": "STK", "quantity": "50",
+                     "expiry": None, "strike": None, "right": None}]
+
+        mock_pos.side_effect = _positions
+        mock_trades.return_value = [
+            {"symbol": "MSFT", "asset_class": "STK", "side": "BOT",
+             "quantity": "50", "price": "400.00",
+             "trade_date": "2026-02-05T14:00:00",
+             "expiry": None, "strike": None, "right": None},
+        ]
+
+        result = reconcile_holdings("ACCT1")
+        assert result["ok"] is True
+
+
 # ── check_duplicates tests ───────────────────────────────────────────────
 
 
