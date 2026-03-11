@@ -9,7 +9,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import pandas as pd
 import streamlit as st
 
-from src.db import check_coverage_gap, get_statements, reconcile_holdings, reconstruct_holdings
+from src.db import (
+    check_coverage_gap,
+    get_statements,
+    reconcile_holdings,
+    reconcile_holdings_detail,
+    reconstruct_holdings,
+)
 
 st.title("Holdings")
 
@@ -281,4 +287,95 @@ for acct in target_accounts:
                 st.dataframe(
                     pd.DataFrame(result["extra_in_reconstruction"]),
                     use_container_width=True,
+                )
+
+# ── Per-holding reconciliation detail ────────────────────────────────────────
+
+st.divider()
+st.subheader("Per-Holding Reconciliation Detail")
+st.caption(
+    "Shows the starting quantity from the base snapshot, every trade applied "
+    "with a running balance, and whether the final quantity matches the "
+    "target snapshot. Expand any holding to see its full trade ledger."
+)
+
+for acct in target_accounts:
+    detail = reconcile_holdings_detail(acct, base_date=custom_base, target_date=custom_target)
+
+    if detail.get("skipped"):
+        st.info(f"**{acct}**: {detail['skipped']}")
+        continue
+
+    st.markdown(f"**{acct}** — {detail['base_date']} to {detail['target_date']}")
+
+    if not detail["holdings"]:
+        st.info("No holdings to reconcile.")
+        continue
+
+    # Build summary table
+    summary_rows = []
+    for symbol, h in detail["holdings"].items():
+        summary_rows.append({
+            "Symbol": symbol,
+            "Base Qty": h["base_qty"],
+            "Trades": len(h["trades"]),
+            "Final Qty": h["final_qty"],
+            "Expected Qty": h["expected_qty"],
+            "Match": h["match"],
+        })
+
+    summary_df = pd.DataFrame(summary_rows)
+    for col in ["Base Qty", "Final Qty", "Expected Qty"]:
+        summary_df[col] = pd.to_numeric(summary_df[col], errors="coerce")
+
+    # Show mismatches first
+    mismatched = summary_df[~summary_df["Match"]].reset_index(drop=True)
+    matched = summary_df[summary_df["Match"]].reset_index(drop=True)
+
+    if not mismatched.empty:
+        st.error(f"{len(mismatched)} holding(s) do not match:")
+        st.dataframe(
+            mismatched,
+            use_container_width=True,
+            column_config={
+                "Base Qty": st.column_config.NumberColumn(format="%.4f"),
+                "Final Qty": st.column_config.NumberColumn(format="%.4f"),
+                "Expected Qty": st.column_config.NumberColumn(format="%.4f"),
+            },
+        )
+
+    if not matched.empty:
+        with st.expander(f"{len(matched)} holding(s) match", expanded=False):
+            st.dataframe(
+                matched,
+                use_container_width=True,
+                column_config={
+                    "Base Qty": st.column_config.NumberColumn(format="%.4f"),
+                    "Final Qty": st.column_config.NumberColumn(format="%.4f"),
+                    "Expected Qty": st.column_config.NumberColumn(format="%.4f"),
+                },
+            )
+
+    # Per-holding trade ledger expanders
+    for symbol, h in detail["holdings"].items():
+        status = "OK" if h["match"] else "MISMATCH"
+        with st.expander(
+            f"{symbol}: {h['base_qty']} -> {h['final_qty']} "
+            f"(expected {h['expected_qty']}) [{status}]",
+            expanded=not h["match"],
+        ):
+            if not h["trades"]:
+                st.caption("No trades in this period.")
+            else:
+                ledger_df = pd.DataFrame(h["trades"])
+                ledger_df.columns = ["Date", "Side", "Quantity", "Running Qty"]
+                for col in ["Quantity", "Running Qty"]:
+                    ledger_df[col] = pd.to_numeric(ledger_df[col], errors="coerce")
+                st.dataframe(
+                    ledger_df,
+                    use_container_width=True,
+                    column_config={
+                        "Quantity": st.column_config.NumberColumn(format="%.4f"),
+                        "Running Qty": st.column_config.NumberColumn(format="%.4f"),
+                    },
                 )

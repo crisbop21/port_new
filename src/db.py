@@ -964,3 +964,170 @@ def reconcile_holdings(
         "extra_in_reconstruction": extra_in_reconstruction,
         "coverage_gap": coverage_gap,
     }
+
+
+def reconcile_holdings_detail(
+    account_id: str,
+    base_date: date | None = None,
+    target_date: date | None = None,
+) -> dict:
+    """Per-holding daily ledger showing how each position evolves from a base
+    snapshot through every trade to the target snapshot.
+
+    Returns a dict with:
+        ok: bool
+        base_date / target_date: str
+        holdings: dict[str, dict]  — keyed by symbol, each containing:
+            base_qty: str        — quantity in the base snapshot
+            trades: list[dict]   — each trade applied, with date, side, qty, running_qty
+            final_qty: str       — running quantity after all trades
+            expected_qty: str    — quantity in the target snapshot (or "0" if absent)
+            match: bool          — final_qty == expected_qty
+        skipped: str | None
+    """
+    stmts = _get_account_statements(account_id)
+    if len(stmts) < 2:
+        return {
+            "ok": True,
+            "base_date": stmts[0]["period_end"] if stmts else None,
+            "target_date": stmts[0]["period_end"] if stmts else None,
+            "holdings": {},
+            "skipped": "Need at least 2 statements to reconcile.",
+        }
+
+    stmts_by_date = {s["period_end"]: s for s in stmts}
+
+    if base_date is not None and base_date.isoformat() not in stmts_by_date:
+        return {
+            "ok": False,
+            "base_date": base_date.isoformat(),
+            "target_date": (target_date.isoformat() if target_date else None),
+            "holdings": {},
+            "skipped": f"No statement found with period_end = {base_date}.",
+        }
+
+    if target_date is not None and target_date.isoformat() not in stmts_by_date:
+        return {
+            "ok": False,
+            "base_date": (base_date.isoformat() if base_date else None),
+            "target_date": target_date.isoformat(),
+            "holdings": {},
+            "skipped": f"No statement found with period_end = {target_date}.",
+        }
+
+    earliest = stmts_by_date.get(base_date.isoformat()) if base_date else stmts[0]
+    latest = stmts_by_date.get(target_date.isoformat()) if target_date else stmts[-1]
+    earliest_end = date.fromisoformat(earliest["period_end"])
+    latest_end = date.fromisoformat(latest["period_end"])
+
+    if earliest_end >= latest_end:
+        return {
+            "ok": True,
+            "base_date": earliest["period_end"],
+            "target_date": latest["period_end"],
+            "holdings": {},
+            "skipped": "Base date must be before target date.",
+        }
+
+    # ── Build per-holding ledger ─────────────────────────────────────────────
+    base_positions = get_positions(earliest["id"])
+
+    # ledger keyed by position key
+    # Each entry: { symbol, asset_class, base_qty, trades: [], running_qty }
+    ledger: dict[tuple, dict] = {}
+    for p in base_positions:
+        key = _position_key(p)
+        ledger[key] = {
+            "symbol": p["symbol"],
+            "asset_class": p["asset_class"],
+            "base_qty": Decimal(str(p["quantity"])),
+            "trades": [],
+            "running_qty": Decimal(str(p["quantity"])),
+        }
+
+    trades = _get_account_trades_between(account_id, earliest_end, latest_end)
+    for t in trades:
+        key = _position_key(t)
+        qty = Decimal(str(t["quantity"]))
+
+        if key not in ledger:
+            ledger[key] = {
+                "symbol": t["symbol"],
+                "asset_class": t["asset_class"],
+                "base_qty": Decimal("0"),
+                "trades": [],
+                "running_qty": Decimal("0"),
+            }
+
+        if t["side"] == "BOT":
+            ledger[key]["running_qty"] += qty
+        else:
+            ledger[key]["running_qty"] -= qty
+
+        # Parse trade_date to date-only for display
+        td_raw = t.get("trade_date", "")
+        trade_dt = td_raw[:10] if isinstance(td_raw, str) else str(td_raw)
+
+        ledger[key]["trades"].append({
+            "date": trade_dt,
+            "side": t["side"],
+            "quantity": str(qty),
+            "running_qty": str(ledger[key]["running_qty"]),
+        })
+
+    # ── Build actual target snapshot ─────────────────────────────────────────
+    actual_positions = get_positions(latest["id"])
+    actual: dict[tuple, Decimal] = {}
+    for p in actual_positions:
+        key = _position_key(p)
+        actual[key] = Decimal(str(p["quantity"]))
+        # Ensure positions that only exist in the target appear in the ledger
+        if key not in ledger:
+            ledger[key] = {
+                "symbol": p["symbol"],
+                "asset_class": p["asset_class"],
+                "base_qty": Decimal("0"),
+                "trades": [],
+                "running_qty": Decimal("0"),
+            }
+
+    # ── Assemble output ──────────────────────────────────────────────────────
+    all_ok = True
+    holdings: dict[str, dict] = {}
+
+    for key in sorted(ledger.keys(), key=lambda k: k[0]):
+        entry = ledger[key]
+        final_qty = entry["running_qty"]
+        expected_qty = actual.get(key, Decimal("0"))
+
+        # Skip expired options with zero quantity on both sides
+        if entry["asset_class"] == "OPT" and len(key) == 4 and key[1]:
+            expiry_val = key[1]
+            expiry_date = (
+                date.fromisoformat(expiry_val) if isinstance(expiry_val, str) else expiry_val
+            )
+            if expiry_date < latest_end and final_qty <= 0 and expected_qty <= 0:
+                continue
+
+        match = final_qty == expected_qty
+        if not match:
+            all_ok = False
+
+        # Use symbol as display key; for options include option details
+        display_key = entry["symbol"]
+
+        holdings[display_key] = {
+            "base_qty": str(entry["base_qty"]),
+            "trades": entry["trades"],
+            "final_qty": str(final_qty),
+            "expected_qty": str(expected_qty),
+            "match": match,
+        }
+
+    return {
+        "ok": all_ok,
+        "base_date": earliest["period_end"],
+        "target_date": latest["period_end"],
+        "holdings": holdings,
+        "skipped": None,
+    }
