@@ -9,7 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import pandas as pd
 import streamlit as st
 
-from src.db import get_statements, reconstruct_holdings
+from src.db import check_coverage_gap, get_statements, reconcile_holdings, reconstruct_holdings
 
 st.title("Holdings")
 
@@ -21,7 +21,7 @@ if not statements:
     st.info("No statements uploaded yet. Go to **Upload** to import a PDF.")
     st.stop()
 
-# Group statements by account; track widest date range and latest statement
+# Group statements by account; track widest date range
 accounts: dict[str, dict] = {}
 for s in statements:
     acct = s["account_id"]
@@ -29,14 +29,12 @@ for s in statements:
     p_end = date.fromisoformat(s["period_end"])
     if acct not in accounts:
         accounts[acct] = {
-            "latest_id": s["id"],
             "period_start": p_start,
             "period_end": p_end,
         }
     else:
         info = accounts[acct]
         if p_end > info["period_end"]:
-            info["latest_id"] = s["id"]
             info["period_end"] = p_end
         if p_start < info["period_start"]:
             info["period_start"] = p_start
@@ -60,20 +58,40 @@ as_of = st.date_input(
     value=acct_info["period_end"],
     min_value=acct_info["period_start"],
     max_value=acct_info["period_end"],
-    help="Positions are reconstructed by reversing trades after this date.",
+    help="Positions are reconstructed from the nearest prior snapshot plus subsequent trades.",
 )
 
 is_historical = as_of < acct_info["period_end"]
+
+# ── Coverage-gap check ──────────────────────────────────────────────────────
+
+if is_historical:
+    if selected_account == "All Accounts":
+        gap_warnings = {
+            acct: check_coverage_gap(acct, as_of)
+            for acct in accounts
+        }
+        gap_warnings = {k: v for k, v in gap_warnings.items() if v is not None}
+    else:
+        gap_msg = check_coverage_gap(selected_account, as_of)
+        gap_warnings = {selected_account: gap_msg} if gap_msg else {}
+
+    if gap_warnings:
+        for acct, msg in gap_warnings.items():
+            st.warning(
+                f"**{acct}**: {msg} "
+                "Reconstructed holdings may be inaccurate — upload the missing statement(s)."
+            )
 
 # ── Reconstruct holdings ────────────────────────────────────────────────────
 
 with st.spinner("Reconstructing holdings..."):
     if selected_account == "All Accounts":
         rows = []
-        for acct, info in accounts.items():
-            rows.extend(reconstruct_holdings(info["latest_id"], as_of))
+        for acct in accounts:
+            rows.extend(reconstruct_holdings(acct, as_of))
     else:
-        rows = reconstruct_holdings(accounts[selected_account]["latest_id"], as_of)
+        rows = reconstruct_holdings(selected_account, as_of)
 
 if not rows:
     st.warning("No holdings found as of this date.")
@@ -147,3 +165,76 @@ for asset_class, group in df.groupby("asset_class", sort=True):
             "multiplier": st.column_config.NumberColumn("Mult", format="%d"),
         },
     )
+
+# ── Data integrity: reconciliation check ─────────────────────────────────────
+
+st.divider()
+st.subheader("Data Integrity Check")
+st.caption(
+    "Rolls forward from the earliest snapshot through all trades to the latest "
+    "snapshot, then compares. Mismatches indicate missing trades, duplicate "
+    "entries, or corporate actions not captured in the statement."
+)
+
+target_accounts = list(accounts.keys()) if selected_account == "All Accounts" else [selected_account]
+
+for acct in target_accounts:
+    result = reconcile_holdings(acct)
+
+    if result.get("skipped"):
+        st.info(f"**{acct}**: {result['skipped']}")
+        continue
+
+    header = f"**{acct}** — {result['base_date']} → {result['target_date']}"
+
+    if result["coverage_gap"]:
+        st.warning(f"{header}: Coverage gap detected — {result['coverage_gap']}")
+
+    if result["ok"]:
+        st.success(f"{header}: Reconciliation passed — initial + trades = final snapshot.")
+    else:
+        st.error(f"{header}: Reconciliation FAILED — differences found below.")
+
+        if result["mismatches"]:
+            with st.expander(f"Quantity mismatches ({len(result['mismatches'])})", expanded=True):
+                st.dataframe(
+                    pd.DataFrame(result["mismatches"]),
+                    use_container_width=True,
+                    column_config={
+                        "expected_qty": "Snapshot Qty",
+                        "reconstructed_qty": "Reconstructed Qty",
+                        "diff": "Difference",
+                    },
+                )
+
+        if result["missing_from_reconstruction"]:
+            with st.expander(
+                f"In snapshot but not reconstructed ({len(result['missing_from_reconstruction'])})",
+                expanded=True,
+            ):
+                st.caption(
+                    "These positions appear in the latest snapshot but could not be "
+                    "built from the earliest snapshot + trades. Possible causes: "
+                    "missing statement covering the period when these were bought, "
+                    "or corporate action (spin-off, merger)."
+                )
+                st.dataframe(
+                    pd.DataFrame(result["missing_from_reconstruction"]),
+                    use_container_width=True,
+                )
+
+        if result["extra_in_reconstruction"]:
+            with st.expander(
+                f"Reconstructed but not in snapshot ({len(result['extra_in_reconstruction'])})",
+                expanded=True,
+            ):
+                st.caption(
+                    "These positions show up when rolling forward but are absent "
+                    "from the latest snapshot. Possible causes: position was closed "
+                    "by a trade missing from the database, option expired/exercised, "
+                    "or corporate action."
+                )
+                st.dataframe(
+                    pd.DataFrame(result["extra_in_reconstruction"]),
+                    use_container_width=True,
+                )
