@@ -11,8 +11,8 @@ from src.parser import parse_statement
 from src.db import (
     upsert_statement,
     check_duplicates,
-    check_coverage_gap,
-    reconcile_holdings,
+    get_snapshot_dates,
+    reconcile_pair,
     clear_query_caches,
     get_client,
 )
@@ -163,39 +163,38 @@ if uploaded is not None:
             except Exception as exc:
                 st.warning(f"Could not verify: {exc}")
 
-        # ── Post-save: gap & reconciliation alerts ────────────────────
+        # ── Post-save: reconciliation alerts ─────────────────────────
         if saved > 0:
             st.divider()
             st.subheader("Post-upload integrity check")
             for parsed in statements:
                 acct = parsed.meta.account_id
 
-                gap = check_coverage_gap(acct, parsed.meta.period_end)
-                if gap:
-                    st.warning(
-                        f"**{acct}** — Coverage gap: {gap} "
-                        "Upload the missing statement(s) to fill the gap."
+                snapshot_dates = get_snapshot_dates(acct)
+                if len(snapshot_dates) < 2:
+                    st.info(
+                        f"**{acct}**: Only {len(snapshot_dates)} snapshot(s) — "
+                        "need at least 2 to reconcile."
                     )
+                    continue
 
-                recon = reconcile_holdings(acct)
-                if recon.get("skipped"):
-                    st.info(f"**{acct}**: {recon['skipped']}")
-                elif recon["ok"]:
+                # Reconcile the last two consecutive snapshots
+                base_d = snapshot_dates[-2]
+                target_d = snapshot_dates[-1]
+                recon = reconcile_pair(acct, base_d, target_d)
+
+                if recon["ok"]:
                     st.success(
                         f"**{acct}**: Reconciliation passed — "
-                        f"earliest snapshot ({recon['base_date']}) + trades "
-                        f"= latest snapshot ({recon['target_date']})."
+                        f"{recon['base_date']} + trades = {recon['target_date']}."
                     )
                 else:
-                    problems = (
-                        len(recon["mismatches"])
-                        + len(recon["missing_from_reconstruction"])
-                        + len(recon["extra_in_reconstruction"])
+                    mismatched = sum(
+                        1 for h in recon["holdings"].values() if not h["match"]
                     )
                     st.error(
-                        f"**{acct}**: Reconciliation FAILED — {problems} difference(s) "
-                        f"between earliest ({recon['base_date']}) + trades and "
-                        f"latest snapshot ({recon['target_date']}). "
+                        f"**{acct}**: Reconciliation FAILED — {mismatched} holding(s) "
+                        f"differ between {recon['base_date']} and {recon['target_date']}. "
                         "Go to **Holdings** for details."
                     )
 
