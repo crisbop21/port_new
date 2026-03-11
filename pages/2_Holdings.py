@@ -171,15 +171,59 @@ for asset_class, group in df.groupby("asset_class", sort=True):
 st.divider()
 st.subheader("Data Integrity Check")
 st.caption(
-    "Rolls forward from the earliest snapshot through all trades to the latest "
+    "Rolls forward from a base snapshot through all trades to a target "
     "snapshot, then compares. Mismatches indicate missing trades, duplicate "
     "entries, or corporate actions not captured in the statement."
 )
 
 target_accounts = list(accounts.keys()) if selected_account == "All Accounts" else [selected_account]
 
+# Collect available statement dates per account for the date pickers
+_stmt_dates_by_acct: dict[str, list[date]] = {}
+for s in statements:
+    acct = s["account_id"]
+    if acct not in target_accounts:
+        continue
+    d = date.fromisoformat(s["period_end"])
+    _stmt_dates_by_acct.setdefault(acct, []).append(d)
+for acct in _stmt_dates_by_acct:
+    _stmt_dates_by_acct[acct] = sorted(set(_stmt_dates_by_acct[acct]))
+
+# If only one account, let the user choose the two dates
+_all_stmt_dates = sorted(
+    {d for dates in _stmt_dates_by_acct.values() for d in dates}
+)
+
+use_custom_dates = False
+custom_base: date | None = None
+custom_target: date | None = None
+
+if len(_all_stmt_dates) >= 2:
+    use_custom_dates = st.checkbox(
+        "Choose reconciliation dates",
+        help="Select specific base and target statement dates instead of earliest/latest.",
+    )
+
+if use_custom_dates and len(_all_stmt_dates) >= 2:
+    col_b, col_t = st.columns(2)
+    with col_b:
+        custom_base = st.selectbox(
+            "Base date (start from)",
+            options=_all_stmt_dates[:-1],
+            index=0,
+            format_func=lambda d: d.isoformat(),
+        )
+    with col_t:
+        valid_targets = [d for d in _all_stmt_dates if d > custom_base]
+        custom_target = st.selectbox(
+            "Target date (compare against)",
+            options=valid_targets,
+            index=len(valid_targets) - 1 if valid_targets else 0,
+            format_func=lambda d: d.isoformat(),
+        )
+
 for acct in target_accounts:
-    result = reconcile_holdings(acct)
+    result = reconcile_holdings(acct, base_date=custom_base, target_date=custom_target)
 
     if result.get("skipped"):
         st.info(f"**{acct}**: {result['skipped']}")
@@ -213,8 +257,8 @@ for acct in target_accounts:
                 expanded=True,
             ):
                 st.caption(
-                    "These positions appear in the latest snapshot but could not be "
-                    "built from the earliest snapshot + trades. Possible causes: "
+                    "These positions appear in the target snapshot but could not be "
+                    "built from the base snapshot + trades. Possible causes: "
                     "missing statement covering the period when these were bought, "
                     "or corporate action (spin-off, merger)."
                 )
@@ -230,7 +274,7 @@ for acct in target_accounts:
             ):
                 st.caption(
                     "These positions show up when rolling forward but are absent "
-                    "from the latest snapshot. Possible causes: position was closed "
+                    "from the target snapshot. Possible causes: position was closed "
                     "by a trade missing from the database, option expired/exercised, "
                     "or corporate action."
                 )
