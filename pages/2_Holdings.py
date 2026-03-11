@@ -195,7 +195,18 @@ for s in statements:
 for acct in _stmt_dates_by_acct:
     _stmt_dates_by_acct[acct] = sorted(set(_stmt_dates_by_acct[acct]))
 
-# If only one account, let the user choose the two dates
+# Check if any individual account has enough statements to reconcile
+_any_account_reconcilable = any(
+    len(dates) >= 2 for dates in _stmt_dates_by_acct.values()
+)
+
+if not _any_account_reconcilable:
+    st.info(
+        "Each account needs at least 2 statements (different period ends) to "
+        "reconcile. Upload more statements to enable this check."
+    )
+
+# Combine all statement dates for the date pickers
 _all_stmt_dates = sorted(
     {d for dates in _stmt_dates_by_acct.values() for d in dates}
 )
@@ -204,7 +215,7 @@ use_custom_dates = False
 custom_base: date | None = None
 custom_target: date | None = None
 
-if len(_all_stmt_dates) >= 2:
+if _any_account_reconcilable and len(_all_stmt_dates) >= 2:
     use_custom_dates = st.checkbox(
         "Choose reconciliation dates",
         help="Select specific base and target statement dates instead of earliest/latest.",
@@ -227,6 +238,14 @@ if use_custom_dates and len(_all_stmt_dates) >= 2:
             index=len(valid_targets) - 1 if valid_targets else 0,
             format_func=lambda d: d.isoformat(),
         )
+
+# Gate reconciliation behind a button so users explicitly trigger it
+_run_reconciliation = False
+if _any_account_reconcilable:
+    _run_reconciliation = st.button("Run Reconciliation", type="primary")
+
+if not _run_reconciliation:
+    st.stop()
 
 for acct in target_accounts:
     result = reconcile_holdings(acct, base_date=custom_base, target_date=custom_target)
