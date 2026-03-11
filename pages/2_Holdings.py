@@ -123,25 +123,26 @@ else:
 
 st.divider()
 
-# ── Consolidated cost basis per symbol ─────────────────────────────────────
+# ── Consolidated market value per symbol ───────────────────────────────────
 
-st.subheader("Cost Basis by Symbol")
+st.subheader("Market Value by Symbol" if has_market_data else "Cost Basis by Symbol")
 
-# Build consolidated view: for options use strike*100*contracts, else qty*cost_basis
 consol_rows = []
 for _, row in df.iterrows():
-    if row["asset_class"] == "OPT":
+    if has_market_data and pd.notna(row.get("market_value")):
+        value = abs(float(row["market_value"]))
+    elif row["asset_class"] == "OPT":
         value = float(row.get("strike", 0) or 0) * 100 * abs(float(row["quantity"]))
     else:
         value = abs(float(row["quantity"])) * float(row["cost_basis"])
-    consol_rows.append({"symbol": row["symbol"], "cost_basis": value})
+    consol_rows.append({"symbol": row["symbol"], "market_value": value})
 
-consol_df = pd.DataFrame(consol_rows).groupby("symbol", as_index=False)["cost_basis"].sum()
-total_cost = consol_df["cost_basis"].sum()
+consol_df = pd.DataFrame(consol_rows).groupby("symbol", as_index=False)["market_value"].sum()
+total_mv = consol_df["market_value"].sum()
 consol_df["pct_of_account"] = (
-    (consol_df["cost_basis"] / total_cost * 100) if total_cost else 0.0
+    (consol_df["market_value"] / total_mv * 100) if total_mv else 0.0
 )
-consol_df = consol_df.sort_values("cost_basis", ascending=False).reset_index(drop=True)
+consol_df = consol_df.sort_values("market_value", ascending=False).reset_index(drop=True)
 
 col_table, col_chart = st.columns([1, 1])
 
@@ -149,12 +150,12 @@ with col_table:
     st.dataframe(
         consol_df.rename(columns={
             "symbol": "Symbol",
-            "cost_basis": "Cost Basis ($)",
+            "market_value": "Market Value ($)",
             "pct_of_account": "% of Account",
         }),
         use_container_width=True,
         column_config={
-            "Cost Basis ($)": st.column_config.NumberColumn(format="$%.2f"),
+            "Market Value ($)": st.column_config.NumberColumn(format="$%.2f"),
             "% of Account": st.column_config.NumberColumn(format="%.1f%%"),
         },
         hide_index=True,
@@ -168,11 +169,11 @@ with col_chart:
         alt.Chart(chart_data)
         .mark_arc(innerRadius=50)
         .encode(
-            theta=alt.Theta("cost_basis:Q", title="Cost Basis"),
+            theta=alt.Theta("market_value:Q", title="Market Value"),
             color=alt.Color("symbol:N", title="Symbol"),
             tooltip=[
                 alt.Tooltip("symbol:N", title="Symbol"),
-                alt.Tooltip("cost_basis:Q", title="Cost Basis", format="$,.2f"),
+                alt.Tooltip("market_value:Q", title="Market Value", format="$,.2f"),
                 alt.Tooltip("pct_of_account:Q", title="% of Account", format=".1f"),
             ],
         )
