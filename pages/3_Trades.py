@@ -224,6 +224,11 @@ else:
     else:
         pos_df["market_value"] = 0.0
 
+    if "cost_basis" not in pos_df.columns:
+        pos_df["cost_basis"] = 0.0
+    else:
+        pos_df["cost_basis"] = pos_df["cost_basis"].fillna(0.0)
+
     # Consolidate by underlying ticker
     pos_df["underlying"] = pos_df["symbol"].str.split().str[0]
 
@@ -232,6 +237,7 @@ else:
         .agg(
             unrealized_pnl=("unrealized_pnl", "sum"),
             market_value=("market_value", "sum"),
+            cost_basis=("cost_basis", "sum"),
             positions=("symbol", "count"),
             quantity=("quantity", "sum"),
         )
@@ -240,17 +246,23 @@ else:
         .sort_values("unrealized_pnl", ascending=False)
     )
 
+    # Weighted-average breakeven price = total cost basis / total quantity
+    unrealized_stats["breakeven"] = (
+        unrealized_stats["cost_basis"] / unrealized_stats["quantity"].replace(0, float("nan"))
+    ).abs()
+
     total_unrealized = unrealized_stats["unrealized_pnl"].sum()
     st.metric("Total Unrealized P&L", f"${total_unrealized:,.2f}",
               delta=f"{total_unrealized:,.2f}")
 
     st.dataframe(
-        unrealized_stats[["symbol", "quantity", "market_value", "unrealized_pnl", "positions"]],
+        unrealized_stats[["symbol", "quantity", "breakeven", "market_value", "unrealized_pnl", "positions"]],
         use_container_width=True,
         hide_index=True,
         column_config={
             "symbol": "Symbol",
             "quantity": st.column_config.NumberColumn("Total Qty", format="%.2f"),
+            "breakeven": st.column_config.NumberColumn("Avg Breakeven", format="$%.2f"),
             "market_value": st.column_config.NumberColumn("Market Value", format="$%.2f"),
             "unrealized_pnl": st.column_config.NumberColumn("Unrealized P&L", format="$%.2f"),
             "positions": "Positions",
