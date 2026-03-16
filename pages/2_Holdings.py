@@ -136,16 +136,47 @@ for _, row in df.iterrows():
     else:
         value = abs(float(row["quantity"])) * float(row["cost_basis"])
     qty = abs(float(row["quantity"]))
-    cost = abs(float(row.get("cost_basis", 0) or 0)) * qty
-    consol_rows.append({"symbol": row["symbol"], "market_value": value, "total_cost": cost, "quantity": qty})
+    multiplier = 100 if row["asset_class"] == "OPT" else 1
+    cost = abs(float(row.get("cost_basis", 0) or 0)) * qty * multiplier
+    consol_rows.append({
+        "symbol": row["symbol"],
+        "market_value": value,
+        "total_cost": cost,
+        "quantity": qty,
+        "asset_class": row["asset_class"],
+        "strike": float(row.get("strike", 0) or 0),
+        "right": row.get("right"),
+    })
 
 consol_df = (
     pd.DataFrame(consol_rows)
     .groupby("symbol", as_index=False)
-    .agg(market_value=("market_value", "sum"), total_cost=("total_cost", "sum"), quantity=("quantity", "sum"))
+    .agg(
+        market_value=("market_value", "sum"),
+        total_cost=("total_cost", "sum"),
+        quantity=("quantity", "sum"),
+        asset_class=("asset_class", "first"),
+        strike=("strike", "first"),
+        right=("right", "first"),
+    )
 )
-consol_df["breakeven"] = (
-    consol_df["total_cost"] / consol_df["quantity"].replace(0, float("nan"))
+
+# Breakeven calculation:
+# STK/ETF: weighted average cost basis = total_cost / quantity
+# OPT calls: strike + avg premium per share (total_cost / quantity / 100)
+# OPT puts:  strike - avg premium per share (total_cost / quantity / 100)
+safe_qty = consol_df["quantity"].replace(0, float("nan"))
+is_opt = consol_df["asset_class"] == "OPT"
+avg_premium = consol_df["total_cost"] / safe_qty / 100  # per-share premium for options
+is_call = consol_df["right"] == "C"
+
+consol_df["breakeven"] = float("nan")
+consol_df.loc[~is_opt, "breakeven"] = consol_df.loc[~is_opt, "total_cost"] / safe_qty[~is_opt]
+consol_df.loc[is_opt & is_call, "breakeven"] = (
+    consol_df.loc[is_opt & is_call, "strike"] + avg_premium[is_opt & is_call]
+)
+consol_df.loc[is_opt & ~is_call, "breakeven"] = (
+    consol_df.loc[is_opt & ~is_call, "strike"] - avg_premium[is_opt & ~is_call]
 )
 total_mv = consol_df["market_value"].sum()
 consol_df["pct_of_account"] = (
