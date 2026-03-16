@@ -194,7 +194,9 @@ st.divider()
 
 st.subheader("Unrealized P&L by Symbol")
 
-# Determine which accounts to load positions for
+# Load ALL open positions from the latest snapshot for each account.
+# This is independent of the trade-date filters above — it always
+# reflects the most recent position snapshot so you see every holding.
 _accts = [account_filter] if account_filter else get_account_ids()
 
 _pos_rows: list[dict] = []
@@ -211,46 +213,56 @@ else:
         if _nc in pos_df.columns:
             pos_df[_nc] = pd.to_numeric(pos_df[_nc], errors="coerce")
 
-    if "unrealized_pnl" not in pos_df.columns or pos_df["unrealized_pnl"].isna().all():
-        st.info("Unrealized P&L data not available in the latest position snapshot.")
+    # Fill missing unrealized_pnl with 0 (positions with no market movement)
+    if "unrealized_pnl" not in pos_df.columns:
+        pos_df["unrealized_pnl"] = 0.0
     else:
-        # Consolidate by underlying ticker
-        pos_df["underlying"] = pos_df["symbol"].str.split().str[0]
+        pos_df["unrealized_pnl"] = pos_df["unrealized_pnl"].fillna(0.0)
 
-        unrealized_stats = (
-            pos_df.groupby("underlying")
-            .agg(
-                unrealized_pnl=("unrealized_pnl", "sum"),
-                market_value=("market_value", "sum"),
-                positions=("unrealized_pnl", "count"),
-            )
-            .reset_index()
-            .rename(columns={"underlying": "symbol"})
-            .sort_values("unrealized_pnl", ascending=False)
+    if "market_value" in pos_df.columns:
+        pos_df["market_value"] = pos_df["market_value"].fillna(0.0)
+    else:
+        pos_df["market_value"] = 0.0
+
+    # Consolidate by underlying ticker
+    pos_df["underlying"] = pos_df["symbol"].str.split().str[0]
+
+    unrealized_stats = (
+        pos_df.groupby("underlying")
+        .agg(
+            unrealized_pnl=("unrealized_pnl", "sum"),
+            market_value=("market_value", "sum"),
+            positions=("symbol", "count"),
+            quantity=("quantity", "sum"),
         )
+        .reset_index()
+        .rename(columns={"underlying": "symbol"})
+        .sort_values("unrealized_pnl", ascending=False)
+    )
 
-        total_unrealized = unrealized_stats["unrealized_pnl"].sum()
-        st.metric("Total Unrealized P&L", f"${total_unrealized:,.2f}",
-                  delta=f"{total_unrealized:,.2f}")
+    total_unrealized = unrealized_stats["unrealized_pnl"].sum()
+    st.metric("Total Unrealized P&L", f"${total_unrealized:,.2f}",
+              delta=f"{total_unrealized:,.2f}")
 
-        st.dataframe(
-            unrealized_stats[["symbol", "unrealized_pnl", "market_value", "positions"]],
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "symbol": "Symbol",
-                "unrealized_pnl": st.column_config.NumberColumn("Unrealized P&L", format="$%.2f"),
-                "market_value": st.column_config.NumberColumn("Market Value", format="$%.2f"),
-                "positions": "Positions",
-            },
-        )
+    st.dataframe(
+        unrealized_stats[["symbol", "quantity", "market_value", "unrealized_pnl", "positions"]],
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "symbol": "Symbol",
+            "quantity": st.column_config.NumberColumn("Total Qty", format="%.2f"),
+            "market_value": st.column_config.NumberColumn("Market Value", format="$%.2f"),
+            "unrealized_pnl": st.column_config.NumberColumn("Unrealized P&L", format="$%.2f"),
+            "positions": "Positions",
+        },
+    )
 
-        # Bar chart of unrealized P&L by symbol
-        top_u = min(10, len(unrealized_stats))
-        st.bar_chart(
-            unrealized_stats.head(top_u).set_index("symbol")["unrealized_pnl"]
-            .rename("Unrealized P&L by Symbol")
-        )
+    # Bar chart of unrealized P&L by symbol
+    top_u = min(10, len(unrealized_stats))
+    st.bar_chart(
+        unrealized_stats.head(top_u).set_index("symbol")["unrealized_pnl"]
+        .rename("Unrealized P&L by Symbol")
+    )
 
 st.divider()
 
