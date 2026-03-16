@@ -150,8 +150,8 @@ if not trade_df.empty:
         use_container_width=True,
         column_config={
             "trade_date": st.column_config.DatetimeColumn("Date", format="YYYY-MM-DD HH:mm"),
-            "price": st.column_config.NumberColumn(format="$%.2f"),
-            "realized_pnl": st.column_config.NumberColumn("Realized P&L", format="$%.2f"),
+            "price": st.column_config.NumberColumn(format="$%,.2f"),
+            "realized_pnl": st.column_config.NumberColumn("Realized P&L", format="$%,.2f"),
         },
     )
 
