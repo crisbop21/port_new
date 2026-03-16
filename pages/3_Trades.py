@@ -143,12 +143,17 @@ if not closing_trades.empty:
 
 st.divider()
 
-# ── Per-symbol breakdown ─────────────────────────────────────────────────────
+# ── Per-symbol breakdown (consolidated by underlying) ────────────────────────
 
 st.subheader("P&L by Symbol")
 
+# Extract the underlying ticker (first word) so option contracts
+# like "AAPL 20240119 150.0 C" consolidate under "AAPL".
+closing_trades = closing_trades.copy()
+closing_trades["underlying"] = closing_trades["symbol"].str.split().str[0]
+
 symbol_stats = (
-    closing_trades.groupby("symbol")
+    closing_trades.groupby("underlying")
     .agg(
         total_pnl=("realized_pnl", "sum"),
         trades=("realized_pnl", "count"),
@@ -157,6 +162,7 @@ symbol_stats = (
         total_commission=("commission", "sum"),
     )
     .reset_index()
+    .rename(columns={"underlying": "symbol"})
 )
 if not symbol_stats.empty:
     symbol_stats["win_rate"] = (symbol_stats["wins"] / symbol_stats["trades"] * 100).round(1)
