@@ -9,7 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import pandas as pd
 import streamlit as st
 
-from src.db import get_account_ids, get_trades
+from src.db import get_account_ids, get_positions_as_of, get_snapshot_dates, get_trades
 
 st.title("Trade History")
 
@@ -187,6 +187,70 @@ if not symbol_stats.empty:
     st.bar_chart(
         symbol_stats.head(top_n).set_index("symbol")["total_pnl"].rename("P&L by Symbol")
     )
+
+st.divider()
+
+# ── Unrealized P&L by Symbol ────────────────────────────────────────────────
+
+st.subheader("Unrealized P&L by Symbol")
+
+# Determine which accounts to load positions for
+_accts = [account_filter] if account_filter else get_account_ids()
+
+_pos_rows: list[dict] = []
+for _acct in _accts:
+    _snap_dates = get_snapshot_dates(_acct)
+    if _snap_dates:
+        _pos_rows.extend(get_positions_as_of(_acct, _snap_dates[-1]))
+
+if not _pos_rows:
+    st.info("No position snapshots available — upload a statement with open positions.")
+else:
+    pos_df = pd.DataFrame(_pos_rows)
+    for _nc in ["quantity", "market_value", "unrealized_pnl", "cost_basis"]:
+        if _nc in pos_df.columns:
+            pos_df[_nc] = pd.to_numeric(pos_df[_nc], errors="coerce")
+
+    if "unrealized_pnl" not in pos_df.columns or pos_df["unrealized_pnl"].isna().all():
+        st.info("Unrealized P&L data not available in the latest position snapshot.")
+    else:
+        # Consolidate by underlying ticker
+        pos_df["underlying"] = pos_df["symbol"].str.split().str[0]
+
+        unrealized_stats = (
+            pos_df.groupby("underlying")
+            .agg(
+                unrealized_pnl=("unrealized_pnl", "sum"),
+                market_value=("market_value", "sum"),
+                positions=("unrealized_pnl", "count"),
+            )
+            .reset_index()
+            .rename(columns={"underlying": "symbol"})
+            .sort_values("unrealized_pnl", ascending=False)
+        )
+
+        total_unrealized = unrealized_stats["unrealized_pnl"].sum()
+        st.metric("Total Unrealized P&L", f"${total_unrealized:,.2f}",
+                  delta=f"{total_unrealized:,.2f}")
+
+        st.dataframe(
+            unrealized_stats[["symbol", "unrealized_pnl", "market_value", "positions"]],
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "symbol": "Symbol",
+                "unrealized_pnl": st.column_config.NumberColumn("Unrealized P&L", format="$%.2f"),
+                "market_value": st.column_config.NumberColumn("Market Value", format="$%.2f"),
+                "positions": "Positions",
+            },
+        )
+
+        # Bar chart of unrealized P&L by symbol
+        top_u = min(10, len(unrealized_stats))
+        st.bar_chart(
+            unrealized_stats.head(top_u).set_index("symbol")["unrealized_pnl"]
+            .rename("Unrealized P&L by Symbol")
+        )
 
 st.divider()
 
