@@ -135,9 +135,18 @@ for _, row in df.iterrows():
         value = float(row.get("strike", 0) or 0) * 100 * abs(float(row["quantity"]))
     else:
         value = abs(float(row["quantity"])) * float(row["cost_basis"])
-    consol_rows.append({"symbol": row["symbol"], "market_value": value})
+    qty = abs(float(row["quantity"]))
+    cost = abs(float(row.get("cost_basis", 0) or 0)) * qty
+    consol_rows.append({"symbol": row["symbol"], "market_value": value, "total_cost": cost, "quantity": qty})
 
-consol_df = pd.DataFrame(consol_rows).groupby("symbol", as_index=False)["market_value"].sum()
+consol_df = (
+    pd.DataFrame(consol_rows)
+    .groupby("symbol", as_index=False)
+    .agg(market_value=("market_value", "sum"), total_cost=("total_cost", "sum"), quantity=("quantity", "sum"))
+)
+consol_df["breakeven"] = (
+    consol_df["total_cost"] / consol_df["quantity"].replace(0, float("nan"))
+)
 total_mv = consol_df["market_value"].sum()
 consol_df["pct_of_account"] = (
     (consol_df["market_value"] / total_mv * 100) if total_mv else 0.0
@@ -148,13 +157,17 @@ col_table, col_chart = st.columns([1, 1])
 
 with col_table:
     st.dataframe(
-        consol_df.rename(columns={
+        consol_df[["symbol", "quantity", "breakeven", "market_value", "pct_of_account"]].rename(columns={
             "symbol": "Symbol",
+            "quantity": "Total Qty",
+            "breakeven": "Avg Breakeven",
             "market_value": "Market Value ($)",
             "pct_of_account": "% of Account",
         }),
         use_container_width=True,
         column_config={
+            "Total Qty": st.column_config.NumberColumn(format="%.2f"),
+            "Avg Breakeven": st.column_config.NumberColumn(format="$%.2f"),
             "Market Value ($)": st.column_config.NumberColumn(format="$%.2f"),
             "% of Account": st.column_config.NumberColumn(format="%.1f%%"),
         },
