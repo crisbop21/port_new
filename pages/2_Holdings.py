@@ -76,7 +76,8 @@ with st.spinner("Loading holdings..."):
         positions = get_positions_as_of(acct, as_of)
         for p in positions:
             multiplier = 100 if p.get("asset_class") == "OPT" else 1
-            cost_value = float(p["quantity"]) * float(p["cost_basis"]) * multiplier
+            # cost_basis from IBKR is already total cost for the position
+            cost_value = abs(float(p["cost_basis"]))
             rows.append({
                 **p,
                 "multiplier": multiplier,
@@ -118,7 +119,7 @@ else:
     col3.metric("As-of", str(as_of))
     st.caption(
         "Market value and unrealized P&L may be unavailable. "
-        "Cost value = quantity x cost basis x multiplier."
+        "Cost value is the total cost basis reported by IBKR."
     )
 
 st.divider()
@@ -136,8 +137,8 @@ for _, row in df.iterrows():
     else:
         value = abs(float(row["quantity"])) * float(row["cost_basis"])
     qty = abs(float(row["quantity"]))
-    multiplier = 100 if row["asset_class"] == "OPT" else 1
-    cost = abs(float(row.get("cost_basis", 0) or 0)) * qty * multiplier
+    # cost_basis from IBKR is already total cost for the position
+    cost = abs(float(row.get("cost_basis", 0) or 0))
     consol_rows.append({
         "symbol": row["symbol"],
         "market_value": value,

@@ -240,21 +240,25 @@ else:
         pos_df["asset_class"] = "STK"
 
     # Per-position breakeven and weight (shares equivalent)
-    # STK/ETF: breakeven = cost_basis, weight = |quantity|
-    # OPT call: breakeven = strike + |cost_basis| (premium per share), weight = |quantity| * 100
-    # OPT put:  breakeven = strike - |cost_basis|, weight = |quantity| * 100
+    # cost_basis from IBKR is already the TOTAL cost for the position
+    # STK/ETF: breakeven = cost_basis / |quantity|  (per-share avg cost)
+    # OPT: premium_per_share = cost_basis / (|quantity| * 100)
+    # OPT call: breakeven = strike + premium_per_share
+    # OPT put:  breakeven = strike - premium_per_share
     is_opt = pos_df["asset_class"] == "OPT"
     is_call = pos_df["right"] == "C"
     abs_cost = pos_df["cost_basis"].abs()
     abs_qty = pos_df["quantity"].abs()
 
     pos_df["pos_breakeven"] = float("nan")
-    pos_df.loc[~is_opt, "pos_breakeven"] = abs_cost[~is_opt]
+    safe_abs_qty = abs_qty.replace(0, float("nan"))
+    pos_df.loc[~is_opt, "pos_breakeven"] = abs_cost[~is_opt] / safe_abs_qty[~is_opt]
+    opt_premium_per_share = abs_cost / (safe_abs_qty * 100)
     pos_df.loc[is_opt & is_call, "pos_breakeven"] = (
-        pos_df.loc[is_opt & is_call, "strike"] + abs_cost[is_opt & is_call]
+        pos_df.loc[is_opt & is_call, "strike"] + opt_premium_per_share[is_opt & is_call]
     )
     pos_df.loc[is_opt & ~is_call, "pos_breakeven"] = (
-        pos_df.loc[is_opt & ~is_call, "strike"] - abs_cost[is_opt & ~is_call]
+        pos_df.loc[is_opt & ~is_call, "strike"] - opt_premium_per_share[is_opt & ~is_call]
     )
 
     pos_df["weight"] = abs_qty.where(~is_opt, abs_qty * 100)
