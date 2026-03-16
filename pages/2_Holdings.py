@@ -156,23 +156,19 @@ consol_df = consol_df.sort_values("market_value", ascending=False).reset_index(d
 col_table, col_chart = st.columns([1, 1])
 
 with col_table:
-    st.dataframe(
-        consol_df[["symbol", "quantity", "breakeven", "market_value", "pct_of_account"]].rename(columns={
-            "symbol": "Symbol",
-            "quantity": "Total Qty",
-            "breakeven": "Avg Breakeven",
-            "market_value": "Market Value ($)",
-            "pct_of_account": "% of Account",
-        }),
-        use_container_width=True,
-        column_config={
-            "Total Qty": st.column_config.NumberColumn(format="%.2f"),
-            "Avg Breakeven": st.column_config.NumberColumn(format="$%.2f"),
-            "Market Value ($)": st.column_config.NumberColumn(format="$%.2f"),
-            "% of Account": st.column_config.NumberColumn(format="%.1f%%"),
-        },
-        hide_index=True,
-    )
+    display_mv = consol_df[["symbol", "quantity", "breakeven", "market_value", "pct_of_account"]].copy()
+    display_mv["quantity"] = display_mv["quantity"].map(lambda v: f"{v:,.2f}")
+    display_mv["breakeven"] = display_mv["breakeven"].map(lambda v: f"${v:,.2f}")
+    display_mv["market_value"] = display_mv["market_value"].map(lambda v: f"${v:,.2f}")
+    display_mv["pct_of_account"] = display_mv["pct_of_account"].map(lambda v: f"{v:.1f}%")
+    display_mv = display_mv.rename(columns={
+        "symbol": "Symbol",
+        "quantity": "Total Qty",
+        "breakeven": "Avg Breakeven",
+        "market_value": "Market Value ($)",
+        "pct_of_account": "% of Account",
+    })
+    st.dataframe(display_mv, use_container_width=True, hide_index=True)
 
 with col_chart:
     import altair as alt
@@ -215,19 +211,20 @@ for asset_class, group in df.groupby("asset_class", sort=True):
     st.subheader(f"{label} ({len(group)})")
 
     show_cols = [c for c in display_cols if c in group.columns]
-    st.dataframe(
-        group[show_cols].sort_values("symbol").reset_index(drop=True),
-        use_container_width=True,
-        column_config={
-            "cost_value": st.column_config.NumberColumn("Cost Value", format="$%.2f"),
-            "market_value": st.column_config.NumberColumn("Market Value", format="$%.2f"),
-            "cost_basis": st.column_config.NumberColumn("Cost Basis", format="$%.2f"),
-            "market_price": st.column_config.NumberColumn("Market Price", format="$%.2f"),
-            "unrealized_pnl": st.column_config.NumberColumn("Unrealized P&L", format="$%.2f"),
-            "strike": st.column_config.NumberColumn(format="$%.2f"),
-            "multiplier": st.column_config.NumberColumn("Mult", format="%d"),
-        },
-    )
+    detail_df = group[show_cols].sort_values("symbol").reset_index(drop=True).copy()
+    dollar_cols = ["cost_value", "market_value", "cost_basis", "market_price", "unrealized_pnl", "strike"]
+    for col in dollar_cols:
+        if col in detail_df.columns:
+            detail_df[col] = detail_df[col].map(lambda v: f"${v:,.2f}")
+    if "multiplier" in detail_df.columns:
+        detail_df["multiplier"] = detail_df["multiplier"].astype(int)
+    col_labels = {
+        "cost_value": "Cost Value", "market_value": "Market Value",
+        "cost_basis": "Cost Basis", "market_price": "Market Price",
+        "unrealized_pnl": "Unrealized P&L", "multiplier": "Mult",
+    }
+    detail_df = detail_df.rename(columns={k: v for k, v in col_labels.items() if k in detail_df.columns})
+    st.dataframe(detail_df, use_container_width=True)
 
 # ── Reconciliation ──────────────────────────────────────────────────────────
 
