@@ -27,6 +27,20 @@ st.set_page_config(
     layout="wide",
 )
 
+# Reduce default padding so content uses more of the screen
+st.markdown(
+    """
+    <style>
+    .block-container {
+        padding-left: 2rem;
+        padding-right: 2rem;
+        padding-top: 1rem;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 # --- Resolve secrets: prefer env vars, fall back to st.secrets ---
 for var in ("SUPABASE_URL", "SUPABASE_KEY"):
     if not os.environ.get(var):
