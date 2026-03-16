@@ -229,23 +229,56 @@ else:
     # Consolidate by underlying ticker
     pos_df["underlying"] = pos_df["symbol"].str.split().str[0]
 
+    # Ensure strike/right columns exist for breakeven calc
+    if "strike" not in pos_df.columns:
+        pos_df["strike"] = float("nan")
+    else:
+        pos_df["strike"] = pd.to_numeric(pos_df["strike"], errors="coerce")
+    if "right" not in pos_df.columns:
+        pos_df["right"] = None
+    if "asset_class" not in pos_df.columns:
+        pos_df["asset_class"] = "STK"
+
+    # Per-position breakeven and weight (shares equivalent)
+    # STK/ETF: breakeven = cost_basis, weight = |quantity|
+    # OPT call: breakeven = strike + |cost_basis| (premium per share), weight = |quantity| * 100
+    # OPT put:  breakeven = strike - |cost_basis|, weight = |quantity| * 100
+    is_opt = pos_df["asset_class"] == "OPT"
+    is_call = pos_df["right"] == "C"
+    abs_cost = pos_df["cost_basis"].abs()
+    abs_qty = pos_df["quantity"].abs()
+
+    pos_df["pos_breakeven"] = float("nan")
+    pos_df.loc[~is_opt, "pos_breakeven"] = abs_cost[~is_opt]
+    pos_df.loc[is_opt & is_call, "pos_breakeven"] = (
+        pos_df.loc[is_opt & is_call, "strike"] + abs_cost[is_opt & is_call]
+    )
+    pos_df.loc[is_opt & ~is_call, "pos_breakeven"] = (
+        pos_df.loc[is_opt & ~is_call, "strike"] - abs_cost[is_opt & ~is_call]
+    )
+
+    pos_df["weight"] = abs_qty.where(~is_opt, abs_qty * 100)
+    pos_df["weighted_be"] = pos_df["pos_breakeven"] * pos_df["weight"]
+
     unrealized_stats = (
         pos_df.groupby("underlying")
         .agg(
             unrealized_pnl=("unrealized_pnl", "sum"),
             market_value=("market_value", "sum"),
-            cost_basis=("cost_basis", "sum"),
             positions=("symbol", "count"),
             quantity=("quantity", "sum"),
+            weighted_be=("weighted_be", "sum"),
+            weight=("weight", "sum"),
         )
         .reset_index()
         .rename(columns={"underlying": "symbol"})
         .sort_values("unrealized_pnl", ascending=False)
     )
 
-    # Weighted-average breakeven price = total cost basis / total quantity
+    # Weighted-average breakeven across all legs
+    safe_weight = unrealized_stats["weight"].replace(0, float("nan"))
     unrealized_stats["breakeven"] = (
-        unrealized_stats["cost_basis"] / unrealized_stats["quantity"].replace(0, float("nan"))
+        unrealized_stats["weighted_be"] / safe_weight
     ).abs()
 
     total_unrealized = unrealized_stats["unrealized_pnl"].sum()
