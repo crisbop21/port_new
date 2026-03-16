@@ -166,10 +166,10 @@ with col_table:
         }),
         use_container_width=True,
         column_config={
-            "Total Qty": st.column_config.NumberColumn(format="%,.2f"),
-            "Avg Breakeven": st.column_config.NumberColumn(format="$%,.2f"),
-            "Market Value ($)": st.column_config.NumberColumn(format="$%,.2f"),
-            "% of Account": st.column_config.NumberColumn(format="%.1f%%"),
+            "Total Qty": st.column_config.NumberColumn(format=",.2f"),
+            "Avg Breakeven": st.column_config.NumberColumn(format="$,.2f"),
+            "Market Value ($)": st.column_config.NumberColumn(format="$,.2f"),
+            "% of Account": st.column_config.NumberColumn(format=".1f%%"),
         },
         hide_index=True,
     )
@@ -219,12 +219,12 @@ for asset_class, group in df.groupby("asset_class", sort=True):
         group[show_cols].sort_values("symbol").reset_index(drop=True),
         use_container_width=True,
         column_config={
-            "cost_value": st.column_config.NumberColumn("Cost Value", format="$%,.2f"),
-            "market_value": st.column_config.NumberColumn("Market Value", format="$%,.2f"),
-            "cost_basis": st.column_config.NumberColumn("Cost Basis", format="$%,.2f"),
-            "market_price": st.column_config.NumberColumn("Market Price", format="$%,.2f"),
-            "unrealized_pnl": st.column_config.NumberColumn("Unrealized P&L", format="$%,.2f"),
-            "strike": st.column_config.NumberColumn(format="$%,.2f"),
+            "cost_value": st.column_config.NumberColumn("Cost Value", format="$,.2f"),
+            "market_value": st.column_config.NumberColumn("Market Value", format="$,.2f"),
+            "cost_basis": st.column_config.NumberColumn("Cost Basis", format="$,.2f"),
+            "market_price": st.column_config.NumberColumn("Market Price", format="$,.2f"),
+            "unrealized_pnl": st.column_config.NumberColumn("Unrealized P&L", format="$,.2f"),
+            "strike": st.column_config.NumberColumn(format="$,.2f"),
             "multiplier": st.column_config.NumberColumn("Mult", format="%d"),
         },
     )
@@ -374,10 +374,10 @@ for acct in target_accounts:
                     mismatched,
                     use_container_width=True,
                     column_config={
-                        "Base Qty": st.column_config.NumberColumn(format="%.4f"),
-                        "Reconstructed Qty": st.column_config.NumberColumn(format="%.4f"),
-                        "Expected Qty": st.column_config.NumberColumn(format="%.4f"),
-                        "Diff": st.column_config.NumberColumn(format="%.4f"),
+                        "Base Qty": st.column_config.NumberColumn(format=",.4f"),
+                        "Reconstructed Qty": st.column_config.NumberColumn(format=",.4f"),
+                        "Expected Qty": st.column_config.NumberColumn(format=",.4f"),
+                        "Diff": st.column_config.NumberColumn(format=",.4f"),
                     },
                 )
 
@@ -387,10 +387,10 @@ for acct in target_accounts:
                         matched,
                         use_container_width=True,
                         column_config={
-                            "Base Qty": st.column_config.NumberColumn(format="%.4f"),
-                            "Reconstructed Qty": st.column_config.NumberColumn(format="%.4f"),
-                            "Expected Qty": st.column_config.NumberColumn(format="%.4f"),
-                            "Diff": st.column_config.NumberColumn(format="%.4f"),
+                            "Base Qty": st.column_config.NumberColumn(format=",.4f"),
+                            "Reconstructed Qty": st.column_config.NumberColumn(format=",.4f"),
+                            "Expected Qty": st.column_config.NumberColumn(format=",.4f"),
+                            "Diff": st.column_config.NumberColumn(format=",.4f"),
                         },
                     )
 
@@ -413,7 +413,7 @@ for acct in target_accounts:
                             ledger_df,
                             use_container_width=True,
                             column_config={
-                                "Quantity": st.column_config.NumberColumn(format="%.4f"),
-                                "Running Qty": st.column_config.NumberColumn(format="%.4f"),
+                                "Quantity": st.column_config.NumberColumn(format=",.4f"),
+                                "Running Qty": st.column_config.NumberColumn(format=",.4f"),
                             },
                         )

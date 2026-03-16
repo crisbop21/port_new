@@ -174,11 +174,11 @@ if not symbol_stats.empty:
         hide_index=True,
         column_config={
             "symbol": "Symbol",
-            "total_pnl": st.column_config.NumberColumn("Total P&L", format="$%,.2f"),
+            "total_pnl": st.column_config.NumberColumn("Total P&L", format="$,.2f"),
             "trades": "Trades",
-            "win_rate": st.column_config.NumberColumn("Win Rate %", format="%.1f%%"),
-            "avg_pnl": st.column_config.NumberColumn("Avg P&L", format="$%,.2f"),
-            "total_commission": st.column_config.NumberColumn("Commissions", format="$%,.4f"),
+            "win_rate": st.column_config.NumberColumn("Win Rate %", format=".1f%%"),
+            "avg_pnl": st.column_config.NumberColumn("Avg P&L", format="$,.2f"),
+            "total_commission": st.column_config.NumberColumn("Commissions", format="$,.4f"),
         },
     )
 
@@ -261,10 +261,10 @@ else:
         hide_index=True,
         column_config={
             "symbol": "Symbol",
-            "quantity": st.column_config.NumberColumn("Total Qty", format="%,.2f"),
-            "breakeven": st.column_config.NumberColumn("Avg Breakeven", format="$%,.2f"),
-            "market_value": st.column_config.NumberColumn("Market Value", format="$%,.2f"),
-            "unrealized_pnl": st.column_config.NumberColumn("Unrealized P&L", format="$%,.2f"),
+            "quantity": st.column_config.NumberColumn("Total Qty", format=",.2f"),
+            "breakeven": st.column_config.NumberColumn("Avg Breakeven", format="$,.2f"),
+            "market_value": st.column_config.NumberColumn("Market Value", format="$,.2f"),
+            "unrealized_pnl": st.column_config.NumberColumn("Unrealized P&L", format="$,.2f"),
             "positions": "Positions",
         },
     )
@@ -296,10 +296,10 @@ st.dataframe(
     use_container_width=True,
     column_config={
         "trade_date": st.column_config.DatetimeColumn("Date/Time", format="YYYY-MM-DD HH:mm"),
-        "price": st.column_config.NumberColumn(format="$%,.2f"),
-        "proceeds": st.column_config.NumberColumn(format="$%,.2f"),
-        "commission": st.column_config.NumberColumn(format="$%,.4f"),
-        "realized_pnl": st.column_config.NumberColumn("Realized P&L", format="$%,.2f"),
-        "strike": st.column_config.NumberColumn(format="$%,.2f"),
+        "price": st.column_config.NumberColumn(format="$,.2f"),
+        "proceeds": st.column_config.NumberColumn(format="$,.2f"),
+        "commission": st.column_config.NumberColumn(format="$,.4f"),
+        "realized_pnl": st.column_config.NumberColumn("Realized P&L", format="$,.2f"),
+        "strike": st.column_config.NumberColumn(format="$,.2f"),
     },
 )
