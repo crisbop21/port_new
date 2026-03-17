@@ -252,8 +252,9 @@ def _pick_latest_annual(values: list[dict]) -> dict | None:
 def _pick_all_annual(values: list[dict]) -> list[dict]:
     """From a list of XBRL fact entries, return all 10-K and 10-Q values.
 
-    Includes both annual and quarterly filings.  Deduplicates by period end
-    date, keeping the most recently filed entry for each period.
+    Includes both annual and quarterly filings.  Deduplicates by
+    (end date, fiscal period), keeping the most recently filed entry for
+    each combination.
 
     Returns a list sorted by end date descending (most recent first).
     """
@@ -265,16 +266,20 @@ def _pick_all_annual(values: list[dict]) -> list[dict]:
     if not candidates:
         candidates = values
 
-    # Deduplicate by end date — keep the most recently filed for each period
-    by_period: dict[str, dict] = {}
+    # Deduplicate by (end, fp) — keep the most recently filed for each combo.
+    # This preserves both the Q3 YTD and the FY for the same end-date
+    # (which happen when fiscal year ends on a quarter boundary).
+    by_key: dict[tuple[str, str], dict] = {}
     for v in candidates:
         end = v.get("end", "")
+        fp = v.get("fp", "")
         filed = v.get("filed", "")
-        if end and (end not in by_period or filed > by_period[end].get("filed", "")):
-            by_period[end] = v
+        key = (end, fp)
+        if end and (key not in by_key or filed > by_key[key].get("filed", "")):
+            by_key[key] = v
 
     # Sort by end date descending
-    result = sorted(by_period.values(), key=lambda v: v.get("end", ""), reverse=True)
+    result = sorted(by_key.values(), key=lambda v: v.get("end", ""), reverse=True)
     return result
 
 
@@ -354,6 +359,8 @@ def fetch_metrics_for_symbol(symbol: str) -> tuple[list[StockMetric], list[str]]
             # Parse the value
             raw_val = entry.get("val")
             raw_end = entry.get("end")
+            raw_start = entry.get("start")
+            fiscal_period = entry.get("fp")  # FY, Q1, Q2, Q3, Q4
             filing_form = entry.get("form", "unknown")
 
             if raw_val is None or raw_end is None:
@@ -387,6 +394,13 @@ def fetch_metrics_for_symbol(symbol: str) -> tuple[list[StockMetric], list[str]]
                 errors.append(msg)
                 continue
 
+            period_start = None
+            if raw_start:
+                try:
+                    period_start = date.fromisoformat(str(raw_start))
+                except ValueError:
+                    pass  # non-critical — we can still use fiscal_period
+
             # Build validated model
             try:
                 metric = StockMetric(
@@ -394,15 +408,18 @@ def fetch_metrics_for_symbol(symbol: str) -> tuple[list[StockMetric], list[str]]
                     metric_name=metric_name,
                     metric_value=metric_value,
                     period_end=period_end,
+                    period_start=period_start,
+                    fiscal_period=fiscal_period,
                     source="SEC_EDGAR",
                     cik=cik,
                     filing_type=filing_form,
                 )
                 metrics.append(metric)
                 logger.debug(
-                    "%s: %s = %s (period_end=%s, tag=%s, form=%s)",
-                    symbol, metric_name, metric_value, period_end,
-                    matched_tag, filing_form,
+                    "%s: %s = %s (period=%s→%s, fp=%s, tag=%s, form=%s)",
+                    symbol, metric_name, metric_value,
+                    period_start, period_end,
+                    fiscal_period, matched_tag, filing_form,
                 )
             except Exception as e:
                 msg = f"{symbol}: Pydantic validation failed for '{metric_name}': {e}"

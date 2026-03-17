@@ -106,6 +106,8 @@ class StockMetric(BaseModel):
     metric_name: str
     metric_value: Decimal
     period_end: date
+    period_start: date | None = None       # start of reporting period (for duration calc)
+    fiscal_period: str | None = None       # 'FY', 'Q1', 'Q2', 'Q3', 'Q4'
     source: str = "SEC_EDGAR"
     cik: str | None = None
     filing_type: str | None = None
