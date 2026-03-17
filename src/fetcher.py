@@ -241,30 +241,44 @@ def _extract_fact_values(
 def _pick_latest_annual(values: list[dict]) -> dict | None:
     """From a list of XBRL fact entries, pick the most recent 10-K value.
 
-    Falls back to 10-Q if no 10-K exists.  Prefers entries without a
-    'frame' key (those are often point-in-time vs. accumulated).
+    Falls back to 10-Q if no 10-K exists.
 
     Returns the single best dict, or None.
     """
-    if not values:
-        return None
+    results = _pick_all_annual(values)
+    return results[0] if results else None
 
-    # Separate by filing type
+
+def _pick_all_annual(values: list[dict]) -> list[dict]:
+    """From a list of XBRL fact entries, return all 10-K values (deduplicated).
+
+    Falls back to 10-Q if no 10-K exists.  Deduplicates by period end date,
+    keeping the most recently filed entry for each period.
+
+    Returns a list sorted by end date descending (most recent first).
+    """
+    if not values:
+        return []
+
+    # Separate by filing type — prefer 10-K
     annual = [v for v in values if v.get("form") == "10-K"]
     quarterly = [v for v in values if v.get("form") == "10-Q"]
 
     candidates = annual if annual else quarterly
     if not candidates:
-        # Fallback: use whatever is available
         candidates = values
 
-    # Sort by end date descending — most recent first
-    try:
-        candidates.sort(key=lambda v: v.get("end", ""), reverse=True)
-    except TypeError:
-        pass
+    # Deduplicate by end date — keep the most recently filed for each period
+    by_period: dict[str, dict] = {}
+    for v in candidates:
+        end = v.get("end", "")
+        filed = v.get("filed", "")
+        if end and (end not in by_period or filed > by_period[end].get("filed", "")):
+            by_period[end] = v
 
-    return candidates[0]
+    # Sort by end date descending
+    result = sorted(by_period.values(), key=lambda v: v.get("end", ""), reverse=True)
+    return result
 
 
 # ── Main orchestrator ────────────────────────────────────────────────────────
@@ -320,83 +334,83 @@ def fetch_metrics_for_symbol(symbol: str) -> tuple[list[StockMetric], list[str]]
     company_name = facts.get("entityName", "Unknown")
     logger.info("%s: entity = %s", symbol, company_name)
 
-    # Step 3: Extract each metric
+    # Step 3: Extract each metric (all historical periods)
     for metric_name, xbrl_tags in XBRL_TAG_MAP.items():
-        best_value: dict | None = None
+        all_values: list[dict] = []
         matched_tag: str | None = None
 
         for tag in xbrl_tags:
             values = _extract_fact_values(facts, tag)
             if values:
-                candidate = _pick_latest_annual(values)
-                if candidate is not None:
-                    best_value = candidate
+                all_values = _pick_all_annual(values)
+                if all_values:
                     matched_tag = tag
                     break  # first matching tag wins
 
-        if best_value is None:
+        if not all_values:
             msg = f"{symbol}: metric '{metric_name}' — no data found (tried {len(xbrl_tags)} XBRL tags)"
             logger.debug(msg)
             # Not an error — many companies don't report all metrics
             continue
 
-        # Parse the value
-        raw_val = best_value.get("val")
-        raw_end = best_value.get("end")
-        filing_form = best_value.get("form", "unknown")
+        for entry in all_values:
+            # Parse the value
+            raw_val = entry.get("val")
+            raw_end = entry.get("end")
+            filing_form = entry.get("form", "unknown")
 
-        if raw_val is None or raw_end is None:
-            msg = (
-                f"{symbol}: metric '{metric_name}' has null val or end date "
-                f"(tag={matched_tag}, raw={best_value})"
-            )
-            logger.warning(msg)
-            errors.append(msg)
-            continue
+            if raw_val is None or raw_end is None:
+                msg = (
+                    f"{symbol}: metric '{metric_name}' has null val or end date "
+                    f"(tag={matched_tag}, raw={entry})"
+                )
+                logger.warning(msg)
+                errors.append(msg)
+                continue
 
-        try:
-            metric_value = Decimal(str(raw_val))
-        except (InvalidOperation, ValueError) as e:
-            msg = (
-                f"{symbol}: metric '{metric_name}' value not numeric: "
-                f"raw_val={raw_val!r} — {e}"
-            )
-            logger.warning(msg)
-            errors.append(msg)
-            continue
+            try:
+                metric_value = Decimal(str(raw_val))
+            except (InvalidOperation, ValueError) as e:
+                msg = (
+                    f"{symbol}: metric '{metric_name}' value not numeric: "
+                    f"raw_val={raw_val!r} — {e}"
+                )
+                logger.warning(msg)
+                errors.append(msg)
+                continue
 
-        try:
-            period_end = date.fromisoformat(str(raw_end))
-        except ValueError as e:
-            msg = (
-                f"{symbol}: metric '{metric_name}' bad date: "
-                f"raw_end={raw_end!r} — {e}"
-            )
-            logger.warning(msg)
-            errors.append(msg)
-            continue
+            try:
+                period_end = date.fromisoformat(str(raw_end))
+            except ValueError as e:
+                msg = (
+                    f"{symbol}: metric '{metric_name}' bad date: "
+                    f"raw_end={raw_end!r} — {e}"
+                )
+                logger.warning(msg)
+                errors.append(msg)
+                continue
 
-        # Build validated model
-        try:
-            metric = StockMetric(
-                symbol=symbol,
-                metric_name=metric_name,
-                metric_value=metric_value,
-                period_end=period_end,
-                source="SEC_EDGAR",
-                cik=cik,
-                filing_type=filing_form,
-            )
-            metrics.append(metric)
-            logger.debug(
-                "%s: %s = %s (period_end=%s, tag=%s, form=%s)",
-                symbol, metric_name, metric_value, period_end,
-                matched_tag, filing_form,
-            )
-        except Exception as e:
-            msg = f"{symbol}: Pydantic validation failed for '{metric_name}': {e}"
-            logger.error(msg)
-            errors.append(msg)
+            # Build validated model
+            try:
+                metric = StockMetric(
+                    symbol=symbol,
+                    metric_name=metric_name,
+                    metric_value=metric_value,
+                    period_end=period_end,
+                    source="SEC_EDGAR",
+                    cik=cik,
+                    filing_type=filing_form,
+                )
+                metrics.append(metric)
+                logger.debug(
+                    "%s: %s = %s (period_end=%s, tag=%s, form=%s)",
+                    symbol, metric_name, metric_value, period_end,
+                    matched_tag, filing_form,
+                )
+            except Exception as e:
+                msg = f"{symbol}: Pydantic validation failed for '{metric_name}': {e}"
+                logger.error(msg)
+                errors.append(msg)
 
     logger.info(
         "%s: extracted %d metrics, %d issues",
