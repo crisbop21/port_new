@@ -1,5 +1,8 @@
 """Tests for TTM (Trailing Twelve Months) via quarter isolation."""
 
+from datetime import date
+
+from src.splits import DetectedSplit, normalize_metrics
 from src.ttm import (
     IsolatedQuarter,
     compute_ttm,
@@ -322,3 +325,106 @@ class TestComputeTTMLatest:
         val, method = compute_ttm_latest(rows)
         assert val == 100000
         assert method == "annual"
+
+
+# ── TTM + split composition ────────────────────────────────────────────────
+
+
+class TestTTMWithSplits:
+    """Verify that split normalization composes correctly with TTM.
+
+    Pipeline: split-normalize all history → compute TTM on normalized_value.
+    """
+
+    def test_eps_ttm_with_4_to_1_split(self):
+        """4:1 split mid-year: pre-split EPS must be divided before TTM sum.
+
+        Raw data:
+            Q1 2022: EPS YTD = $6.00  (pre-split)
+            Q2 2022: EPS YTD = $12.00 (pre-split)
+            Q3 2022: EPS YTD = $18.00 (pre-split)
+            FY 2022: EPS     = $24.00 (pre-split)
+            ── 4:1 split happens ──
+            Q1 2023: EPS YTD = $1.80  (post-split)
+
+        Without normalization, TTM would mix $6 pre-split quarters with
+        $1.80 post-split → wrong.
+
+        With normalization (divide pre-split by 4):
+            Q1 2022 norm = $1.50, Q2 YTD norm = $3.00, Q3 YTD norm = $4.50, FY norm = $6.00
+            Q2 iso = 1.50, Q3 iso = 1.50, Q4 iso = 1.50
+            TTM = Q2(1.50) + Q3(1.50) + Q4(1.50) + Q1_23(1.80) = $6.30
+        """
+        split = DetectedSplit(
+            symbol="AAPL",
+            period_end=date(2023, 1, 15),  # split between FY2022 and Q1 2023
+            prior_period_end=date(2022, 12, 31),
+            shares_ratio=4.0,
+            confidence="high",
+            reason="test",
+        )
+
+        rows = [
+            _row("2022-03-31", 6.00, "Q1"),
+            _row("2022-06-30", 12.00, "Q2"),
+            _row("2022-09-30", 18.00, "Q3"),
+            _row("2022-12-31", 24.00, "FY", "10-K"),
+            _row("2023-03-31", 1.80, "Q1"),
+        ]
+        for r in rows:
+            r["metric_name"] = "eps_diluted"
+
+        # Step 1: Split-normalize
+        normalized = normalize_metrics(rows, [split], "eps_diluted")
+
+        # Verify normalization happened
+        pre_q1 = [r for r in normalized if r["period_end"] == "2022-03-31"][0]
+        assert pre_q1["normalized_value"] == 1.5  # 6.00 / 4
+        post_q1 = [r for r in normalized if r["period_end"] == "2023-03-31"][0]
+        assert post_q1["split_adjusted"] is False  # post-split, not adjusted
+
+        # Step 2: TTM on normalized values
+        val, method = compute_ttm_latest(normalized, value_key="normalized_value")
+
+        # Q2 iso = 3.00-1.50=1.50, Q3 iso = 4.50-3.00=1.50,
+        # Q4 iso = 6.00-4.50=1.50, Q1_23 = 1.80
+        # TTM = 1.50 + 1.50 + 1.50 + 1.80 = 6.30
+        assert val == 6.3
+        assert method == "sum_4q"
+
+    def test_value_key_reads_correct_field(self):
+        """compute_ttm with value_key='normalized_value' uses that field."""
+        rows = [
+            {"period_end": "2022-03-31", "fiscal_period": "Q1",
+             "metric_value": 100, "normalized_value": 50},
+            {"period_end": "2022-06-30", "fiscal_period": "Q2",
+             "metric_value": 200, "normalized_value": 100},
+            {"period_end": "2022-09-30", "fiscal_period": "Q3",
+             "metric_value": 300, "normalized_value": 150},
+            {"period_end": "2022-12-31", "fiscal_period": "FY",
+             "metric_value": 400, "normalized_value": 200},
+        ]
+        # Using normalized_value: Q1=50, Q2=100-50=50, Q3=150-100=50, Q4=200-150=50
+        result = compute_ttm(rows, value_key="normalized_value")
+        fy = [r for r in result if r["fiscal_period"] == "FY"][0]
+        assert fy["ttm_value"] == 200  # sum of normalized quarters
+
+        # Using metric_value: Q1=100, Q2=200-100=100, Q3=300-200=100, Q4=400-300=100
+        result2 = compute_ttm(rows, value_key="metric_value")
+        fy2 = [r for r in result2 if r["fiscal_period"] == "FY"][0]
+        assert fy2["ttm_value"] == 400  # sum of raw quarters
+
+    def test_no_splits_uses_raw_values(self):
+        """Without splits, normalized_value == metric_value, TTM is the same."""
+        rows = [
+            _row("2022-03-31", 25000, "Q1"),
+            _row("2022-06-30", 53000, "Q2"),
+            _row("2022-09-30", 80000, "Q3"),
+            _row("2022-12-31", 108000, "FY", "10-K"),
+        ]
+        # Normalize with no splits (just copies metric_value → normalized_value)
+        normalized = normalize_metrics(rows, [], "revenue")
+
+        val_raw, _ = compute_ttm_latest(normalized, value_key="metric_value")
+        val_norm, _ = compute_ttm_latest(normalized, value_key="normalized_value")
+        assert val_raw == val_norm == 108000

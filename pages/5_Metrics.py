@@ -159,17 +159,21 @@ for sym in sorted(metrics_data.keys()):
                 try:
                     val = float(raw_val)
 
-                    # TTM adjustment for flow metrics from quarterly filings
+                    # Pipeline: split-normalize first, then TTM on adjusted values
                     if is_flow_metric(metric_key) and fp and fp != "FY":
                         history = get_stock_metrics(symbol=sym, metric_name=metric_key)
-                        ttm_val, ttm_method = compute_ttm_latest(history)
+                        # Split-normalize all history first
+                        history = normalize_metrics(history, sym_splits, metric_key)
+                        vk = "normalized_value" if sym_splits else "metric_value"
+                        ttm_val, ttm_method = compute_ttm_latest(history, value_key=vk)
                         if ttm_val is not None:
                             val = ttm_val
                             if sym not in [n.split(":")[0] for n in ttm_notes]:
                                 ttm_notes.append(f"{sym}: TTM computed from {fp} data")
-
-                    # Auto-adjust split-affected metrics
-                    if sym_splits and metric_key in (SPLIT_AFFECTED_PER_SHARE | SPLIT_AFFECTED_SHARE_COUNT):
+                            if sym_splits and sym not in [n.split(":")[0] for n in split_notes]:
+                                split_notes.append(f"{sym}: {len(sym_splits)} split(s) detected — per-share metrics adjusted")
+                    elif sym_splits and metric_key in (SPLIT_AFFECTED_PER_SHARE | SPLIT_AFFECTED_SHARE_COUNT):
+                        # Non-flow metric (shares_outstanding) — just split-adjust
                         val, was_adjusted = normalize_latest_value(
                             metric_key, val, str(period), sym_splits,
                         )
@@ -248,16 +252,18 @@ if detail_symbol:
                     val = float(raw)
                     suffixes = []
 
-                    # TTM for flow metrics from quarterly filings
+                    # Pipeline: split-normalize first, then TTM on adjusted values
                     if is_flow_metric(key) and fp and fp != "FY":
                         history = get_stock_metrics(symbol=detail_symbol, metric_name=key)
-                        ttm_val, ttm_method = compute_ttm_latest(history)
+                        history = normalize_metrics(history, detected_splits, key)
+                        vk = "normalized_value" if detected_splits else "metric_value"
+                        ttm_val, ttm_method = compute_ttm_latest(history, value_key=vk)
                         if ttm_val is not None:
                             val = ttm_val
                             suffixes.append("TTM")
-
-                    # Split adjustment
-                    if detected_splits and key in (SPLIT_AFFECTED_PER_SHARE | SPLIT_AFFECTED_SHARE_COUNT):
+                            if detected_splits:
+                                suffixes.append("adj")
+                    elif detected_splits and key in (SPLIT_AFFECTED_PER_SHARE | SPLIT_AFFECTED_SHARE_COUNT):
                         val, was_adj = normalize_latest_value(key, val, str(period), detected_splits)
                         if was_adj:
                             suffixes.append("adj")
@@ -310,10 +316,11 @@ if detail_symbol:
                     # Split normalization
                     history = normalize_metrics(history, detected_splits, hist_metric)
 
-                    # TTM computation for flow metrics
+                    # TTM computation for flow metrics (reads split-adjusted values)
                     has_ttm = False
+                    ttm_value_key = "normalized_value" if detected_splits else "metric_value"
                     if is_flow_metric(hist_metric):
-                        ttm_history = compute_ttm(history)
+                        ttm_history = compute_ttm(history, value_key=ttm_value_key)
                         # Merge TTM columns back into history
                         for orig, ttm_row in zip(history, ttm_history):
                             orig["quarterly_value"] = ttm_row.get("quarterly_value")
