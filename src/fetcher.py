@@ -69,6 +69,17 @@ XBRL_TAG_MAP: dict[str, list[str]] = {
 }
 
 
+# Common ticker aliases — maps tickers that SEC doesn't list to their
+# SEC-recognized equivalents (same company, different share class or name).
+_TICKER_ALIASES: dict[str, str] = {
+    "GOOG": "GOOGL",       # Alphabet Class C → Class A
+    "BRK.A": "BRK-A",      # Berkshire variants
+    "BRK/A": "BRK-A",
+    "BRK.B": "BRK-B",
+    "BRK/B": "BRK-B",
+}
+
+
 def _get_user_agent() -> str:
     return os.environ.get("EDGAR_USER_AGENT", _DEFAULT_USER_AGENT)
 
@@ -171,7 +182,10 @@ def get_cik(ticker: str) -> str | None:
     """
     session = _get_session()
     cik_map = _load_cik_map(session)
-    cik = cik_map.get(ticker.upper().strip())
+    normalized = ticker.upper().strip()
+    cik = cik_map.get(normalized)
+    if cik is None and normalized in _TICKER_ALIASES:
+        cik = cik_map.get(_TICKER_ALIASES[normalized])
     if cik is None:
         logger.info("No CIK found for ticker '%s' — may be ETF or delisted", ticker)
     else:
@@ -261,10 +275,16 @@ def fetch_metrics_for_symbol(symbol: str) -> tuple[list[StockMetric], list[str]]
 
     logger.info("=== Fetching metrics for %s ===", symbol)
 
-    # Step 1: CIK lookup
+    # Step 1: CIK lookup (try alias if direct lookup fails)
     session = _get_session()
     cik_map = _load_cik_map(session)
     cik = cik_map.get(symbol)
+    lookup_symbol = symbol
+    if cik is None and symbol in _TICKER_ALIASES:
+        lookup_symbol = _TICKER_ALIASES[symbol]
+        cik = cik_map.get(lookup_symbol)
+        if cik is not None:
+            logger.info("%s: resolved via alias → %s", symbol, lookup_symbol)
     if cik is None:
         msg = f"{symbol}: no CIK found — not in SEC database (ETF or foreign?)"
         logger.warning(msg)
