@@ -316,10 +316,12 @@ if detail_symbol:
                         ttm_history = compute_ttm(history)
                         # Merge TTM columns back into history
                         for orig, ttm_row in zip(history, ttm_history):
+                            orig["quarterly_value"] = ttm_row.get("quarterly_value")
                             orig["ttm_value"] = ttm_row.get("ttm_value")
                             orig["ttm_method"] = ttm_row.get("ttm_method")
                             orig["is_ytd"] = ttm_row.get("is_ytd", False)
-                            orig["fiscal_period"] = ttm_row.get("fiscal_period", "")
+                            if not orig.get("fiscal_period"):
+                                orig["fiscal_period"] = ttm_row.get("fiscal_period", "")
                         has_ttm = any(r.get("ttm_value") is not None for r in history)
 
                     # Pick the right column for the chart
@@ -343,7 +345,7 @@ if detail_symbol:
                     # Data table
                     display_cols = ["period_end", "fiscal_period", "filing_type", "metric_value"]
                     if has_ttm:
-                        display_cols.extend(["ttm_value", "ttm_method", "is_ytd"])
+                        display_cols.extend(["quarterly_value", "ttm_value", "ttm_method", "is_ytd"])
                     if detected_splits:
                         display_cols.extend(["normalized_value", "split_adjusted"])
                     if not has_ttm and not detected_splits:

@@ -6,18 +6,19 @@ Problem:
         Q1 = 3-month, Q2 = 6-month, Q3 = 9-month.
     Comparing a 10-K revenue to a Q1 10-Q revenue is meaningless.
 
-Solution:
-    TTM = latest YTD + prior FY − prior same-quarter YTD
-
-    For FY periods, TTM = the reported value (already 12 months).
-    For Q-n periods:
-        TTM = Q-n YTD + prior_FY − prior_Q-n YTD
+Solution — isolate each quarter, then sum the last 4:
+    Q1 isolated = Q1 YTD                  (already 3 months)
+    Q2 isolated = Q2 YTD − Q1 YTD
+    Q3 isolated = Q3 YTD − Q2 YTD
+    Q4 isolated = FY     − Q3 YTD
+    TTM         = sum of last 4 isolated quarters
 
 Balance-sheet items (assets, liabilities, equity, shares, cash) are
 point-in-time snapshots and do NOT need TTM adjustment.
 """
 
 import logging
+from dataclasses import dataclass
 from datetime import date
 
 logger = logging.getLogger(__name__)
@@ -57,118 +58,205 @@ def _fiscal_year_for(period_end: str) -> int:
         return 0
 
 
+# ── Quarter isolation ───────────────────────────────────────────────────────
+
+# Ordered so we can look up the prior quarter's YTD
+_PRIOR_YTD = {"Q1": None, "Q2": "Q1", "Q3": "Q2", "Q4": "Q3"}
+
+
+@dataclass
+class IsolatedQuarter:
+    """A single quarter's isolated (non-cumulative) value."""
+
+    fiscal_year: int
+    quarter: str          # Q1, Q2, Q3, Q4
+    period_end: str
+    ytd_value: float      # raw YTD value from the filing
+    isolated_value: float  # just this quarter's contribution
+    method: str           # 'direct' (Q1) | 'subtracted' (Q2-Q4)
+
+
+def isolate_quarters(metric_rows: list[dict]) -> list[IsolatedQuarter]:
+    """Derive isolated quarterly values from YTD-cumulative SEC data.
+
+    Input rows must have: metric_value, period_end, fiscal_period.
+
+    Derivation:
+        Q1 isolated = Q1 YTD  (already a single quarter)
+        Q2 isolated = Q2 YTD − Q1 YTD
+        Q3 isolated = Q3 YTD − Q2 YTD
+        Q4 isolated = FY      − Q3 YTD   (FY is the full-year 10-K value)
+
+    Returns isolated quarters sorted chronologically.
+    """
+    if not metric_rows:
+        return []
+
+    # Build lookup: (fiscal_year, fiscal_period) → float YTD value
+    by_fy_fp: dict[tuple[int, str], tuple[float, str]] = {}
+    for row in metric_rows:
+        fp = row.get("fiscal_period", "")
+        pe = str(row.get("period_end", ""))
+        fy = _fiscal_year_for(pe)
+        if not fy or not fp:
+            continue
+        try:
+            val = float(row.get("metric_value", 0))
+        except (ValueError, TypeError):
+            continue
+        key = (fy, fp)
+        # Keep latest entry per (fy, fp)
+        if key not in by_fy_fp or pe >= by_fy_fp[key][1]:
+            by_fy_fp[key] = (val, pe)
+
+    quarters: list[IsolatedQuarter] = []
+
+    for (fy, fp), (ytd_val, pe) in sorted(by_fy_fp.items()):
+        if fp == "FY":
+            # FY contributes Q4 = FY − Q3 YTD
+            q3_entry = by_fy_fp.get((fy, "Q3"))
+            if q3_entry is not None:
+                q4_val = round(ytd_val - q3_entry[0], 4)
+                quarters.append(IsolatedQuarter(
+                    fiscal_year=fy, quarter="Q4", period_end=pe,
+                    ytd_value=ytd_val, isolated_value=q4_val,
+                    method="subtracted",
+                ))
+            else:
+                # No Q3 data — can't isolate Q4, but we know the annual total.
+                # Store as Q4 = FY (best we can do; mark method accordingly).
+                quarters.append(IsolatedQuarter(
+                    fiscal_year=fy, quarter="Q4", period_end=pe,
+                    ytd_value=ytd_val, isolated_value=ytd_val,
+                    method="annual_only",
+                ))
+            continue
+
+        if fp == "Q4":
+            # Rare: Q4 in a 10-Q. Treat YTD as full year → same as FY logic.
+            q3_entry = by_fy_fp.get((fy, "Q3"))
+            if q3_entry is not None:
+                q4_val = round(ytd_val - q3_entry[0], 4)
+                quarters.append(IsolatedQuarter(
+                    fiscal_year=fy, quarter="Q4", period_end=pe,
+                    ytd_value=ytd_val, isolated_value=q4_val,
+                    method="subtracted",
+                ))
+            else:
+                quarters.append(IsolatedQuarter(
+                    fiscal_year=fy, quarter="Q4", period_end=pe,
+                    ytd_value=ytd_val, isolated_value=ytd_val,
+                    method="annual_only",
+                ))
+            continue
+
+        prior_fp = _PRIOR_YTD.get(fp)
+
+        if prior_fp is None:
+            # Q1: already isolated
+            quarters.append(IsolatedQuarter(
+                fiscal_year=fy, quarter=fp, period_end=pe,
+                ytd_value=ytd_val, isolated_value=ytd_val,
+                method="direct",
+            ))
+        else:
+            # Q2, Q3: subtract prior quarter's YTD
+            prior_entry = by_fy_fp.get((fy, prior_fp))
+            if prior_entry is not None:
+                isolated = round(ytd_val - prior_entry[0], 4)
+                quarters.append(IsolatedQuarter(
+                    fiscal_year=fy, quarter=fp, period_end=pe,
+                    ytd_value=ytd_val, isolated_value=isolated,
+                    method="subtracted",
+                ))
+            else:
+                # Can't isolate without prior YTD
+                logger.debug(
+                    "Cannot isolate %s FY%d: missing %s YTD",
+                    fp, fy, prior_fp,
+                )
+
+    # Sort chronologically by (fiscal_year, quarter order)
+    q_order = {"Q1": 1, "Q2": 2, "Q3": 3, "Q4": 4}
+    quarters.sort(key=lambda q: (q.fiscal_year, q_order.get(q.quarter, 9)))
+
+    return quarters
+
+
+# ── TTM from isolated quarters ──────────────────────────────────────────────
+
+
 def compute_ttm(
     metric_rows: list[dict],
 ) -> list[dict]:
     """Compute TTM values for a single flow metric's history.
 
-    Each row must have: metric_value, period_end, fiscal_period, filing_type.
+    Strategy:
+        1. Isolate each quarter (Q1, Q2, Q3, Q4) from YTD data
+        2. For each period, TTM = sum of the 4 most recent isolated quarters
+           up to and including that period
 
-    Returns a new list of dicts with added keys:
-        - ttm_value: the trailing-twelve-month figure (or None if not computable)
-        - ttm_method: 'annual' | 'computed' | None
-        - is_ytd: bool — True if the raw value is a YTD cumulative (not 12-month)
+    Each row must have: metric_value, period_end, fiscal_period.
 
-    Rows are returned in chronological order.
+    Returns a new list of dicts (chronological) with added keys:
+        - quarterly_value: the isolated single-quarter figure (or None)
+        - ttm_value: trailing-twelve-month figure (or None if < 4 quarters)
+        - ttm_method: 'annual' | 'sum_4q' | None
+        - is_ytd: bool — True if the raw value is a YTD cumulative
     """
     if not metric_rows:
         return []
 
-    # Sort chronologically
     sorted_rows = sorted(metric_rows, key=lambda r: str(r.get("period_end", "")))
 
-    # Build lookup: (fiscal_year, fiscal_period) → float value
-    # This lets us find "prior FY" and "prior same-quarter YTD" efficiently.
-    by_fy_fp: dict[tuple[int, str], dict] = {}
-    for row in sorted_rows:
-        fp = row.get("fiscal_period", "")
-        pe = str(row.get("period_end", ""))
-        fy = _fiscal_year_for(pe)
-        if fy and fp:
-            # If multiple entries for same (fy, fp), keep the latest-filed
-            key = (fy, fp)
-            existing = by_fy_fp.get(key)
-            if existing is None or str(row.get("period_end", "")) >= str(existing.get("period_end", "")):
-                by_fy_fp[key] = row
+    # Isolate quarters
+    isolated = isolate_quarters(metric_rows)
 
+    # Build a lookup from period_end → IsolatedQuarter for enriching rows
+    iso_by_pe: dict[str, IsolatedQuarter] = {}
+    for q in isolated:
+        iso_by_pe[q.period_end] = q
+
+    # Build running list for TTM: at each quarter, sum the last 4
+    ttm_at_pe: dict[str, tuple[float, str]] = {}
+    for i, q in enumerate(isolated):
+        if q.method == "annual_only" and q.quarter == "Q4":
+            # FY with no quarterly breakdown → the value IS 12 months
+            ttm_at_pe[q.period_end] = (q.ytd_value, "annual")
+        elif i >= 3:
+            window = isolated[i - 3 : i + 1]
+            # Verify we have exactly 4 consecutive quarters
+            expected_quarters = {"Q1", "Q2", "Q3", "Q4"}
+            actual_quarters = {wq.quarter for wq in window}
+            if actual_quarters == expected_quarters:
+                ttm_val = round(sum(wq.isolated_value for wq in window), 4)
+                ttm_at_pe[q.period_end] = (ttm_val, "sum_4q")
+
+    # Enrich each row
     result = []
     for row in sorted_rows:
         r = dict(row)
-        fp = r.get("fiscal_period", "")
         pe = str(r.get("period_end", ""))
-        fy = _fiscal_year_for(pe)
+        fp = r.get("fiscal_period", "")
 
-        try:
-            val = float(r.get("metric_value", 0))
-        except (ValueError, TypeError):
-            r["ttm_value"] = None
-            r["ttm_method"] = None
-            r["is_ytd"] = False
-            result.append(r)
-            continue
+        iso_q = iso_by_pe.get(pe)
+        r["quarterly_value"] = iso_q.isolated_value if iso_q else None
 
-        # Annual filings: the value IS the TTM
-        if fp == "FY":
-            r["ttm_value"] = val
-            r["ttm_method"] = "annual"
-            r["is_ytd"] = False
-            result.append(r)
-            continue
+        r["is_ytd"] = fp in ("Q2", "Q3")
 
-        # Quarterly filings: compute TTM = current YTD + prior FY - prior same-quarter YTD
-        r["is_ytd"] = True
-
-        if fp == "Q1":
-            # Q1 YTD is just 3 months. TTM = Q1 + prior_FY - prior_Q1
-            prior_fy_row = by_fy_fp.get((fy - 1, "FY"))
-            prior_q1_row = by_fy_fp.get((fy - 1, "Q1"))
-
-            if prior_fy_row is not None and prior_q1_row is not None:
-                try:
-                    prior_fy_val = float(prior_fy_row.get("metric_value", 0))
-                    prior_q1_val = float(prior_q1_row.get("metric_value", 0))
-                    r["ttm_value"] = round(val + prior_fy_val - prior_q1_val, 4)
-                    r["ttm_method"] = "computed"
-                except (ValueError, TypeError):
-                    r["ttm_value"] = None
-                    r["ttm_method"] = None
-            elif prior_fy_row is not None:
-                # No prior Q1 — can't compute exact TTM, but we can approximate
-                # TTM ≈ Q1 * 4 is too rough. Better: just use prior FY as fallback.
+        ttm_entry = ttm_at_pe.get(pe)
+        if fp == "FY" and ttm_entry is None:
+            # FY value is already 12 months
+            try:
+                r["ttm_value"] = float(r.get("metric_value", 0))
+                r["ttm_method"] = "annual"
+            except (ValueError, TypeError):
                 r["ttm_value"] = None
                 r["ttm_method"] = None
-            else:
-                r["ttm_value"] = None
-                r["ttm_method"] = None
-
-        elif fp in ("Q2", "Q3"):
-            # Q2 YTD = 6 months, Q3 YTD = 9 months
-            # TTM = current YTD + prior_FY - prior same-quarter YTD
-            prior_fy_row = by_fy_fp.get((fy - 1, "FY"))
-            prior_same_q_row = by_fy_fp.get((fy - 1, fp))
-
-            if prior_fy_row is not None and prior_same_q_row is not None:
-                try:
-                    prior_fy_val = float(prior_fy_row.get("metric_value", 0))
-                    prior_same_q_val = float(prior_same_q_row.get("metric_value", 0))
-                    r["ttm_value"] = round(val + prior_fy_val - prior_same_q_val, 4)
-                    r["ttm_method"] = "computed"
-                except (ValueError, TypeError):
-                    r["ttm_value"] = None
-                    r["ttm_method"] = None
-            else:
-                r["ttm_value"] = None
-                r["ttm_method"] = None
-
-        elif fp == "Q4":
-            # Q4 in a 10-Q context is unusual (most companies file 10-K for Q4).
-            # If present, the YTD value should equal the full year.
-            r["ttm_value"] = val
-            r["ttm_method"] = "annual"
-            r["is_ytd"] = False
-
+        elif ttm_entry is not None:
+            r["ttm_value"] = ttm_entry[0]
+            r["ttm_method"] = ttm_entry[1]
         else:
-            # Unknown fiscal period
             r["ttm_value"] = None
             r["ttm_method"] = None
 
