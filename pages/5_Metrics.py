@@ -18,6 +18,7 @@ from src.db import (
     upsert_stock_metrics,
 )
 from src.fetcher import fetch_metrics_for_symbol
+from src.splits import detect_splits, normalize_metrics
 
 st.title("Stock Metrics")
 
@@ -197,7 +198,23 @@ if detail_symbol:
             else:
                 col.metric(label, "—")
 
-        # Historical data for this symbol
+        # ── Split detection ──────────────────────────────────────────────
+        shares_history = get_stock_metrics(symbol=detail_symbol, metric_name="shares_outstanding")
+        eps_history = get_stock_metrics(symbol=detail_symbol, metric_name="eps_diluted")
+        detected_splits = detect_splits(shares_history, eps_history)
+
+        if detected_splits:
+            with st.expander(f"Detected splits ({len(detected_splits)})", expanded=True):
+                for sp in detected_splits:
+                    icon = "🔴" if sp.confidence == "high" else "🟡"
+                    st.markdown(
+                        f"{icon} **{sp.period_end}** — "
+                        f"ratio {sp.shares_ratio:.2f}x "
+                        f"({sp.confidence} confidence)"
+                    )
+                    st.caption(sp.reason)
+
+        # ── Historical data for this symbol ─────────────────────────────
         with st.expander("Historical metrics"):
             hist_metric = st.selectbox(
                 "Metric",
@@ -205,18 +222,34 @@ if detail_symbol:
                 key="hist_metric",
             )
 
+            normalize = st.checkbox(
+                "Normalize for splits",
+                value=bool(detected_splits),
+                disabled=not detected_splits,
+                help="Adjust historical values for detected stock splits",
+            )
+
             if hist_metric:
                 history = get_stock_metrics(symbol=detail_symbol, metric_name=hist_metric)
                 if history:
+                    if normalize and detected_splits:
+                        history = normalize_metrics(history, detected_splits, hist_metric)
+                        value_col = "normalized_value"
+                    else:
+                        value_col = "metric_value"
+
                     hist_df = pd.DataFrame(history)
                     hist_df["period_end"] = pd.to_datetime(hist_df["period_end"])
-                    hist_df["metric_value"] = pd.to_numeric(hist_df["metric_value"], errors="coerce")
+                    hist_df[value_col] = pd.to_numeric(hist_df[value_col], errors="coerce")
                     hist_df = hist_df.sort_values("period_end")
 
-                    st.line_chart(hist_df, x="period_end", y="metric_value")
+                    st.line_chart(hist_df, x="period_end", y=value_col)
 
                     # Raw data table
                     display_cols = ["period_end", "metric_value", "filing_type", "source"]
+                    if normalize and detected_splits:
+                        display_cols = ["period_end", "metric_value", "normalized_value",
+                                        "split_adjusted", "filing_type"]
                     available = [c for c in display_cols if c in hist_df.columns]
                     st.dataframe(
                         hist_df[available].reset_index(drop=True),
