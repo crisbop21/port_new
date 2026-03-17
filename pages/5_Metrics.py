@@ -25,6 +25,7 @@ from src.splits import (
     normalize_latest_value,
     normalize_metrics,
 )
+from src.ttm import compute_ttm, compute_ttm_latest, is_flow_metric
 
 st.title("Stock Metrics")
 
@@ -142,6 +143,7 @@ def _get_splits_for_symbol(sym: str) -> list:
 
 rows = []
 split_notes: list[str] = []
+ttm_notes: list[str] = []
 for sym in sorted(metrics_data.keys()):
     sym_metrics = metrics_data[sym]
     sym_splits = _get_splits_for_symbol(sym)
@@ -151,20 +153,30 @@ for sym in sorted(metrics_data.keys()):
         if metric_key in sym_metrics:
             raw_val = sym_metrics[metric_key].get("metric_value")
             period = sym_metrics[metric_key].get("period_end", "")
+            filing = sym_metrics[metric_key].get("filing_type", "")
+            fp = sym_metrics[metric_key].get("fiscal_period", "")
             if raw_val is not None:
                 try:
                     val = float(raw_val)
+
+                    # TTM adjustment for flow metrics from quarterly filings
+                    if is_flow_metric(metric_key) and fp and fp != "FY":
+                        history = get_stock_metrics(symbol=sym, metric_name=metric_key)
+                        ttm_val, ttm_method = compute_ttm_latest(history)
+                        if ttm_val is not None:
+                            val = ttm_val
+                            if sym not in [n.split(":")[0] for n in ttm_notes]:
+                                ttm_notes.append(f"{sym}: TTM computed from {fp} data")
+
                     # Auto-adjust split-affected metrics
                     if sym_splits and metric_key in (SPLIT_AFFECTED_PER_SHARE | SPLIT_AFFECTED_SHARE_COUNT):
                         val, was_adjusted = normalize_latest_value(
                             metric_key, val, str(period), sym_splits,
                         )
                         if was_adjusted:
-                            display_name_adj = display_name + " *"
-                            row[display_name] = fmt.format(val)
                             if sym not in [n.split(":")[0] for n in split_notes]:
                                 split_notes.append(f"{sym}: {len(sym_splits)} split(s) detected — per-share metrics adjusted")
-                            continue
+
                     row[display_name] = fmt.format(val)
                 except (ValueError, TypeError):
                     row[display_name] = str(raw_val)
@@ -177,13 +189,19 @@ for sym in sorted(metrics_data.keys()):
     any_metric = next(iter(sym_metrics.values()), {})
     row["Period End"] = any_metric.get("period_end", "—")
     row["Filing"] = any_metric.get("filing_type", "—")
+    row["FP"] = any_metric.get("fiscal_period", "—")
     rows.append(row)
 
 if rows:
     summary_df = pd.DataFrame(rows)
     st.dataframe(summary_df, use_container_width=True, hide_index=True)
+    notes = []
+    if ttm_notes:
+        notes.append("TTM-adjusted: " + " | ".join(ttm_notes))
     if split_notes:
-        st.caption("Split-adjusted: " + " | ".join(split_notes))
+        notes.append("Split-adjusted: " + " | ".join(split_notes))
+    if notes:
+        st.caption(" · ".join(notes))
 else:
     st.info("No metrics to display.")
 
@@ -212,7 +230,7 @@ if detail_symbol:
         # ── Split detection (reuse cache from summary) ────────────────
         detected_splits = _get_splits_for_symbol(detail_symbol)
 
-        # Metric cards — auto-adjusted for splits
+        # Metric cards — TTM-adjusted for flow metrics, split-adjusted for per-share
         card_metrics = [
             ("revenue", "Revenue"),
             ("net_income", "Net Income"),
@@ -225,13 +243,29 @@ if detail_symbol:
             if key in latest:
                 raw = latest[key].get("metric_value")
                 period = latest[key].get("period_end", "")
+                fp = latest[key].get("fiscal_period", "")
                 try:
                     val = float(raw)
-                    adjusted_label = label
+                    suffixes = []
+
+                    # TTM for flow metrics from quarterly filings
+                    if is_flow_metric(key) and fp and fp != "FY":
+                        history = get_stock_metrics(symbol=detail_symbol, metric_name=key)
+                        ttm_val, ttm_method = compute_ttm_latest(history)
+                        if ttm_val is not None:
+                            val = ttm_val
+                            suffixes.append("TTM")
+
+                    # Split adjustment
                     if detected_splits and key in (SPLIT_AFFECTED_PER_SHARE | SPLIT_AFFECTED_SHARE_COUNT):
                         val, was_adj = normalize_latest_value(key, val, str(period), detected_splits)
                         if was_adj:
-                            adjusted_label = label + " (adj)"
+                            suffixes.append("adj")
+
+                    adjusted_label = label
+                    if suffixes:
+                        adjusted_label = f"{label} ({', '.join(suffixes)})"
+
                     if key.startswith("eps"):
                         display = f"${val:,.2f}"
                     else:
@@ -273,10 +307,25 @@ if detail_symbol:
             if hist_metric:
                 history = get_stock_metrics(symbol=detail_symbol, metric_name=hist_metric)
                 if history:
-                    # Always normalize when splits detected
+                    # Split normalization
                     history = normalize_metrics(history, detected_splits, hist_metric)
 
-                    if detected_splits and not show_raw:
+                    # TTM computation for flow metrics
+                    has_ttm = False
+                    if is_flow_metric(hist_metric):
+                        ttm_history = compute_ttm(history)
+                        # Merge TTM columns back into history
+                        for orig, ttm_row in zip(history, ttm_history):
+                            orig["ttm_value"] = ttm_row.get("ttm_value")
+                            orig["ttm_method"] = ttm_row.get("ttm_method")
+                            orig["is_ytd"] = ttm_row.get("is_ytd", False)
+                            orig["fiscal_period"] = ttm_row.get("fiscal_period", "")
+                        has_ttm = any(r.get("ttm_value") is not None for r in history)
+
+                    # Pick the right column for the chart
+                    if has_ttm:
+                        value_col = "ttm_value"
+                    elif detected_splits and not show_raw:
                         value_col = "normalized_value"
                     else:
                         value_col = "metric_value"
@@ -286,14 +335,20 @@ if detail_symbol:
                     hist_df[value_col] = pd.to_numeric(hist_df[value_col], errors="coerce")
                     hist_df = hist_df.sort_values("period_end")
 
-                    st.line_chart(hist_df, x="period_end", y=value_col)
+                    if has_ttm:
+                        st.caption("Showing TTM (trailing twelve months) values for apples-to-apples comparison across 10-K and 10-Q filings")
 
-                    # Data table — show both raw + adjusted when splits exist
+                    st.line_chart(hist_df.dropna(subset=[value_col]), x="period_end", y=value_col)
+
+                    # Data table
+                    display_cols = ["period_end", "fiscal_period", "filing_type", "metric_value"]
+                    if has_ttm:
+                        display_cols.extend(["ttm_value", "ttm_method", "is_ytd"])
                     if detected_splits:
-                        display_cols = ["period_end", "metric_value", "normalized_value",
-                                        "split_adjusted", "filing_type"]
-                    else:
-                        display_cols = ["period_end", "metric_value", "filing_type", "source"]
+                        display_cols.extend(["normalized_value", "split_adjusted"])
+                    if not has_ttm and not detected_splits:
+                        display_cols.append("source")
+
                     available = [c for c in display_cols if c in hist_df.columns]
                     st.dataframe(
                         hist_df[available].reset_index(drop=True),

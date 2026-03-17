@@ -780,6 +780,8 @@ def _metric_row(metric: StockMetric) -> dict:
         "metric_name": metric.metric_name,
         "metric_value": _ser(metric.metric_value),
         "period_end": _ser(metric.period_end),
+        "period_start": _ser(metric.period_start),
+        "fiscal_period": metric.fiscal_period,
         "source": metric.source,
         "cik": metric.cik,
         "filing_type": metric.filing_type,
@@ -788,7 +790,7 @@ def _metric_row(metric: StockMetric) -> dict:
 
 def _metric_fingerprint(row: dict) -> tuple:
     """Fingerprint for deduplicating stock metrics."""
-    return (row.get("symbol"), row.get("metric_name"), row.get("period_end"))
+    return (row.get("symbol"), row.get("metric_name"), row.get("period_end"), row.get("fiscal_period"))
 
 
 def upsert_stock_metrics(
@@ -847,7 +849,7 @@ def upsert_stock_metrics(
         try:
             result = (
                 client.table("stock_metrics")
-                .upsert(batch, on_conflict="symbol,metric_name,period_end")
+                .upsert(batch, on_conflict="symbol,metric_name,period_end,fiscal_period")
                 .execute()
             )
             if not result.data:
