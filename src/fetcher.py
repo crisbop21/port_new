@@ -250,21 +250,18 @@ def _pick_latest_annual(values: list[dict]) -> dict | None:
 
 
 def _pick_all_annual(values: list[dict]) -> list[dict]:
-    """From a list of XBRL fact entries, return all 10-K values (deduplicated).
+    """From a list of XBRL fact entries, return all 10-K and 10-Q values.
 
-    Falls back to 10-Q if no 10-K exists.  Deduplicates by period end date,
-    keeping the most recently filed entry for each period.
+    Includes both annual and quarterly filings.  Deduplicates by period end
+    date, keeping the most recently filed entry for each period.
 
     Returns a list sorted by end date descending (most recent first).
     """
     if not values:
         return []
 
-    # Separate by filing type — prefer 10-K
-    annual = [v for v in values if v.get("form") == "10-K"]
-    quarterly = [v for v in values if v.get("form") == "10-Q"]
-
-    candidates = annual if annual else quarterly
+    # Include both 10-K and 10-Q filings
+    candidates = [v for v in values if v.get("form") in ("10-K", "10-Q")]
     if not candidates:
         candidates = values
 
