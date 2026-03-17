@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 
 # ── Configuration ────────────────────────────────────────────────────────────
 
-_DEFAULT_USER_AGENT = "IBKRTradeJournal/1.0 (personal-use)"
+_DEFAULT_USER_AGENT = "IBKRTradeJournal/1.0 (bojaca.cristian21@gmail.com)"
 _REQUEST_INTERVAL = 0.2  # seconds between SEC requests (~5 req/s)
 _REQUEST_TIMEOUT = 15  # seconds
 
@@ -69,6 +69,17 @@ XBRL_TAG_MAP: dict[str, list[str]] = {
 }
 
 
+# Common ticker aliases — maps tickers that SEC doesn't list to their
+# SEC-recognized equivalents (same company, different share class or name).
+_TICKER_ALIASES: dict[str, str] = {
+    "GOOG": "GOOGL",       # Alphabet Class C → Class A
+    "BRK.A": "BRK-A",      # Berkshire variants
+    "BRK/A": "BRK-A",
+    "BRK.B": "BRK-B",
+    "BRK/B": "BRK-B",
+}
+
+
 def _get_user_agent() -> str:
     return os.environ.get("EDGAR_USER_AGENT", _DEFAULT_USER_AGENT)
 
@@ -109,6 +120,14 @@ def _sec_get(session: requests.Session, url: str) -> dict | None:
         logger.error("SEC request failed (network): %s — %s", url, e)
         return None
 
+    if resp.status_code == 403:
+        logger.error(
+            "SEC 403 (forbidden): %s — likely bad User-Agent. "
+            "SEC requires format 'Company admin@email.com'. "
+            "Set EDGAR_USER_AGENT env var. Current: %s",
+            url, session.headers.get("User-Agent"),
+        )
+        return None
     if resp.status_code == 404:
         logger.warning("SEC 404 (not found): %s", url)
         return None
@@ -149,8 +168,8 @@ def _load_cik_map(session: requests.Session) -> dict[str, str]:
     data = _sec_get(session, url)
     if data is None:
         logger.error("Failed to load CIK map from %s", url)
-        _cik_cache = {}
-        return _cik_cache
+        # Do NOT cache empty result — allow retry on next call
+        return {}
 
     mapping: dict[str, str] = {}
     for entry in data.values():
@@ -171,7 +190,10 @@ def get_cik(ticker: str) -> str | None:
     """
     session = _get_session()
     cik_map = _load_cik_map(session)
-    cik = cik_map.get(ticker.upper().strip())
+    normalized = ticker.upper().strip()
+    cik = cik_map.get(normalized)
+    if cik is None and normalized in _TICKER_ALIASES:
+        cik = cik_map.get(_TICKER_ALIASES[normalized])
     if cik is None:
         logger.info("No CIK found for ticker '%s' — may be ETF or delisted", ticker)
     else:
@@ -261,10 +283,24 @@ def fetch_metrics_for_symbol(symbol: str) -> tuple[list[StockMetric], list[str]]
 
     logger.info("=== Fetching metrics for %s ===", symbol)
 
-    # Step 1: CIK lookup
+    # Step 1: CIK lookup (try alias if direct lookup fails)
     session = _get_session()
     cik_map = _load_cik_map(session)
+    if not cik_map:
+        msg = (
+            "Failed to download SEC ticker database — "
+            "check your internet connection and EDGAR_USER_AGENT env var"
+        )
+        logger.error(msg)
+        errors.append(msg)
+        return metrics, errors
     cik = cik_map.get(symbol)
+    lookup_symbol = symbol
+    if cik is None and symbol in _TICKER_ALIASES:
+        lookup_symbol = _TICKER_ALIASES[symbol]
+        cik = cik_map.get(lookup_symbol)
+        if cik is not None:
+            logger.info("%s: resolved via alias → %s", symbol, lookup_symbol)
     if cik is None:
         msg = f"{symbol}: no CIK found — not in SEC database (ETF or foreign?)"
         logger.warning(msg)
