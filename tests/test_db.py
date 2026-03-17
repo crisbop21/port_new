@@ -9,8 +9,16 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from src.db import _position_row, _position_fingerprint, _ser, _trade_row, _trade_fingerprint
-from src.models import ParsedStatement, Position, StatementMeta, Trade
+from src.db import (
+    _metric_fingerprint,
+    _metric_row,
+    _position_fingerprint,
+    _position_row,
+    _ser,
+    _trade_fingerprint,
+    _trade_row,
+)
+from src.models import ParsedStatement, Position, StatementMeta, StockMetric, Trade
 
 
 # ── Fixtures ─────────────────────────────────────────────────────────────────
@@ -802,3 +810,113 @@ class TestCheckDuplicates:
         assert result["dup_trades"] == 0
         assert result["new_positions"] == 0
         assert result["dup_positions"] == 0
+
+
+# ── Stock metric helpers ─────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def sample_metric():
+    return StockMetric(
+        symbol="AAPL",
+        metric_name="revenue",
+        metric_value=Decimal("394328000000"),
+        period_end=date(2024, 9, 28),
+        source="SEC_EDGAR",
+        cik="0000320193",
+        filing_type="10-K",
+    )
+
+
+class TestMetricRow:
+    def test_structure(self, sample_metric):
+        row = _metric_row(sample_metric)
+        assert row["symbol"] == "AAPL"
+        assert row["metric_name"] == "revenue"
+        assert row["metric_value"] == "394328000000"
+        assert row["period_end"] == "2024-09-28"
+        assert row["source"] == "SEC_EDGAR"
+        assert row["cik"] == "0000320193"
+        assert row["filing_type"] == "10-K"
+
+    def test_decimal_precision(self):
+        metric = StockMetric(
+            symbol="MSFT",
+            metric_name="eps_diluted",
+            metric_value=Decimal("11.86"),
+            period_end=date(2024, 6, 30),
+            source="SEC_EDGAR",
+            cik="0000789019",
+            filing_type="10-K",
+        )
+        row = _metric_row(metric)
+        assert row["metric_value"] == "11.86"
+
+
+class TestMetricFingerprint:
+    def test_same_metric_same_fingerprint(self, sample_metric):
+        row = _metric_row(sample_metric)
+        fp1 = _metric_fingerprint(row)
+        fp2 = _metric_fingerprint(row)
+        assert fp1 == fp2
+
+    def test_different_period_different_fingerprint(self, sample_metric):
+        row1 = _metric_row(sample_metric)
+        metric2 = sample_metric.model_copy(update={"period_end": date(2023, 9, 30)})
+        row2 = _metric_row(metric2)
+        assert _metric_fingerprint(row1) != _metric_fingerprint(row2)
+
+    def test_different_metric_name_different_fingerprint(self, sample_metric):
+        row1 = _metric_row(sample_metric)
+        metric2 = sample_metric.model_copy(update={"metric_name": "net_income"})
+        row2 = _metric_row(metric2)
+        assert _metric_fingerprint(row1) != _metric_fingerprint(row2)
+
+
+class TestUpsertStockMetrics:
+    @patch("src.db.get_client")
+    def test_inserts_new_metrics(self, mock_get_client, sample_metric):
+        from src.db import upsert_stock_metrics
+
+        client = _make_mock_client()
+        mock_get_client.return_value = client
+
+        inserted, updated, errors = upsert_stock_metrics([sample_metric])
+        assert inserted == 1
+        assert updated == 0
+        assert errors == []
+
+    @patch("src.db.get_client")
+    def test_empty_list_returns_zeros(self, mock_get_client):
+        from src.db import upsert_stock_metrics
+
+        inserted, updated, errors = upsert_stock_metrics([])
+        assert inserted == 0
+        assert updated == 0
+        assert errors == []
+
+    @patch("src.db.get_client")
+    def test_detects_existing_as_update(self, mock_get_client, sample_metric):
+        from src.db import upsert_stock_metrics
+
+        client = MagicMock()
+        existing_row = {"symbol": "AAPL", "metric_name": "revenue", "period_end": "2024-09-28"}
+
+        def _mock_table(name):
+            table = MagicMock()
+            select = table.select.return_value
+            select.eq.return_value = select
+            # Return the existing metric so the fingerprint check finds it
+            select.execute.return_value = MagicMock(data=[existing_row])
+            # upsert chain
+            table.upsert.return_value.execute.return_value = MagicMock(
+                data=[{"id": "row-uuid-001"}]
+            )
+            return table
+
+        client.table.side_effect = _mock_table
+        mock_get_client.return_value = client
+
+        inserted, updated, errors = upsert_stock_metrics([sample_metric])
+        assert updated == 1
+        assert inserted == 0
