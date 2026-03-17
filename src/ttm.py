@@ -76,10 +76,19 @@ class IsolatedQuarter:
     method: str           # 'direct' (Q1) | 'subtracted' (Q2-Q4)
 
 
-def isolate_quarters(metric_rows: list[dict]) -> list[IsolatedQuarter]:
+def isolate_quarters(
+    metric_rows: list[dict],
+    value_key: str = "metric_value",
+) -> list[IsolatedQuarter]:
     """Derive isolated quarterly values from YTD-cumulative SEC data.
 
-    Input rows must have: metric_value, period_end, fiscal_period.
+    Input rows must have: period_end, fiscal_period, and the field
+    named by *value_key* (default "metric_value").
+
+    Args:
+        metric_rows: historical metric rows from DB
+        value_key:   which dict key holds the value to isolate.
+                     Use "normalized_value" when split-adjusted data is available.
 
     Derivation:
         Q1 isolated = Q1 YTD  (already a single quarter)
@@ -101,7 +110,7 @@ def isolate_quarters(metric_rows: list[dict]) -> list[IsolatedQuarter]:
         if not fy or not fp:
             continue
         try:
-            val = float(row.get("metric_value", 0))
+            val = float(row.get(value_key) or row.get("metric_value", 0))
         except (ValueError, TypeError):
             continue
         key = (fy, fp)
@@ -188,6 +197,7 @@ def isolate_quarters(metric_rows: list[dict]) -> list[IsolatedQuarter]:
 
 def compute_ttm(
     metric_rows: list[dict],
+    value_key: str = "metric_value",
 ) -> list[dict]:
     """Compute TTM values for a single flow metric's history.
 
@@ -196,7 +206,10 @@ def compute_ttm(
         2. For each period, TTM = sum of the 4 most recent isolated quarters
            up to and including that period
 
-    Each row must have: metric_value, period_end, fiscal_period.
+    Args:
+        metric_rows: historical metric rows
+        value_key:   which dict key holds the value to use.
+                     Use "normalized_value" after split normalization.
 
     Returns a new list of dicts (chronological) with added keys:
         - quarterly_value: the isolated single-quarter figure (or None)
@@ -210,7 +223,7 @@ def compute_ttm(
     sorted_rows = sorted(metric_rows, key=lambda r: str(r.get("period_end", "")))
 
     # Isolate quarters
-    isolated = isolate_quarters(metric_rows)
+    isolated = isolate_quarters(metric_rows, value_key=value_key)
 
     # Build a lookup from period_end → IsolatedQuarter for enriching rows
     iso_by_pe: dict[str, IsolatedQuarter] = {}
@@ -248,7 +261,7 @@ def compute_ttm(
         if fp == "FY" and ttm_entry is None:
             # FY value is already 12 months
             try:
-                r["ttm_value"] = float(r.get("metric_value", 0))
+                r["ttm_value"] = float(r.get(value_key) or r.get("metric_value", 0))
                 r["ttm_method"] = "annual"
             except (ValueError, TypeError):
                 r["ttm_value"] = None
@@ -265,12 +278,15 @@ def compute_ttm(
     return result
 
 
-def compute_ttm_latest(metric_rows: list[dict]) -> tuple[float | None, str | None]:
+def compute_ttm_latest(
+    metric_rows: list[dict],
+    value_key: str = "metric_value",
+) -> tuple[float | None, str | None]:
     """Compute just the latest TTM value for a flow metric.
 
     Returns (ttm_value, ttm_method) or (None, None) if not computable.
     """
-    ttm_rows = compute_ttm(metric_rows)
+    ttm_rows = compute_ttm(metric_rows, value_key=value_key)
     if not ttm_rows:
         return None, None
 
