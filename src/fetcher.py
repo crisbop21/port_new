@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 
 # ── Configuration ────────────────────────────────────────────────────────────
 
-_DEFAULT_USER_AGENT = "IBKRTradeJournal/1.0 (trade-journal@example.com)"
+_DEFAULT_USER_AGENT = "IBKRTradeJournal/1.0 (bojaca.cristian21@gmail.com)"
 _REQUEST_INTERVAL = 0.2  # seconds between SEC requests (~5 req/s)
 _REQUEST_TIMEOUT = 15  # seconds
 
