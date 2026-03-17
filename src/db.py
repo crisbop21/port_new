@@ -1,6 +1,6 @@
 """Supabase database layer for the IBKR Trade Journal.
 
-Tables: statements, positions, trades (see sql/001_schema.sql).
+Tables: statements, positions, trades, stock_metrics (see sql/).
 All financial columns use Postgres numeric via Python Decimal.
 """
 
@@ -12,7 +12,7 @@ from decimal import Decimal
 import streamlit as st
 from supabase import Client, create_client
 
-from src.models import ParsedStatement, Position, Trade
+from src.models import ParsedStatement, Position, StockMetric, Trade
 
 logger = logging.getLogger(__name__)
 
@@ -367,6 +367,9 @@ def clear_query_caches() -> None:
     _get_account_statements.clear()
     get_snapshot_dates.clear()
     get_positions_as_of.clear()
+    get_stock_metrics.clear()
+    get_latest_stock_metrics.clear()
+    get_portfolio_symbols.clear()
 
 
 # ── Queries ──────────────────────────────────────────────────────────────────
@@ -765,3 +768,191 @@ def reconcile_account(account_id: str) -> list[dict]:
         )
         results.append(pair_result)
     return results
+
+
+# ── Stock metrics ────────────────────────────────────────────────────────────
+
+
+def _metric_row(metric: StockMetric) -> dict:
+    """Serialise a StockMetric to a dict for Supabase insert."""
+    return {
+        "symbol": metric.symbol,
+        "metric_name": metric.metric_name,
+        "metric_value": _ser(metric.metric_value),
+        "period_end": _ser(metric.period_end),
+        "source": metric.source,
+        "cik": metric.cik,
+        "filing_type": metric.filing_type,
+    }
+
+
+def _metric_fingerprint(row: dict) -> tuple:
+    """Fingerprint for deduplicating stock metrics."""
+    return (row.get("symbol"), row.get("metric_name"), row.get("period_end"))
+
+
+def upsert_stock_metrics(
+    metrics: list[StockMetric],
+) -> tuple[int, int, list[str]]:
+    """Save stock metrics to Supabase, skipping duplicates.
+
+    Uses the DB unique constraint (symbol, metric_name, period_end) via
+    upsert to handle conflicts — existing rows get their value updated,
+    new rows are inserted.
+
+    Returns:
+        (inserted, updated, errors) — counts and a list of error messages.
+    """
+    if not metrics:
+        return 0, 0, []
+
+    client = get_client()
+    errors: list[str] = []
+    inserted = 0
+    updated = 0
+
+    # Fetch existing fingerprints to know what's an insert vs update
+    symbols = list({m.symbol for m in metrics})
+    existing_fps: set[tuple] = set()
+    try:
+        for sym in symbols:
+            result = (
+                client.table("stock_metrics")
+                .select("symbol,metric_name,period_end")
+                .eq("symbol", sym)
+                .execute()
+            )
+            for row in result.data:
+                existing_fps.add(_metric_fingerprint(row))
+    except Exception as e:
+        msg = f"Failed to check existing metrics: {e}"
+        logger.error(msg)
+        errors.append(msg)
+        # Continue anyway — upsert will handle conflicts
+
+    rows = [_metric_row(m) for m in metrics]
+
+    # Count what's new vs what will be updated
+    for row in rows:
+        fp = _metric_fingerprint(row)
+        if fp in existing_fps:
+            updated += 1
+        else:
+            inserted += 1
+
+    # Upsert in batches (Supabase has payload limits)
+    batch_size = 50
+    for i in range(0, len(rows), batch_size):
+        batch = rows[i : i + batch_size]
+        try:
+            result = (
+                client.table("stock_metrics")
+                .upsert(batch, on_conflict="symbol,metric_name,period_end")
+                .execute()
+            )
+            if not result.data:
+                msg = (
+                    f"Metrics upsert returned no data (batch {i // batch_size + 1}, "
+                    f"{len(batch)} rows). Check RLS policies on 'stock_metrics' table."
+                )
+                logger.error(msg)
+                errors.append(msg)
+        except Exception as e:
+            msg = f"Metrics upsert failed (batch {i // batch_size + 1}): {e}"
+            logger.exception(msg)
+            errors.append(msg)
+
+    logger.info(
+        "Stock metrics upsert: %d inserted, %d updated, %d errors",
+        inserted, updated, len(errors),
+    )
+    return inserted, updated, errors
+
+
+@st.cache_data(ttl=60)
+def get_stock_metrics(
+    symbol: str | None = None,
+    metric_name: str | None = None,
+) -> list[dict]:
+    """Fetch stock metrics with optional filters.
+
+    Returns rows ordered by period_end descending.
+    """
+    try:
+        query = get_client().table("stock_metrics").select("*")
+        if symbol:
+            query = query.eq("symbol", symbol.upper())
+        if metric_name:
+            query = query.eq("metric_name", metric_name)
+        result = query.order("period_end", desc=True).execute()
+        return result.data
+    except Exception as e:
+        logger.exception("Failed to fetch stock metrics (symbol=%s, metric=%s)", symbol, metric_name)
+        st.error(f"Database error fetching stock metrics: {e}")
+        return []
+
+
+@st.cache_data(ttl=60)
+def get_latest_stock_metrics(symbol: str) -> dict[str, dict]:
+    """Fetch the most recent value of each metric for a symbol.
+
+    Returns a dict keyed by metric_name, each value being the full row dict.
+    Example: {"revenue": {"metric_value": "123456", "period_end": "2025-12-31", ...}}
+    """
+    all_metrics = get_stock_metrics(symbol=symbol)
+    latest: dict[str, dict] = {}
+    for row in all_metrics:
+        name = row["metric_name"]
+        if name not in latest:
+            latest[name] = row  # already sorted by period_end desc
+    return latest
+
+
+@st.cache_data(ttl=60)
+def get_portfolio_symbols(account_id: str | None = None) -> list[str]:
+    """Return unique stock/ETF symbols from the latest positions.
+
+    Excludes options (OPT) since they share the underlying symbol.
+    """
+    try:
+        statements = get_statements()
+        if not statements:
+            return []
+
+        if account_id:
+            statements = [s for s in statements if s["account_id"] == account_id]
+        if not statements:
+            return []
+
+        # Get latest statement per account
+        latest_by_account: dict[str, dict] = {}
+        for s in statements:
+            acct = s["account_id"]
+            if acct not in latest_by_account:
+                latest_by_account[acct] = s
+
+        symbols: set[str] = set()
+        for s in latest_by_account.values():
+            positions = get_positions(s["id"])
+            for p in positions:
+                if p["asset_class"] in ("STK", "ETF"):
+                    symbols.add(p["symbol"])
+
+        return sorted(symbols)
+    except Exception as e:
+        logger.exception("Failed to get portfolio symbols")
+        st.error(f"Database error fetching portfolio symbols: {e}")
+        return []
+
+
+def get_metrics_for_symbols(symbols: list[str]) -> dict[str, dict[str, dict]]:
+    """Fetch latest metrics for multiple symbols.
+
+    Returns nested dict: {symbol: {metric_name: row_dict}}.
+    """
+    result: dict[str, dict[str, dict]] = {}
+    for sym in symbols:
+        latest = get_latest_stock_metrics(sym)
+        if latest:
+            result[sym] = latest
+    return result

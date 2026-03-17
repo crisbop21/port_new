@@ -3,7 +3,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import Literal
 
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel, field_validator, model_validator
 
 logger = logging.getLogger(__name__)
 
@@ -81,3 +81,56 @@ class ParsedStatement(BaseModel):
     positions: list[Position] = []
     trades: list[Trade] = []
     skipped_rows: list[dict] = []
+
+
+# ── Stock metrics ────────────────────────────────────────────────────────────
+
+KNOWN_METRICS = {
+    "revenue",
+    "net_income",
+    "eps_basic",
+    "eps_diluted",
+    "total_assets",
+    "total_liabilities",
+    "stockholders_equity",
+    "shares_outstanding",
+    "operating_income",
+    "cash_and_equivalents",
+}
+
+
+class StockMetric(BaseModel):
+    """A single fundamental metric for a stock, sourced from SEC EDGAR."""
+
+    symbol: str
+    metric_name: str
+    metric_value: Decimal
+    period_end: date
+    source: str = "SEC_EDGAR"
+    cik: str | None = None
+    filing_type: str | None = None
+
+    @field_validator("symbol")
+    @classmethod
+    def symbol_not_blank(cls, v: str) -> str:
+        v = v.strip().upper()
+        if not v:
+            raise ValueError("symbol must not be blank")
+        return v
+
+    @field_validator("metric_name")
+    @classmethod
+    def metric_name_known(cls, v: str) -> str:
+        v = v.strip().lower()
+        if v not in KNOWN_METRICS:
+            logger.warning("Metric '%s' not in KNOWN_METRICS — allowing but verify", v)
+        return v
+
+    @model_validator(mode="after")
+    def check_source_has_cik(self):
+        if self.source == "SEC_EDGAR" and not self.cik:
+            raise ValueError(
+                f"SEC_EDGAR metric '{self.metric_name}' for {self.symbol} "
+                f"must include a CIK for traceability."
+            )
+        return self
