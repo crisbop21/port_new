@@ -18,7 +18,13 @@ from src.db import (
     upsert_stock_metrics,
 )
 from src.fetcher import fetch_metrics_for_symbol
-from src.splits import detect_splits, normalize_metrics
+from src.splits import (
+    SPLIT_AFFECTED_PER_SHARE,
+    SPLIT_AFFECTED_SHARE_COUNT,
+    detect_splits,
+    normalize_latest_value,
+    normalize_metrics,
+)
 
 st.title("Stock Metrics")
 
@@ -122,16 +128,43 @@ DISPLAY_METRICS = [
     ("cash_and_equivalents", "Cash", "${:,.0f}"),
 ]
 
+# Pre-compute split detection per symbol for use in summary + detail
+_splits_cache: dict[str, list] = {}
+
+def _get_splits_for_symbol(sym: str) -> list:
+    """Detect splits for a symbol, cached for the page render."""
+    if sym not in _splits_cache:
+        shares = get_stock_metrics(symbol=sym, metric_name="shares_outstanding")
+        eps = get_stock_metrics(symbol=sym, metric_name="eps_diluted")
+        _splits_cache[sym] = detect_splits(shares, eps)
+    return _splits_cache[sym]
+
+
 rows = []
+split_notes: list[str] = []
 for sym in sorted(metrics_data.keys()):
     sym_metrics = metrics_data[sym]
+    sym_splits = _get_splits_for_symbol(sym)
     row: dict = {"Symbol": sym}
+
     for metric_key, display_name, fmt in DISPLAY_METRICS:
         if metric_key in sym_metrics:
             raw_val = sym_metrics[metric_key].get("metric_value")
+            period = sym_metrics[metric_key].get("period_end", "")
             if raw_val is not None:
                 try:
                     val = float(raw_val)
+                    # Auto-adjust split-affected metrics
+                    if sym_splits and metric_key in (SPLIT_AFFECTED_PER_SHARE | SPLIT_AFFECTED_SHARE_COUNT):
+                        val, was_adjusted = normalize_latest_value(
+                            metric_key, val, str(period), sym_splits,
+                        )
+                        if was_adjusted:
+                            display_name_adj = display_name + " *"
+                            row[display_name] = fmt.format(val)
+                            if sym not in [n.split(":")[0] for n in split_notes]:
+                                split_notes.append(f"{sym}: {len(sym_splits)} split(s) detected — per-share metrics adjusted")
+                            continue
                     row[display_name] = fmt.format(val)
                 except (ValueError, TypeError):
                     row[display_name] = str(raw_val)
@@ -149,6 +182,8 @@ for sym in sorted(metrics_data.keys()):
 if rows:
     summary_df = pd.DataFrame(rows)
     st.dataframe(summary_df, use_container_width=True, hide_index=True)
+    if split_notes:
+        st.caption("Split-adjusted: " + " | ".join(split_notes))
 else:
     st.info("No metrics to display.")
 
@@ -174,7 +209,10 @@ if detail_symbol:
     if not latest:
         st.info(f"No metrics stored for {detail_symbol}.")
     else:
-        # Metric cards
+        # ── Split detection (reuse cache from summary) ────────────────
+        detected_splits = _get_splits_for_symbol(detail_symbol)
+
+        # Metric cards — auto-adjusted for splits
         card_metrics = [
             ("revenue", "Revenue"),
             ("net_income", "Net Income"),
@@ -186,22 +224,24 @@ if detail_symbol:
         for col, (key, label) in zip(cols, card_metrics):
             if key in latest:
                 raw = latest[key].get("metric_value")
+                period = latest[key].get("period_end", "")
                 try:
                     val = float(raw)
+                    adjusted_label = label
+                    if detected_splits and key in (SPLIT_AFFECTED_PER_SHARE | SPLIT_AFFECTED_SHARE_COUNT):
+                        val, was_adj = normalize_latest_value(key, val, str(period), detected_splits)
+                        if was_adj:
+                            adjusted_label = label + " (adj)"
                     if key.startswith("eps"):
                         display = f"${val:,.2f}"
                     else:
                         display = f"${val:,.0f}"
                 except (ValueError, TypeError):
                     display = str(raw)
-                col.metric(label, display)
+                    adjusted_label = label
+                col.metric(adjusted_label, display)
             else:
                 col.metric(label, "—")
-
-        # ── Split detection ──────────────────────────────────────────────
-        shares_history = get_stock_metrics(symbol=detail_symbol, metric_name="shares_outstanding")
-        eps_history = get_stock_metrics(symbol=detail_symbol, metric_name="eps_diluted")
-        detected_splits = detect_splits(shares_history, eps_history)
 
         if detected_splits:
             with st.expander(f"Detected splits ({len(detected_splits)})", expanded=True):
@@ -222,18 +262,21 @@ if detail_symbol:
                 key="hist_metric",
             )
 
-            normalize = st.checkbox(
-                "Normalize for splits",
-                value=bool(detected_splits),
-                disabled=not detected_splits,
-                help="Adjust historical values for detected stock splits",
-            )
+            show_raw = False
+            if detected_splits:
+                show_raw = st.checkbox(
+                    "Show raw (unadjusted) values",
+                    value=False,
+                    help="Uncheck to see split-adjusted values (default)",
+                )
 
             if hist_metric:
                 history = get_stock_metrics(symbol=detail_symbol, metric_name=hist_metric)
                 if history:
-                    if normalize and detected_splits:
-                        history = normalize_metrics(history, detected_splits, hist_metric)
+                    # Always normalize when splits detected
+                    history = normalize_metrics(history, detected_splits, hist_metric)
+
+                    if detected_splits and not show_raw:
                         value_col = "normalized_value"
                     else:
                         value_col = "metric_value"
@@ -245,11 +288,12 @@ if detail_symbol:
 
                     st.line_chart(hist_df, x="period_end", y=value_col)
 
-                    # Raw data table
-                    display_cols = ["period_end", "metric_value", "filing_type", "source"]
-                    if normalize and detected_splits:
+                    # Data table — show both raw + adjusted when splits exist
+                    if detected_splits:
                         display_cols = ["period_end", "metric_value", "normalized_value",
                                         "split_adjusted", "filing_type"]
+                    else:
+                        display_cols = ["period_end", "metric_value", "filing_type", "source"]
                     available = [c for c in display_cols if c in hist_df.columns]
                     st.dataframe(
                         hist_df[available].reset_index(drop=True),

@@ -190,6 +190,25 @@ def detect_splits(
     return splits
 
 
+# Metrics that are per-share (divide by ratio to normalize old values)
+SPLIT_AFFECTED_PER_SHARE = {"eps_basic", "eps_diluted"}
+# Metrics that are share-count (multiply by ratio to normalize old values)
+SPLIT_AFFECTED_SHARE_COUNT = {"shares_outstanding"}
+# All other metrics (revenue, net_income, etc.) are unaffected by splits
+
+
+def _compute_split_factor(
+    period: str,
+    sorted_splits: list[DetectedSplit],
+) -> float:
+    """Cumulative split factor for a period — product of all ratios after it."""
+    factor = 1.0
+    for s in sorted_splits:
+        if period < str(s.period_end):
+            factor *= s.shares_ratio
+    return factor
+
+
 def normalize_metrics(
     metrics: list[dict],
     splits: list[DetectedSplit],
@@ -211,7 +230,6 @@ def normalize_metrics(
         'split_adjusted' boolean flag.
     """
     if not splits or not metrics:
-        # No splits — just copy normalized_value = metric_value
         result = []
         for row in metrics:
             r = dict(row)
@@ -220,26 +238,13 @@ def normalize_metrics(
             result.append(r)
         return result
 
-    # Metrics that are per-share (divide by ratio to normalize old values)
-    PER_SHARE = {"eps_basic", "eps_diluted"}
-    # Metrics that are share-count (multiply by ratio to normalize old values)
-    SHARE_COUNT = {"shares_outstanding"}
-    # All other metrics (revenue, net_income, etc.) are unaffected by splits
-
-    # Sort splits chronologically and compute cumulative factor
     sorted_splits = sorted(splits, key=lambda s: s.period_end)
 
     result = []
     for row in metrics:
         r = dict(row)
         period = str(r.get("period_end", ""))
-
-        # Compute cumulative split factor for periods BEFORE each split
-        # Factor = product of all split ratios that happened AFTER this period
-        factor = 1.0
-        for s in sorted_splits:
-            if period < str(s.period_end):
-                factor *= s.shares_ratio
+        factor = _compute_split_factor(period, sorted_splits)
 
         adjusted = False
         raw_val = r.get("metric_value")
@@ -247,16 +252,13 @@ def normalize_metrics(
         if factor != 1.0 and raw_val is not None:
             try:
                 val = float(raw_val)
-                if metric_name in PER_SHARE:
-                    # Old EPS was on fewer shares → divide to normalize
+                if metric_name in SPLIT_AFFECTED_PER_SHARE:
                     r["normalized_value"] = round(val / factor, 4)
                     adjusted = True
-                elif metric_name in SHARE_COUNT:
-                    # Old share count was lower → multiply to normalize
+                elif metric_name in SPLIT_AFFECTED_SHARE_COUNT:
                     r["normalized_value"] = round(val * factor, 0)
                     adjusted = True
                 else:
-                    # Revenue, net income, etc. — not affected by splits
                     r["normalized_value"] = raw_val
             except (ValueError, TypeError):
                 r["normalized_value"] = raw_val
@@ -266,4 +268,50 @@ def normalize_metrics(
         r["split_adjusted"] = adjusted
         result.append(r)
 
+    return result
+
+
+def normalize_latest_value(
+    metric_name: str,
+    metric_value: float,
+    period_end: str,
+    splits: list[DetectedSplit],
+) -> tuple[float, bool]:
+    """Normalize a single latest metric value for splits.
+
+    Returns (adjusted_value, was_adjusted).
+    """
+    if not splits:
+        return metric_value, False
+
+    sorted_splits = sorted(splits, key=lambda s: s.period_end)
+    factor = _compute_split_factor(period_end, sorted_splits)
+
+    if factor == 1.0:
+        return metric_value, False
+
+    if metric_name in SPLIT_AFFECTED_PER_SHARE:
+        return round(metric_value / factor, 4), True
+    elif metric_name in SPLIT_AFFECTED_SHARE_COUNT:
+        return round(metric_value * factor, 0), True
+
+    return metric_value, False
+
+
+def normalize_symbol_data(
+    all_metric_rows: dict[str, list[dict]],
+    splits: list[DetectedSplit],
+) -> dict[str, list[dict]]:
+    """Normalize ALL metric histories for a symbol in one pass.
+
+    Args:
+        all_metric_rows: dict mapping metric_name → list of DB rows
+        splits:          detected splits for this symbol
+
+    Returns:
+        Same structure with normalized_value and split_adjusted added.
+    """
+    result: dict[str, list[dict]] = {}
+    for metric_name, rows in all_metric_rows.items():
+        result[metric_name] = normalize_metrics(rows, splits, metric_name)
     return result
