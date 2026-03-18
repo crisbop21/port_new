@@ -167,3 +167,78 @@ class DailyPrice(BaseModel):
         if not v:
             raise ValueError("symbol must not be blank")
         return v
+
+
+# ── Valuation snapshots ─────────────────────────────────────────────────────
+
+
+VALID_PRESETS = {"Balanced", "Value", "Growth", "Quality"}
+
+
+class ValuationSnapshot(BaseModel):
+    """A point-in-time snapshot of computed valuation ratios and scores."""
+
+    symbol: str
+    snapshot_date: date
+    preset: str
+    price_used: Decimal
+
+    # Valuation ratios (all optional — may not be computable for every stock)
+    pe_ttm: Decimal | None = None
+    pb: Decimal | None = None
+    ps: Decimal | None = None
+    ev_ebitda: Decimal | None = None
+    ev_revenue: Decimal | None = None
+    peg: Decimal | None = None
+    earnings_yield: Decimal | None = None
+    fcf_yield: Decimal | None = None
+    market_cap: Decimal | None = None
+    enterprise_value: Decimal | None = None
+
+    # Profitability
+    gross_margin: Decimal | None = None
+    operating_margin: Decimal | None = None
+    net_margin: Decimal | None = None
+    roe: Decimal | None = None
+    roa: Decimal | None = None
+
+    # Financial health
+    debt_to_equity: Decimal | None = None
+    current_ratio: Decimal | None = None
+    interest_coverage: Decimal | None = None
+    cash_to_assets: Decimal | None = None
+    dividend_yield: Decimal | None = None
+    payout_ratio: Decimal | None = None
+
+    # Growth
+    revenue_growth: Decimal | None = None
+    eps_growth: Decimal | None = None
+    net_income_growth: Decimal | None = None
+
+    # Percentiles
+    pe_percentile: Decimal | None = None
+    pb_percentile: Decimal | None = None
+    ps_percentile: Decimal | None = None
+    ev_ebitda_percentile: Decimal | None = None
+
+    # Scores (0-100)
+    score_composite: Decimal | None = None
+    score_valuation: Decimal | None = None
+    score_profitability: Decimal | None = None
+    score_health: Decimal | None = None
+    score_growth: Decimal | None = None
+
+    @field_validator("symbol")
+    @classmethod
+    def symbol_upper(cls, v: str) -> str:
+        v = v.strip().upper()
+        if not v:
+            raise ValueError("symbol must not be blank")
+        return v
+
+    @field_validator("preset")
+    @classmethod
+    def preset_valid(cls, v: str) -> str:
+        if v not in VALID_PRESETS:
+            raise ValueError(f"preset must be one of {VALID_PRESETS}, got '{v}'")
+        return v

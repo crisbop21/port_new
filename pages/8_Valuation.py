@@ -14,17 +14,24 @@ import math
 import pandas as pd
 import streamlit as st
 
+from decimal import Decimal
+
 from src.db import (
+    clear_query_caches,
     get_account_ids,
     get_daily_prices,
     get_latest_price,
     get_latest_stock_metrics,
+    get_latest_valuation_snapshots,
     get_metrics_for_symbols,
     get_portfolio_symbols,
     get_positions,
     get_statements,
     get_stock_metrics,
+    get_valuation_snapshots,
+    upsert_valuation_snapshots,
 )
+from src.models import ValuationSnapshot
 from src.splits import detect_splits, normalize_metrics
 from src.ttm import compute_ttm_latest, is_flow_metric
 from src.valuation import (
@@ -241,6 +248,109 @@ scored_symbols = [s for s in symbols_with_data if s in all_ratios]
 if not scored_symbols:
     st.info("No symbols with both metrics and price data. Fetch prices and metrics first.")
     st.stop()
+
+
+# ── Build snapshot objects for persistence ───────────────────────────────────
+
+def _dec(val: float | None) -> Decimal | None:
+    """Convert float to Decimal for the snapshot model, skipping inf/nan."""
+    if val is None:
+        return None
+    if math.isnan(val) or math.isinf(val):
+        return None
+    return Decimal(str(round(val, 6)))
+
+
+def _build_snapshots() -> list[ValuationSnapshot]:
+    """Build ValuationSnapshot objects from the current computation."""
+    snaps = []
+    for sym in scored_symbols:
+        ratios = all_ratios[sym]
+        growth = all_growth.get(sym, {})
+        pcts = all_percentiles.get(sym, {})
+        score, cat_scores = all_scores.get(sym, (None, {}))
+        price_row = get_latest_price(sym)
+        if not price_row:
+            continue
+        try:
+            price = Decimal(str(price_row["adj_close"]))
+        except (TypeError, ValueError, KeyError):
+            continue
+
+        snap = ValuationSnapshot(
+            symbol=sym,
+            snapshot_date=date.today(),
+            preset=preset,
+            price_used=price,
+            pe_ttm=_dec(ratios.get("pe_ttm")),
+            pb=_dec(ratios.get("pb")),
+            ps=_dec(ratios.get("ps")),
+            ev_ebitda=_dec(ratios.get("ev_ebitda")),
+            ev_revenue=_dec(ratios.get("ev_revenue")),
+            peg=_dec(ratios.get("peg")),
+            earnings_yield=_dec(ratios.get("earnings_yield")),
+            fcf_yield=_dec(ratios.get("fcf_yield")),
+            market_cap=_dec(ratios.get("market_cap")),
+            enterprise_value=_dec(ratios.get("enterprise_value")),
+            gross_margin=_dec(ratios.get("gross_margin")),
+            operating_margin=_dec(ratios.get("operating_margin")),
+            net_margin=_dec(ratios.get("net_margin")),
+            roe=_dec(ratios.get("roe")),
+            roa=_dec(ratios.get("roa")),
+            debt_to_equity=_dec(ratios.get("debt_to_equity")),
+            current_ratio=_dec(ratios.get("current_ratio")),
+            interest_coverage=_dec(ratios.get("interest_coverage")),
+            cash_to_assets=_dec(ratios.get("cash_to_assets")),
+            dividend_yield=_dec(ratios.get("dividend_yield")),
+            payout_ratio=_dec(ratios.get("payout_ratio")),
+            revenue_growth=_dec(growth.get("revenue_growth")),
+            eps_growth=_dec(growth.get("eps_growth")),
+            net_income_growth=_dec(growth.get("net_income_growth")),
+            pe_percentile=_dec(pcts.get("pe_ttm")),
+            pb_percentile=_dec(pcts.get("pb")),
+            ps_percentile=_dec(pcts.get("ps")),
+            ev_ebitda_percentile=_dec(pcts.get("ev_ebitda")),
+            score_composite=_dec(score),
+            score_valuation=_dec(cat_scores.get("valuation")),
+            score_profitability=_dec(cat_scores.get("profitability")),
+            score_health=_dec(cat_scores.get("health")),
+            score_growth=_dec(cat_scores.get("growth")),
+        )
+        snaps.append(snap)
+    return snaps
+
+
+# ── Save snapshot controls ───────────────────────────────────────────────────
+
+col_save, col_save_info = st.columns([1, 3])
+
+with col_save:
+    save_clicked = st.button("Save Snapshot", type="primary",
+                              help="Persist today's valuation ratios and scores to the database for historical tracking.")
+
+with col_save_info:
+    # Check when last snapshot was saved
+    cached = get_latest_valuation_snapshots(scored_symbols[:1], preset=preset)
+    if cached:
+        last_row = next(iter(cached.values()), {})
+        last_date = last_row.get("snapshot_date", "never")
+        st.caption(f"Last saved: **{last_date}** · Saves {len(scored_symbols)} symbols for preset **{preset}**")
+    else:
+        st.caption(f"No snapshots saved yet · Will save {len(scored_symbols)} symbols for preset **{preset}**")
+
+if save_clicked:
+    snapshots = _build_snapshots()
+    if snapshots:
+        with st.spinner(f"Saving {len(snapshots)} snapshots..."):
+            inserted, updated, errors = upsert_valuation_snapshots(snapshots)
+            clear_query_caches()
+        if errors:
+            for err in errors:
+                st.error(err)
+        else:
+            st.success(f"Saved: {inserted} new, {updated} updated snapshots.")
+    else:
+        st.warning("No snapshots to save.")
 
 # ── Comparison Table ─────────────────────────────────────────────────────────
 
@@ -537,6 +647,30 @@ if detail_symbol and detail_symbol in all_ratios:
             st.info("Could not compute historical ratios — check metrics and price data.")
     else:
         st.info("No price history available. Fetch prices first.")
+
+    # ── Score History (from saved snapshots) ─────────────────────────────
+    st.divider()
+    st.markdown("**Score History**")
+
+    hist_snapshots = get_valuation_snapshots(detail_symbol, preset=preset)
+    if hist_snapshots and len(hist_snapshots) >= 2:
+        snap_df = pd.DataFrame(hist_snapshots)
+        snap_df["snapshot_date"] = pd.to_datetime(snap_df["snapshot_date"])
+        for col_name in ("score_composite", "score_valuation", "score_profitability",
+                         "score_health", "score_growth", "price_used"):
+            snap_df[col_name] = pd.to_numeric(snap_df[col_name], errors="coerce")
+        snap_df = snap_df.sort_values("snapshot_date")
+
+        score_chart_cols = ["score_composite", "score_valuation", "score_profitability",
+                            "score_health", "score_growth"]
+        chart_data = snap_df[["snapshot_date"] + score_chart_cols].set_index("snapshot_date")
+        chart_data.columns = ["Composite", "Valuation", "Profitability", "Health", "Growth"]
+        st.line_chart(chart_data)
+        st.caption(f"{len(hist_snapshots)} snapshots saved for {detail_symbol} ({preset} preset)")
+    elif hist_snapshots and len(hist_snapshots) == 1:
+        st.info("Only 1 snapshot saved. Save snapshots on multiple days to see score trends.")
+    else:
+        st.info("No saved snapshots yet. Click **Save Snapshot** to start tracking score history.")
 
 
 # ── Portfolio-Level Stats ────────────────────────────────────────────────────
