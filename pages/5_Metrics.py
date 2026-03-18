@@ -10,6 +10,7 @@ import streamlit as st
 
 from src.db import (
     clear_query_caches,
+    delete_stock_metrics,
     get_account_ids,
     get_latest_stock_metrics,
     get_metrics_for_symbols,
@@ -60,6 +61,16 @@ fetch_symbols = st.multiselect(
     help="Select which symbols to fetch fundamental data for. ETFs typically have no SEC filings.",
 )
 
+overwrite = st.checkbox(
+    "Overwrite existing data",
+    value=False,
+    help=(
+        "Delete existing metrics for selected symbols before fetching. "
+        "Use this to re-fetch with updated reporting-style detection "
+        "(cumulative YTD vs standalone quarterly)."
+    ),
+)
+
 col_fetch, col_status = st.columns([1, 3])
 
 with col_fetch:
@@ -68,6 +79,16 @@ with col_fetch:
 if fetch_clicked:
     all_metrics = []
     all_errors = []
+
+    # Overwrite: delete existing data first
+    if overwrite and fetch_symbols:
+        with st.spinner("Deleting existing metrics..."):
+            deleted, del_errors = delete_stock_metrics(fetch_symbols)
+            all_errors.extend(del_errors)
+            if deleted:
+                st.info(f"Deleted {deleted} existing metric rows for clean re-fetch.")
+            clear_query_caches()
+
     progress = st.progress(0, text="Starting...")
 
     for i, sym in enumerate(fetch_symbols):
@@ -363,7 +384,7 @@ if detail_symbol:
                     st.line_chart(hist_df.dropna(subset=[value_col]), x="period_end", y=value_col)
 
                     # Data table
-                    display_cols = ["period_end", "fiscal_period", "filing_type", "metric_value"]
+                    display_cols = ["period_end", "fiscal_period", "fiscal_year", "filing_type", "metric_value", "duration_days", "reporting_style"]
                     if has_ttm:
                         display_cols.extend(["quarterly_value", "ttm_value", "ttm_method", "is_ytd"])
                     if detected_splits:

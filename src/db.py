@@ -791,6 +791,9 @@ def _metric_row(metric: StockMetric) -> dict:
         "period_end": _ser(metric.period_end),
         "period_start": _ser(metric.period_start),
         "fiscal_period": metric.fiscal_period,
+        "fiscal_year": metric.fiscal_year,
+        "duration_days": metric.duration_days,
+        "reporting_style": metric.reporting_style,
         "source": metric.source,
         "cik": metric.cik,
         "filing_type": metric.filing_type,
@@ -878,6 +881,41 @@ def upsert_stock_metrics(
         inserted, updated, len(errors),
     )
     return inserted, updated, errors
+
+
+def delete_stock_metrics(symbols: list[str]) -> tuple[int, list[str]]:
+    """Delete all stock metrics for the given symbols.
+
+    Used for clean re-fetch: wipe old data before inserting fresh data
+    with updated reporting_style, fiscal_year, and duration_days fields.
+
+    Returns:
+        (deleted_count, errors) — count of deleted rows and error messages.
+    """
+    if not symbols:
+        return 0, []
+
+    client = get_client()
+    errors: list[str] = []
+    total_deleted = 0
+
+    for sym in symbols:
+        try:
+            result = (
+                client.table("stock_metrics")
+                .delete()
+                .eq("symbol", sym.upper().strip())
+                .execute()
+            )
+            count = len(result.data) if result.data else 0
+            total_deleted += count
+            logger.info("Deleted %d metrics for %s", count, sym)
+        except Exception as e:
+            msg = f"Failed to delete metrics for {sym}: {e}"
+            logger.error(msg)
+            errors.append(msg)
+
+    return total_deleted, errors
 
 
 @st.cache_data(ttl=60)

@@ -106,6 +106,9 @@ KNOWN_METRICS = {
 }
 
 
+VALID_REPORTING_STYLES = {"cumulative_ytd", "standalone_quarterly", "annual_only", "mixed"}
+
+
 class StockMetric(BaseModel):
     """A single fundamental metric for a stock, sourced from SEC EDGAR."""
 
@@ -115,6 +118,9 @@ class StockMetric(BaseModel):
     period_end: date
     period_start: date | None = None       # start of reporting period (for duration calc)
     fiscal_period: str | None = None       # 'FY', 'Q1', 'Q2', 'Q3', 'Q4'
+    fiscal_year: int | None = None         # from XBRL 'fy' field (reliable for non-calendar FY)
+    duration_days: int | None = None       # (end - start).days — distinguishes YTD from standalone
+    reporting_style: str | None = None     # cumulative_ytd | standalone_quarterly | annual_only | mixed
     source: str = "SEC_EDGAR"
     cik: str | None = None
     filing_type: str | None = None

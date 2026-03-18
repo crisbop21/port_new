@@ -11,7 +11,11 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from src.fetcher import (
+    _classify_reporting_style,
+    _compute_duration_days,
+    _duration_bucket,
     _extract_fact_values,
+    _pick_all_annual,
     _pick_latest_annual,
     clear_cik_cache,
     fetch_metrics_for_symbol,
@@ -268,3 +272,171 @@ class TestFetchMetricsForSymbol:
         assert len(metrics) == 1
         assert metrics[0].metric_name == "revenue"
         assert len(errors) == 0  # missing metrics are not errors, just debug logs
+
+    @patch("src.fetcher._get_session")
+    def test_fiscal_year_from_xbrl(self, mock_session_fn):
+        """The fy field from XBRL should be used for fiscal_year."""
+        facts_with_fy = {
+            "entityName": "Apple Inc.",
+            "cik": 320193,
+            "facts": {
+                "us-gaap": {
+                    "Revenues": {
+                        "units": {
+                            "USD": [
+                                {
+                                    "val": 100000,
+                                    "end": "2024-09-28",
+                                    "start": "2023-10-01",
+                                    "form": "10-K",
+                                    "fy": 2024,
+                                    "fp": "FY",
+                                    "filed": "2024-11-01",
+                                },
+                            ]
+                        }
+                    },
+                },
+                "dei": {},
+            },
+        }
+        session = MagicMock()
+        session.get.side_effect = [
+            _mock_sec_response(SAMPLE_CIK_MAP),
+            _mock_sec_response(facts_with_fy),
+        ]
+        mock_session_fn.return_value = session
+
+        metrics, _ = fetch_metrics_for_symbol("AAPL")
+        revenue = next(m for m in metrics if m.metric_name == "revenue")
+        assert revenue.fiscal_year == 2024
+        assert revenue.duration_days == 363  # Sep 28 - Oct 1
+
+    @patch("src.fetcher._get_session")
+    def test_reporting_style_detected(self, mock_session_fn):
+        """Fetcher should detect and store reporting_style."""
+        facts = {
+            "entityName": "Test Co",
+            "cik": 320193,
+            "facts": {
+                "us-gaap": {
+                    "Revenues": {
+                        "units": {
+                            "USD": [
+                                {"val": 25000, "end": "2024-03-31", "start": "2024-01-01",
+                                 "form": "10-Q", "fy": 2024, "fp": "Q1", "filed": "2024-05-01"},
+                                {"val": 53000, "end": "2024-06-30", "start": "2024-01-01",
+                                 "form": "10-Q", "fy": 2024, "fp": "Q2", "filed": "2024-08-01"},
+                            ]
+                        }
+                    },
+                },
+                "dei": {},
+            },
+        }
+        session = MagicMock()
+        session.get.side_effect = [
+            _mock_sec_response(SAMPLE_CIK_MAP),
+            _mock_sec_response(facts),
+        ]
+        mock_session_fn.return_value = session
+
+        metrics, _ = fetch_metrics_for_symbol("AAPL")
+        assert all(m.reporting_style == "cumulative_ytd" for m in metrics)
+
+
+# ── Duration and reporting style tests ────────────────────────────────────
+
+
+class TestDurationBucket:
+    def test_3mo(self):
+        assert _duration_bucket("2024-01-01", "2024-03-31") == "3mo"
+
+    def test_6mo(self):
+        assert _duration_bucket("2024-01-01", "2024-06-30") == "6mo"
+
+    def test_9mo(self):
+        assert _duration_bucket("2024-01-01", "2024-09-30") == "9mo"
+
+    def test_12mo(self):
+        assert _duration_bucket("2024-01-01", "2024-12-31") == "12mo"
+
+    def test_no_start(self):
+        assert _duration_bucket(None, "2024-03-31") == "instant"
+
+    def test_bad_date(self):
+        assert _duration_bucket("bad", "2024-03-31") == "unknown"
+
+
+class TestComputeDurationDays:
+    def test_quarter(self):
+        assert _compute_duration_days("2024-01-01", "2024-03-31") == 90
+
+    def test_none_start(self):
+        assert _compute_duration_days(None, "2024-03-31") is None
+
+
+class TestClassifyReportingStyle:
+    def test_cumulative_ytd(self):
+        entries = [
+            {"fp": "Q1", "start": "2024-01-01", "end": "2024-03-31"},
+            {"fp": "Q2", "start": "2024-01-01", "end": "2024-06-30"},  # 181 days = YTD
+        ]
+        assert _classify_reporting_style(entries) == "cumulative_ytd"
+
+    def test_standalone_quarterly(self):
+        entries = [
+            {"fp": "Q1", "start": "2024-01-01", "end": "2024-03-31"},
+            {"fp": "Q2", "start": "2024-04-01", "end": "2024-06-30"},  # 90 days = standalone
+        ]
+        assert _classify_reporting_style(entries) == "standalone_quarterly"
+
+    def test_annual_only(self):
+        entries = [
+            {"fp": "FY", "start": "2024-01-01", "end": "2024-12-31"},
+        ]
+        assert _classify_reporting_style(entries) == "annual_only"
+
+    def test_mixed(self):
+        entries = [
+            {"fp": "Q2", "start": "2024-04-01", "end": "2024-06-30"},  # 3mo
+            {"fp": "Q2", "start": "2024-01-01", "end": "2024-06-30"},  # 6mo
+        ]
+        assert _classify_reporting_style(entries) == "mixed"
+
+    def test_empty(self):
+        assert _classify_reporting_style([]) == "annual_only"
+
+    def test_q1_only_assumes_cumulative(self):
+        """Q1 only (no Q2/Q3 to check) → defaults to cumulative_ytd."""
+        entries = [
+            {"fp": "Q1", "start": "2024-01-01", "end": "2024-03-31"},
+        ]
+        assert _classify_reporting_style(entries) == "cumulative_ytd"
+
+
+class TestPickAllAnnualDuration:
+    """Test that _pick_all_annual correctly selects YTD over standalone."""
+
+    def test_prefers_ytd_for_cumulative_filer(self):
+        """When both 3-month and 6-month Q2 exist, pick the 6-month (YTD)."""
+        values = [
+            {"val": 25000, "end": "2024-06-30", "start": "2024-04-01",
+             "form": "10-Q", "fp": "Q2", "filed": "2024-08-01"},
+            {"val": 53000, "end": "2024-06-30", "start": "2024-01-01",
+             "form": "10-Q", "fp": "Q2", "filed": "2024-08-01"},
+        ]
+        result = _pick_all_annual(values)
+        # Should keep the 6-month (YTD) value
+        assert len(result) == 1
+        assert result[0]["val"] == 53000
+
+    def test_keeps_standalone_for_standalone_filer(self):
+        """When only 3-month Q2 exists, keep it."""
+        values = [
+            {"val": 25000, "end": "2024-06-30", "start": "2024-04-01",
+             "form": "10-Q", "fp": "Q2", "filed": "2024-08-01"},
+        ]
+        result = _pick_all_annual(values)
+        assert len(result) == 1
+        assert result[0]["val"] == 25000
