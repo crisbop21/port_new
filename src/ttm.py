@@ -33,6 +33,10 @@ FLOW_METRICS = {
     "eps_basic",
     "eps_diluted",
     "operating_income",
+    "gross_profit",
+    "capital_expenditures",
+    "dividends_paid",
+    "interest_expense",
 }
 
 # Balance-sheet / point-in-time metrics — no TTM needed.
@@ -42,6 +46,9 @@ POINT_IN_TIME_METRICS = {
     "stockholders_equity",
     "shares_outstanding",
     "cash_and_equivalents",
+    "current_assets",
+    "current_liabilities",
+    "long_term_debt",
 }
 
 

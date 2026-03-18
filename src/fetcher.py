@@ -66,6 +66,31 @@ XBRL_TAG_MAP: dict[str, list[str]] = {
         "us-gaap:CashAndCashEquivalentsAtCarryingValue",
         "us-gaap:Cash",
     ],
+    "gross_profit": [
+        "us-gaap:GrossProfit",
+    ],
+    "current_assets": [
+        "us-gaap:AssetsCurrent",
+    ],
+    "current_liabilities": [
+        "us-gaap:LiabilitiesCurrent",
+    ],
+    "long_term_debt": [
+        "us-gaap:LongTermDebt",
+        "us-gaap:LongTermDebtNoncurrent",
+    ],
+    "capital_expenditures": [
+        "us-gaap:PaymentsToAcquirePropertyPlantAndEquipment",
+        "us-gaap:CapitalExpenditureDiscontinuedOperations",
+    ],
+    "dividends_paid": [
+        "us-gaap:PaymentsOfDividends",
+        "us-gaap:PaymentsOfDividendsCommonStock",
+    ],
+    "interest_expense": [
+        "us-gaap:InterestExpense",
+        "us-gaap:InterestExpenseDebt",
+    ],
 }
 
 
