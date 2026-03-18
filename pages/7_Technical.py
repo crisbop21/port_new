@@ -10,6 +10,7 @@ import pandas as pd
 import streamlit as st
 
 from src.db import get_account_ids, get_daily_prices, get_portfolio_symbols
+from src.signal_guide import generate_signal_guide_pdf
 from src.technical import (
     SIGNAL_CATEGORIES,
     SIGNAL_LABELS,
@@ -20,6 +21,13 @@ from src.technical import (
 )
 
 st.title("Technical Analysis")
+
+st.download_button(
+    label="Download Signal Guide (PDF)",
+    data=generate_signal_guide_pdf(),
+    file_name="technical_signal_guide.pdf",
+    mime="application/pdf",
+)
 
 # ── Account selector ─────────────────────────────────────────────────────────
 
