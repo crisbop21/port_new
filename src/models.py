@@ -96,6 +96,13 @@ KNOWN_METRICS = {
     "shares_outstanding",
     "operating_income",
     "cash_and_equivalents",
+    "gross_profit",
+    "current_assets",
+    "current_liabilities",
+    "long_term_debt",
+    "capital_expenditures",
+    "dividends_paid",
+    "interest_expense",
 }
 
 
