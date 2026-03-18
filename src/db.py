@@ -12,7 +12,7 @@ from decimal import Decimal
 import streamlit as st
 from supabase import Client, create_client
 
-from src.models import ParsedStatement, Position, StockMetric, Trade
+from src.models import DailyPrice, ParsedStatement, Position, StockMetric, Trade
 
 logger = logging.getLogger(__name__)
 
@@ -370,6 +370,8 @@ def clear_query_caches() -> None:
     get_stock_metrics.clear()
     get_latest_stock_metrics.clear()
     get_portfolio_symbols.clear()
+    get_daily_prices.clear()
+    get_latest_price.clear()
 
 
 # ── Queries ──────────────────────────────────────────────────────────────────
@@ -945,6 +947,140 @@ def get_portfolio_symbols(account_id: str | None = None) -> list[str]:
         logger.exception("Failed to get portfolio symbols")
         st.error(f"Database error fetching portfolio symbols: {e}")
         return []
+
+
+# ── Daily prices ─────────────────────────────────────────────────────────────
+
+
+def _price_row(price: DailyPrice) -> dict:
+    """Serialise a DailyPrice to a dict for Supabase insert."""
+    return {
+        "symbol": price.symbol,
+        "price_date": _ser(price.price_date),
+        "open": _ser(price.open),
+        "high": _ser(price.high),
+        "low": _ser(price.low),
+        "close": _ser(price.close),
+        "adj_close": _ser(price.adj_close),
+        "volume": price.volume,
+    }
+
+
+def upsert_daily_prices(
+    prices: list[DailyPrice],
+) -> tuple[int, int, list[str]]:
+    """Save daily prices to Supabase, upserting on (symbol, price_date).
+
+    Returns:
+        (inserted, updated, errors)
+    """
+    if not prices:
+        return 0, 0, []
+
+    client = get_client()
+    errors: list[str] = []
+    inserted = 0
+    updated = 0
+
+    # Check existing to distinguish insert vs update
+    symbols = list({p.symbol for p in prices})
+    existing_keys: set[tuple] = set()
+    try:
+        for sym in symbols:
+            result = (
+                client.table("daily_prices")
+                .select("symbol,price_date")
+                .eq("symbol", sym)
+                .execute()
+            )
+            for row in result.data:
+                existing_keys.add((row["symbol"], row["price_date"]))
+    except Exception as e:
+        msg = f"Failed to check existing prices: {e}"
+        logger.error(msg)
+        errors.append(msg)
+
+    rows = [_price_row(p) for p in prices]
+
+    for row in rows:
+        if (row["symbol"], row["price_date"]) in existing_keys:
+            updated += 1
+        else:
+            inserted += 1
+
+    # Upsert in batches
+    batch_size = 100
+    for i in range(0, len(rows), batch_size):
+        batch = rows[i : i + batch_size]
+        try:
+            result = (
+                client.table("daily_prices")
+                .upsert(batch, on_conflict="symbol,price_date")
+                .execute()
+            )
+            if not result.data:
+                msg = (
+                    f"Prices upsert returned no data (batch {i // batch_size + 1}, "
+                    f"{len(batch)} rows). Check RLS policies on 'daily_prices' table."
+                )
+                logger.error(msg)
+                errors.append(msg)
+        except Exception as e:
+            msg = f"Prices upsert failed (batch {i // batch_size + 1}): {e}"
+            logger.exception(msg)
+            errors.append(msg)
+
+    logger.info(
+        "Daily prices upsert: %d inserted, %d updated, %d errors",
+        inserted, updated, len(errors),
+    )
+    return inserted, updated, errors
+
+
+@st.cache_data(ttl=60)
+def get_daily_prices(
+    symbol: str,
+    date_from: date | None = None,
+    date_to: date | None = None,
+) -> list[dict]:
+    """Fetch daily prices for a symbol, optionally filtered by date range."""
+    try:
+        query = (
+            get_client()
+            .table("daily_prices")
+            .select("*")
+            .eq("symbol", symbol.upper())
+        )
+        if date_from:
+            query = query.gte("price_date", date_from.isoformat())
+        if date_to:
+            query = query.lte("price_date", date_to.isoformat())
+        result = query.order("price_date", desc=False).execute()
+        return result.data
+    except Exception as e:
+        logger.exception("Failed to fetch daily prices for %s", symbol)
+        st.error(f"Database error fetching daily prices: {e}")
+        return []
+
+
+@st.cache_data(ttl=60)
+def get_latest_price(symbol: str) -> dict | None:
+    """Fetch the most recent daily price row for a symbol."""
+    try:
+        result = (
+            get_client()
+            .table("daily_prices")
+            .select("*")
+            .eq("symbol", symbol.upper())
+            .order("price_date", desc=True)
+            .limit(1)
+            .execute()
+        )
+        return result.data[0] if result.data else None
+    except Exception as e:
+        logger.exception("Failed to fetch latest price for %s", symbol)
+        st.error(f"Database error fetching latest price: {e}")
+        return None
 
 
 def get_metrics_for_symbols(symbols: list[str]) -> dict[str, dict[str, dict]]:

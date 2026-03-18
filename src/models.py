@@ -136,3 +136,27 @@ class StockMetric(BaseModel):
                 f"must include a CIK for traceability."
             )
         return self
+
+
+# ── Daily prices ─────────────────────────────────────────────────────────────
+
+
+class DailyPrice(BaseModel):
+    """One day of OHLCV price data for a symbol, sourced from Yahoo Finance."""
+
+    symbol: str
+    price_date: date
+    open: Decimal
+    high: Decimal
+    low: Decimal
+    close: Decimal
+    adj_close: Decimal
+    volume: int
+
+    @field_validator("symbol")
+    @classmethod
+    def symbol_not_blank(cls, v: str) -> str:
+        v = v.strip().upper()
+        if not v:
+            raise ValueError("symbol must not be blank")
+        return v
