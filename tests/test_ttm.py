@@ -12,7 +12,15 @@ from src.ttm import (
 )
 
 
-def _row(period_end: str, value: float, fp: str, form: str = "10-Q") -> dict:
+def _row(
+    period_end: str,
+    value: float,
+    fp: str,
+    form: str = "10-Q",
+    fiscal_year: int | None = None,
+    duration_days: int | None = None,
+    reporting_style: str | None = None,
+) -> dict:
     return {
         "symbol": "AAPL",
         "metric_name": "revenue",
@@ -20,6 +28,9 @@ def _row(period_end: str, value: float, fp: str, form: str = "10-Q") -> dict:
         "period_end": period_end,
         "fiscal_period": fp,
         "filing_type": form,
+        "fiscal_year": fiscal_year,
+        "duration_days": duration_days,
+        "reporting_style": reporting_style,
     }
 
 
@@ -428,3 +439,115 @@ class TestTTMWithSplits:
         val_raw, _ = compute_ttm_latest(normalized, value_key="metric_value")
         val_norm, _ = compute_ttm_latest(normalized, value_key="normalized_value")
         assert val_raw == val_norm == 108000
+
+
+# ── Standalone quarterly reporting ─────────────────────────────────────────
+
+
+class TestStandaloneQuarterly:
+    """Test isolation logic for companies that report standalone quarters."""
+
+    def _standalone_row(self, period_end, value, fp, form="10-Q"):
+        """Helper for standalone rows — each Q is 90 days, style is standalone."""
+        return _row(
+            period_end, value, fp, form,
+            duration_days=90 if fp != "FY" else 365,
+            reporting_style="standalone_quarterly",
+        )
+
+    def test_q1_q2_standalone(self):
+        """Standalone Q1 and Q2 should be used directly, no subtraction."""
+        rows = [
+            self._standalone_row("2023-03-31", 25000, "Q1"),
+            self._standalone_row("2023-06-30", 28000, "Q2"),
+        ]
+        result = isolate_quarters(rows)
+        assert len(result) == 2
+        assert result[0].isolated_value == 25000
+        assert result[0].method == "standalone"
+        assert result[1].isolated_value == 28000
+        assert result[1].method == "standalone"
+
+    def test_full_year_standalone(self):
+        """All 4 standalone quarters should sum to FY."""
+        rows = [
+            self._standalone_row("2023-03-31", 25000, "Q1"),
+            self._standalone_row("2023-06-30", 28000, "Q2"),
+            self._standalone_row("2023-09-30", 27000, "Q3"),
+            self._standalone_row("2023-12-31", 108000, "FY", "10-K"),
+        ]
+        result = isolate_quarters(rows)
+        assert len(result) == 4
+        # Q4 = FY - (Q1+Q2+Q3) = 108000 - 80000 = 28000
+        q4 = [q for q in result if q.quarter == "Q4"][0]
+        assert q4.isolated_value == 28000
+        assert q4.method == "subtracted"
+
+        # Sum should equal FY
+        total = sum(q.isolated_value for q in result)
+        assert total == 108000
+
+    def test_standalone_ttm(self):
+        """TTM computation works correctly for standalone reporters."""
+        rows = [
+            self._standalone_row("2022-03-31", 20000, "Q1"),
+            self._standalone_row("2022-06-30", 22000, "Q2"),
+            self._standalone_row("2022-09-30", 23000, "Q3"),
+            self._standalone_row("2022-12-31", 90000, "FY", "10-K"),
+            self._standalone_row("2023-03-31", 25000, "Q1"),
+        ]
+        result = compute_ttm(rows)
+        q1_23 = [r for r in result if r["period_end"] == "2023-03-31"][0]
+        # Q4_22 = 90000 - (20000+22000+23000) = 25000
+        # TTM = Q2_22(22000) + Q3_22(23000) + Q4_22(25000) + Q1_23(25000) = 95000
+        assert q1_23["ttm_value"] == 95000
+        assert q1_23["ttm_method"] == "sum_4q"
+
+    def test_standalone_is_ytd_false(self):
+        """Standalone reporters should never have is_ytd=True."""
+        rows = [
+            self._standalone_row("2023-03-31", 25000, "Q1"),
+            self._standalone_row("2023-06-30", 28000, "Q2"),
+            self._standalone_row("2023-09-30", 27000, "Q3"),
+        ]
+        result = compute_ttm(rows)
+        for r in result:
+            assert r["is_ytd"] is False
+
+
+class TestFiscalYearField:
+    """Test that fiscal_year from XBRL is used instead of period_end.year."""
+
+    def test_non_calendar_fy(self):
+        """Apple: FY ends Sep, so FY2024 Q1 ends Dec 2023 (period_end.year=2023).
+
+        With fiscal_year=2024 from XBRL, isolation should group correctly.
+        """
+        rows = [
+            _row("2023-12-30", 30000, "Q1", fiscal_year=2024),
+            _row("2024-03-30", 65000, "Q2", fiscal_year=2024),
+            _row("2024-06-29", 98000, "Q3", fiscal_year=2024),
+            _row("2024-09-28", 130000, "FY", "10-K", fiscal_year=2024),
+        ]
+        result = isolate_quarters(rows)
+        assert len(result) == 4
+        # All should be FY 2024
+        assert all(q.fiscal_year == 2024 for q in result)
+        # Q1=30000, Q2=35000, Q3=33000, Q4=32000
+        q1 = [q for q in result if q.quarter == "Q1"][0]
+        assert q1.isolated_value == 30000
+        q2 = [q for q in result if q.quarter == "Q2"][0]
+        assert q2.isolated_value == 35000
+        # Sum = FY
+        total = sum(q.isolated_value for q in result)
+        assert total == 130000
+
+    def test_fallback_to_period_end_year(self):
+        """Without fiscal_year field, falls back to period_end.year."""
+        rows = [
+            _row("2023-03-31", 25000, "Q1"),  # no fiscal_year
+            _row("2023-06-30", 53000, "Q2"),
+        ]
+        result = isolate_quarters(rows)
+        assert result[0].fiscal_year == 2023
+        assert result[1].fiscal_year == 2023

@@ -274,12 +274,93 @@ def _pick_latest_annual(values: list[dict]) -> dict | None:
     return results[0] if results else None
 
 
+def _duration_bucket(start: str | None, end: str | None) -> str:
+    """Classify a reporting period by its duration.
+
+    Returns '3mo', '6mo', '9mo', '12mo', 'instant', or 'unknown'.
+    """
+    if not start or not end:
+        return "instant"  # balance-sheet point-in-time (no start date)
+    try:
+        d_start = date.fromisoformat(str(start))
+        d_end = date.fromisoformat(str(end))
+        days = (d_end - d_start).days
+    except (ValueError, TypeError):
+        return "unknown"
+
+    if days <= 0:
+        return "instant"
+    if days <= 100:
+        return "3mo"
+    if days <= 200:
+        return "6mo"
+    if days <= 290:
+        return "9mo"
+    if days <= 400:
+        return "12mo"
+    return "unknown"
+
+
+def _compute_duration_days(start: str | None, end: str | None) -> int | None:
+    """Compute the number of days between start and end dates."""
+    if not start or not end:
+        return None
+    try:
+        return (date.fromisoformat(str(end)) - date.fromisoformat(str(start))).days
+    except (ValueError, TypeError):
+        return None
+
+
+def _classify_reporting_style(all_entries: list[dict]) -> str:
+    """Determine how a company reports quarterly data.
+
+    Examines Q2/Q3 entries across all metrics.  If any Q2 has ~180-day
+    duration, the company uses YTD cumulative.  If all Q2s have ~90-day
+    duration, it's standalone quarterly.
+
+    Returns: 'cumulative_ytd', 'standalone_quarterly', 'annual_only', or 'mixed'.
+    """
+    q2q3_buckets: set[str] = set()
+
+    for entry in all_entries:
+        fp = entry.get("fp", "")
+        if fp not in ("Q2", "Q3"):
+            continue
+        bucket = _duration_bucket(entry.get("start"), entry.get("end"))
+        if bucket in ("3mo", "6mo", "9mo"):
+            q2q3_buckets.add(bucket)
+
+    if not q2q3_buckets:
+        # No Q2/Q3 data at all — check if there are any quarterly filings
+        has_quarterly = any(
+            entry.get("fp") in ("Q1", "Q2", "Q3", "Q4")
+            for entry in all_entries
+        )
+        if has_quarterly:
+            # Has Q1/Q4 but no Q2/Q3 with start dates — assume cumulative
+            return "cumulative_ytd"
+        return "annual_only"
+
+    has_short = "3mo" in q2q3_buckets
+    has_long = "6mo" in q2q3_buckets or "9mo" in q2q3_buckets
+
+    if has_short and has_long:
+        return "mixed"  # both standalone and YTD contexts present
+    if has_long:
+        return "cumulative_ytd"
+    return "standalone_quarterly"
+
+
 def _pick_all_annual(values: list[dict]) -> list[dict]:
     """From a list of XBRL fact entries, return all 10-K and 10-Q values.
 
     Includes both annual and quarterly filings.  Deduplicates by
-    (end date, fiscal period), keeping the most recently filed entry for
-    each combination.
+    (end date, fiscal period, duration bucket), keeping the most recently
+    filed entry for each combination.
+
+    For cumulative reporters (most US companies), prefers the longest
+    duration context (YTD) for Q2/Q3.  For standalone reporters, keeps
+    the 3-month context.
 
     Returns a list sorted by end date descending (most recent first).
     """
@@ -291,16 +372,41 @@ def _pick_all_annual(values: list[dict]) -> list[dict]:
     if not candidates:
         candidates = values
 
-    # Deduplicate by (end, fp) — keep the most recently filed for each combo.
-    # This preserves both the Q3 YTD and the FY for the same end-date
-    # (which happen when fiscal year ends on a quarter boundary).
+    # Detect reporting style from all candidates
+    style = _classify_reporting_style(candidates)
+
+    # Deduplicate by (end, fp) — but pick the right duration context
     by_key: dict[tuple[str, str], dict] = {}
     for v in candidates:
         end = v.get("end", "")
         fp = v.get("fp", "")
         filed = v.get("filed", "")
+        bucket = _duration_bucket(v.get("start"), v.get("end"))
         key = (end, fp)
-        if end and (key not in by_key or filed > by_key[key].get("filed", "")):
+
+        if not end:
+            continue
+
+        # For Q2/Q3 with mixed or cumulative style, prefer the YTD (longer) context
+        if fp in ("Q2", "Q3") and style in ("cumulative_ytd", "mixed"):
+            existing = by_key.get(key)
+            if existing is not None:
+                existing_bucket = _duration_bucket(
+                    existing.get("start"), existing.get("end"),
+                )
+                # Keep the longer-duration entry (YTD over standalone)
+                if bucket in ("6mo", "9mo") and existing_bucket == "3mo":
+                    by_key[key] = v
+                    continue
+                if existing_bucket in ("6mo", "9mo") and bucket == "3mo":
+                    continue  # existing is already the longer one
+                # Same duration — keep most recently filed
+                if filed > existing.get("filed", ""):
+                    by_key[key] = v
+                continue
+
+        # For standalone reporters or Q1/Q4/FY, keep most recently filed
+        if key not in by_key or filed > by_key[key].get("filed", ""):
             by_key[key] = v
 
     # Sort by end date descending
@@ -361,7 +467,23 @@ def fetch_metrics_for_symbol(symbol: str) -> tuple[list[StockMetric], list[str]]
     company_name = facts.get("entityName", "Unknown")
     logger.info("%s: entity = %s", symbol, company_name)
 
-    # Step 3: Extract each metric (all historical periods)
+    # Step 3: Collect all raw XBRL entries to detect reporting style
+    all_raw_entries: list[dict] = []
+    for metric_name, xbrl_tags in XBRL_TAG_MAP.items():
+        for tag in xbrl_tags:
+            values = _extract_fact_values(facts, tag)
+            if values:
+                # Tag the entries with source info for later use
+                for v in values:
+                    if v.get("form") in ("10-K", "10-Q"):
+                        all_raw_entries.append(v)
+                break  # first matching tag wins per metric
+
+    # Classify how this company reports (cumulative YTD vs standalone)
+    reporting_style = _classify_reporting_style(all_raw_entries)
+    logger.info("%s: reporting_style = %s", symbol, reporting_style)
+
+    # Step 4: Extract each metric (all historical periods)
     for metric_name, xbrl_tags in XBRL_TAG_MAP.items():
         all_values: list[dict] = []
         matched_tag: str | None = None
@@ -386,6 +508,7 @@ def fetch_metrics_for_symbol(symbol: str) -> tuple[list[StockMetric], list[str]]
             raw_end = entry.get("end")
             raw_start = entry.get("start")
             fiscal_period = entry.get("fp")  # FY, Q1, Q2, Q3, Q4
+            fiscal_year = entry.get("fy")    # XBRL fiscal year (reliable)
             filing_form = entry.get("form", "unknown")
 
             if raw_val is None or raw_end is None:
@@ -426,6 +549,19 @@ def fetch_metrics_for_symbol(symbol: str) -> tuple[list[StockMetric], list[str]]
                 except ValueError:
                     pass  # non-critical — we can still use fiscal_period
 
+            # Compute duration for cumulative vs standalone awareness
+            duration_days = _compute_duration_days(raw_start, raw_end)
+
+            # Use XBRL fy field; fall back to period_end year
+            fy = None
+            if fiscal_year is not None:
+                try:
+                    fy = int(fiscal_year)
+                except (ValueError, TypeError):
+                    fy = period_end.year
+            else:
+                fy = period_end.year
+
             # Build validated model
             try:
                 metric = StockMetric(
@@ -435,16 +571,21 @@ def fetch_metrics_for_symbol(symbol: str) -> tuple[list[StockMetric], list[str]]
                     period_end=period_end,
                     period_start=period_start,
                     fiscal_period=fiscal_period,
+                    fiscal_year=fy,
+                    duration_days=duration_days,
+                    reporting_style=reporting_style,
                     source="SEC_EDGAR",
                     cik=cik,
                     filing_type=filing_form,
                 )
                 metrics.append(metric)
                 logger.debug(
-                    "%s: %s = %s (period=%s→%s, fp=%s, tag=%s, form=%s)",
+                    "%s: %s = %s (period=%s→%s, fp=%s, fy=%s, "
+                    "days=%s, style=%s, tag=%s, form=%s)",
                     symbol, metric_name, metric_value,
                     period_start, period_end,
-                    fiscal_period, matched_tag, filing_form,
+                    fiscal_period, fy, duration_days,
+                    reporting_style, matched_tag, filing_form,
                 )
             except Exception as e:
                 msg = f"{symbol}: Pydantic validation failed for '{metric_name}': {e}"
