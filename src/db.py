@@ -12,7 +12,14 @@ from decimal import Decimal
 import streamlit as st
 from supabase import Client, create_client
 
-from src.models import DailyPrice, ParsedStatement, Position, StockMetric, Trade
+from src.models import (
+    DailyPrice,
+    ParsedStatement,
+    Position,
+    StockMetric,
+    Trade,
+    ValuationSnapshot,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1093,4 +1100,164 @@ def get_metrics_for_symbols(symbols: list[str]) -> dict[str, dict[str, dict]]:
         latest = get_latest_stock_metrics(sym)
         if latest:
             result[sym] = latest
+    return result
+
+
+# ── Valuation snapshots ─────────────────────────────────────────────────────
+
+
+# Fields to persist from the ValuationSnapshot model (excluding symbol/date/preset/price
+# which are handled separately as the upsert key).
+_SNAPSHOT_FIELDS = [
+    "pe_ttm", "pb", "ps", "ev_ebitda", "ev_revenue", "peg",
+    "earnings_yield", "fcf_yield", "market_cap", "enterprise_value",
+    "gross_margin", "operating_margin", "net_margin", "roe", "roa",
+    "debt_to_equity", "current_ratio", "interest_coverage", "cash_to_assets",
+    "dividend_yield", "payout_ratio",
+    "revenue_growth", "eps_growth", "net_income_growth",
+    "pe_percentile", "pb_percentile", "ps_percentile", "ev_ebitda_percentile",
+    "score_composite", "score_valuation", "score_profitability",
+    "score_health", "score_growth",
+]
+
+
+def _snapshot_row(snap: ValuationSnapshot) -> dict:
+    """Serialise a ValuationSnapshot for Supabase upsert."""
+    row = {
+        "symbol": snap.symbol,
+        "snapshot_date": _ser(snap.snapshot_date),
+        "preset": snap.preset,
+        "price_used": _ser(snap.price_used),
+    }
+    for field in _SNAPSHOT_FIELDS:
+        row[field] = _ser(getattr(snap, field))
+    return row
+
+
+def upsert_valuation_snapshots(
+    snapshots: list[ValuationSnapshot],
+) -> tuple[int, int, list[str]]:
+    """Save valuation snapshots, upserting on (symbol, snapshot_date, preset).
+
+    Returns (inserted, updated, errors).
+    """
+    if not snapshots:
+        return 0, 0, []
+
+    client = get_client()
+    errors: list[str] = []
+    inserted = 0
+    updated = 0
+
+    # Check existing to distinguish insert vs update
+    symbols = list({s.symbol for s in snapshots})
+    existing_keys: set[tuple] = set()
+    try:
+        for sym in symbols:
+            result = (
+                client.table("valuation_snapshots")
+                .select("symbol,snapshot_date,preset")
+                .eq("symbol", sym)
+                .execute()
+            )
+            for row in result.data:
+                existing_keys.add((row["symbol"], row["snapshot_date"], row["preset"]))
+    except Exception as e:
+        msg = f"Failed to check existing valuation snapshots: {e}"
+        logger.error(msg)
+        errors.append(msg)
+
+    rows = [_snapshot_row(s) for s in snapshots]
+
+    for row in rows:
+        if (row["symbol"], row["snapshot_date"], row["preset"]) in existing_keys:
+            updated += 1
+        else:
+            inserted += 1
+
+    # Upsert in batches
+    batch_size = 50
+    for i in range(0, len(rows), batch_size):
+        batch = rows[i : i + batch_size]
+        try:
+            result = (
+                client.table("valuation_snapshots")
+                .upsert(batch, on_conflict="symbol,snapshot_date,preset")
+                .execute()
+            )
+            if not result.data:
+                msg = (
+                    f"Valuation snapshot upsert returned no data "
+                    f"(batch {i // batch_size + 1}, {len(batch)} rows). "
+                    f"Check RLS policies on 'valuation_snapshots' table."
+                )
+                logger.error(msg)
+                errors.append(msg)
+        except Exception as e:
+            msg = f"Valuation snapshot upsert failed (batch {i // batch_size + 1}): {e}"
+            logger.exception(msg)
+            errors.append(msg)
+
+    logger.info(
+        "Valuation snapshots upsert: %d inserted, %d updated, %d errors",
+        inserted, updated, len(errors),
+    )
+    return inserted, updated, errors
+
+
+@st.cache_data(ttl=60)
+def get_valuation_snapshots(
+    symbol: str,
+    preset: str | None = None,
+    date_from: date | None = None,
+    date_to: date | None = None,
+) -> list[dict]:
+    """Fetch valuation snapshots for a symbol, optionally filtered."""
+    try:
+        query = (
+            get_client()
+            .table("valuation_snapshots")
+            .select("*")
+            .eq("symbol", symbol.upper())
+        )
+        if preset:
+            query = query.eq("preset", preset)
+        if date_from:
+            query = query.gte("snapshot_date", date_from.isoformat())
+        if date_to:
+            query = query.lte("snapshot_date", date_to.isoformat())
+        result = query.order("snapshot_date", desc=False).execute()
+        return result.data
+    except Exception as e:
+        logger.exception("Failed to fetch valuation snapshots for %s", symbol)
+        st.error(f"Database error fetching valuation snapshots: {e}")
+        return []
+
+
+@st.cache_data(ttl=60)
+def get_latest_valuation_snapshots(
+    symbols: list[str],
+    preset: str = "Balanced",
+) -> dict[str, dict]:
+    """Fetch the most recent snapshot for each symbol + preset.
+
+    Returns {symbol: snapshot_row}.
+    """
+    result: dict[str, dict] = {}
+    for sym in symbols:
+        try:
+            resp = (
+                get_client()
+                .table("valuation_snapshots")
+                .select("*")
+                .eq("symbol", sym.upper())
+                .eq("preset", preset)
+                .order("snapshot_date", desc=True)
+                .limit(1)
+                .execute()
+            )
+            if resp.data:
+                result[sym] = resp.data[0]
+        except Exception as e:
+            logger.exception("Failed to fetch latest valuation for %s", sym)
     return result
