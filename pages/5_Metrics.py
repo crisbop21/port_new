@@ -165,7 +165,10 @@ for sym in sorted(metrics_data.keys()):
                         # Split-normalize all history first
                         history = normalize_metrics(history, sym_splits, metric_key)
                         vk = "normalized_value" if sym_splits else "metric_value"
-                        ttm_val, ttm_method = compute_ttm_latest(history, value_key=vk)
+                        try:
+                            ttm_val, ttm_method = compute_ttm_latest(history, value_key=vk)
+                        except TypeError:
+                            ttm_val, ttm_method = None, None
                         if ttm_val is not None:
                             val = ttm_val
                             if sym not in [n.split(":")[0] for n in ttm_notes]:
@@ -257,7 +260,10 @@ if detail_symbol:
                         history = get_stock_metrics(symbol=detail_symbol, metric_name=key)
                         history = normalize_metrics(history, detected_splits, key)
                         vk = "normalized_value" if detected_splits else "metric_value"
-                        ttm_val, ttm_method = compute_ttm_latest(history, value_key=vk)
+                        try:
+                            ttm_val, ttm_method = compute_ttm_latest(history, value_key=vk)
+                        except TypeError:
+                            ttm_val, ttm_method = None, None
                         if ttm_val is not None:
                             val = ttm_val
                             suffixes.append("TTM")
@@ -320,7 +326,14 @@ if detail_symbol:
                     has_ttm = False
                     ttm_value_key = "normalized_value" if detected_splits else "metric_value"
                     if is_flow_metric(hist_metric):
-                        ttm_history = compute_ttm(history, value_key=ttm_value_key)
+                        try:
+                            ttm_history = compute_ttm(history, value_key=ttm_value_key)
+                        except TypeError:
+                            st.error(
+                                f"TTM computation failed for {hist_metric}. "
+                                "This may indicate a version mismatch — try restarting the app."
+                            )
+                            ttm_history = []
                         # Merge TTM columns back into history
                         for orig, ttm_row in zip(history, ttm_history):
                             orig["quarterly_value"] = ttm_row.get("quarterly_value")
