@@ -782,54 +782,15 @@ def reconcile_account(account_id: str) -> list[dict]:
 # ── Stock metrics ────────────────────────────────────────────────────────────
 
 
-def _check_metric_columns() -> set[str]:
-    """Detect which columns exist on stock_metrics table.
+# Columns from migration 007 that may not exist yet
+_NEW_METRIC_COLS = {"fiscal_year", "duration_days", "reporting_style"}
 
-    Returns a set of column names that are safe to include in upsert rows.
-    Caches the result for the session to avoid repeated queries.
-    """
-    if hasattr(_check_metric_columns, "_cache"):
-        return _check_metric_columns._cache
-
-    # These columns always exist (from 004 + 005 migrations)
-    base_cols = {
-        "symbol", "metric_name", "metric_value", "period_end",
-        "period_start", "fiscal_period", "source", "cik", "filing_type",
-    }
-
-    # Columns added by 007_reporting_frequency.sql
-    new_cols = {"fiscal_year", "duration_days", "reporting_style"}
-
-    try:
-        # Probe by selecting the new columns; if they don't exist, Supabase
-        # returns a PGRST204 error.
-        client = get_client()
-        result = (
-            client.table("stock_metrics")
-            .select("fiscal_year")
-            .limit(1)
-            .execute()
-        )
-        # If we get here without error, the columns exist
-        _check_metric_columns._cache = base_cols | new_cols
-    except Exception:
-        logger.info(
-            "stock_metrics table missing new columns (fiscal_year, duration_days, "
-            "reporting_style). Run sql/007_reporting_frequency.sql to enable them."
-        )
-        _check_metric_columns._cache = base_cols
-
-    return _check_metric_columns._cache
+# Module-level flag: False once we know the columns don't exist
+_has_new_metric_cols: bool | None = None  # None = not yet probed
 
 
-def _metric_row(metric: StockMetric) -> dict:
-    """Serialise a StockMetric to a dict for Supabase insert.
-
-    Only includes columns that exist in the DB schema to avoid
-    PGRST204 errors when migration 007 hasn't been applied yet.
-    """
-    allowed = _check_metric_columns()
-
+def _metric_row(metric: StockMetric, include_new_cols: bool = True) -> dict:
+    """Serialise a StockMetric to a dict for Supabase insert."""
     row = {
         "symbol": metric.symbol,
         "metric_name": metric.metric_name,
@@ -842,15 +803,17 @@ def _metric_row(metric: StockMetric) -> dict:
         "filing_type": metric.filing_type,
     }
 
-    # Only include new columns if they exist in the DB
-    if "fiscal_year" in allowed:
+    if include_new_cols:
         row["fiscal_year"] = metric.fiscal_year
-    if "duration_days" in allowed:
         row["duration_days"] = metric.duration_days
-    if "reporting_style" in allowed:
         row["reporting_style"] = metric.reporting_style
 
     return row
+
+
+def _strip_new_cols(rows: list[dict]) -> list[dict]:
+    """Remove migration-007 columns from row dicts."""
+    return [{k: v for k, v in row.items() if k not in _NEW_METRIC_COLS} for row in rows]
 
 
 def _metric_fingerprint(row: dict) -> tuple:
@@ -897,7 +860,11 @@ def upsert_stock_metrics(
         errors.append(msg)
         # Continue anyway — upsert will handle conflicts
 
-    rows = [_metric_row(m) for m in metrics]
+    global _has_new_metric_cols
+
+    # Build rows — include new columns unless we already know they're missing
+    include_new = _has_new_metric_cols is not False
+    rows = [_metric_row(m, include_new_cols=include_new) for m in metrics]
 
     # Count what's new vs what will be updated
     for row in rows:
@@ -910,7 +877,11 @@ def upsert_stock_metrics(
     # Upsert in batches (Supabase has payload limits)
     batch_size = 50
     for i in range(0, len(rows), batch_size):
-        batch = rows[i : i + batch_size]
+        # If a previous batch revealed missing cols, strip from remaining batches
+        if _has_new_metric_cols is False and include_new:
+            batch = _strip_new_cols(rows[i : i + batch_size])
+        else:
+            batch = rows[i : i + batch_size]
         try:
             result = (
                 client.table("stock_metrics")
@@ -924,10 +895,42 @@ def upsert_stock_metrics(
                 )
                 logger.error(msg)
                 errors.append(msg)
+            else:
+                # Success — if we included new cols, they exist
+                if include_new:
+                    _has_new_metric_cols = True
         except Exception as e:
-            msg = f"Metrics upsert failed (batch {i // batch_size + 1}): {e}"
-            logger.exception(msg)
-            errors.append(msg)
+            err_str = str(e)
+            # Detect missing-column errors (PGRST204) and retry without new cols
+            if include_new and ("PGRST204" in err_str or "Could not find" in err_str):
+                logger.info(
+                    "Migration 007 not applied yet — retrying batch %d without "
+                    "fiscal_year/duration_days/reporting_style columns.",
+                    i // batch_size + 1,
+                )
+                _has_new_metric_cols = False
+                stripped = _strip_new_cols(batch)
+                try:
+                    result = (
+                        client.table("stock_metrics")
+                        .upsert(stripped, on_conflict="symbol,metric_name,period_end,fiscal_period")
+                        .execute()
+                    )
+                    if not result.data:
+                        msg = (
+                            f"Metrics upsert returned no data (batch {i // batch_size + 1}, "
+                            f"{len(stripped)} rows, stripped). Check RLS policies."
+                        )
+                        logger.error(msg)
+                        errors.append(msg)
+                except Exception as e2:
+                    msg = f"Metrics upsert failed (batch {i // batch_size + 1}, retry): {e2}"
+                    logger.exception(msg)
+                    errors.append(msg)
+            else:
+                msg = f"Metrics upsert failed (batch {i // batch_size + 1}): {e}"
+                logger.exception(msg)
+                errors.append(msg)
 
     logger.info(
         "Stock metrics upsert: %d inserted, %d updated, %d errors",
