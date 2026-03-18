@@ -782,22 +782,75 @@ def reconcile_account(account_id: str) -> list[dict]:
 # ── Stock metrics ────────────────────────────────────────────────────────────
 
 
+def _check_metric_columns() -> set[str]:
+    """Detect which columns exist on stock_metrics table.
+
+    Returns a set of column names that are safe to include in upsert rows.
+    Caches the result for the session to avoid repeated queries.
+    """
+    if hasattr(_check_metric_columns, "_cache"):
+        return _check_metric_columns._cache
+
+    # These columns always exist (from 004 + 005 migrations)
+    base_cols = {
+        "symbol", "metric_name", "metric_value", "period_end",
+        "period_start", "fiscal_period", "source", "cik", "filing_type",
+    }
+
+    # Columns added by 007_reporting_frequency.sql
+    new_cols = {"fiscal_year", "duration_days", "reporting_style"}
+
+    try:
+        # Probe by selecting the new columns; if they don't exist, Supabase
+        # returns a PGRST204 error.
+        client = get_client()
+        result = (
+            client.table("stock_metrics")
+            .select("fiscal_year")
+            .limit(1)
+            .execute()
+        )
+        # If we get here without error, the columns exist
+        _check_metric_columns._cache = base_cols | new_cols
+    except Exception:
+        logger.info(
+            "stock_metrics table missing new columns (fiscal_year, duration_days, "
+            "reporting_style). Run sql/007_reporting_frequency.sql to enable them."
+        )
+        _check_metric_columns._cache = base_cols
+
+    return _check_metric_columns._cache
+
+
 def _metric_row(metric: StockMetric) -> dict:
-    """Serialise a StockMetric to a dict for Supabase insert."""
-    return {
+    """Serialise a StockMetric to a dict for Supabase insert.
+
+    Only includes columns that exist in the DB schema to avoid
+    PGRST204 errors when migration 007 hasn't been applied yet.
+    """
+    allowed = _check_metric_columns()
+
+    row = {
         "symbol": metric.symbol,
         "metric_name": metric.metric_name,
         "metric_value": _ser(metric.metric_value),
         "period_end": _ser(metric.period_end),
         "period_start": _ser(metric.period_start),
         "fiscal_period": metric.fiscal_period,
-        "fiscal_year": metric.fiscal_year,
-        "duration_days": metric.duration_days,
-        "reporting_style": metric.reporting_style,
         "source": metric.source,
         "cik": metric.cik,
         "filing_type": metric.filing_type,
     }
+
+    # Only include new columns if they exist in the DB
+    if "fiscal_year" in allowed:
+        row["fiscal_year"] = metric.fiscal_year
+    if "duration_days" in allowed:
+        row["duration_days"] = metric.duration_days
+    if "reporting_style" in allowed:
+        row["reporting_style"] = metric.reporting_style
+
+    return row
 
 
 def _metric_fingerprint(row: dict) -> tuple:
