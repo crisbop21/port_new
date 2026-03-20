@@ -18,7 +18,10 @@ streamlit run app.py
 
 ## How to verify changes
 streamlit run app.py and manually test the affected page.
-No test runner yet — tests live in tests/ and run with pytest.
+Tests live in tests/ and run with `pytest`.
+
+## TDD Workflow (mandatory)
+Every code change MUST follow the `/tdd` skill: write failing tests first, implement to pass, then verify the full suite. Use `/tdd` to invoke the workflow.
 
 ## Constraints (non-negotiable)
 - Free tiers only — no paid APIs in Phase 1
