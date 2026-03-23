@@ -503,3 +503,31 @@ def compute_ttm_latest(
             return row["ttm_value"], row["ttm_method"]
 
     return None, None
+
+
+def compute_quarterly_latest(
+    metric_rows: list[dict],
+    value_key: str = "metric_value",
+) -> tuple[float | None, str | None, str | None]:
+    """Return the latest isolated quarterly value for a flow metric.
+
+    Derives quarterly values from the filing history — if the latest period
+    is a 10-K (FY), Q4 is computed as FY − Q3 YTD.  This ensures all
+    values are on a consistent quarterly basis, comparable to Bloomberg.
+
+    Returns (quarterly_value, quarter_label, method) or (None, None, None).
+    Method is 'annual_only' when FY data exists but quarters can't be derived;
+    in that case (None, None, None) is returned since we can't produce a
+    meaningful quarterly figure.
+    """
+    isolated = isolate_quarters(metric_rows, value_key=value_key)
+    if not isolated:
+        return None, None, None
+
+    # Return the most recent quarter that was actually isolated
+    # (skip annual_only since that's a full-year figure, not quarterly)
+    for q in reversed(isolated):
+        if q.method != "annual_only":
+            return q.isolated_value, q.quarter, q.method
+
+    return None, None, None

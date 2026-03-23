@@ -5,6 +5,7 @@ from datetime import date
 from src.splits import DetectedSplit, normalize_metrics
 from src.ttm import (
     IsolatedQuarter,
+    compute_quarterly_latest,
     compute_ttm,
     compute_ttm_latest,
     is_flow_metric,
@@ -551,3 +552,94 @@ class TestFiscalYearField:
         result = isolate_quarters(rows)
         assert result[0].fiscal_year == 2023
         assert result[1].fiscal_year == 2023
+
+
+# ── compute_quarterly_latest ───────────────────────────────────────────────
+
+
+class TestComputeQuarterlyLatest:
+    """Test deriving the latest isolated quarterly value from history."""
+
+    def test_latest_quarter_from_full_year(self):
+        """When latest filing is 10-K (FY), derive Q4 = FY - Q3 YTD."""
+        rows = [
+            _row("2023-03-31", 1.50, "Q1"),
+            _row("2023-06-30", 3.20, "Q2"),
+            _row("2023-09-30", 4.80, "Q3"),
+            _row("2023-12-31", 6.08, "FY", "10-K"),
+        ]
+        val, quarter, method = compute_quarterly_latest(rows)
+        # Q4 = FY(6.08) - Q3 YTD(4.80) = 1.28
+        assert val == 1.28
+        assert quarter == "Q4"
+        assert method == "subtracted"
+
+    def test_latest_quarter_is_q1(self):
+        """When latest filing is Q1, return Q1 directly."""
+        rows = [
+            _row("2023-03-31", 1.50, "Q1"),
+        ]
+        val, quarter, method = compute_quarterly_latest(rows)
+        assert val == 1.50
+        assert quarter == "Q1"
+        assert method == "direct"
+
+    def test_latest_quarter_across_years(self):
+        """Latest isolated quarter after year boundary."""
+        rows = [
+            _row("2022-03-31", 1.20, "Q1"),
+            _row("2022-06-30", 2.50, "Q2"),
+            _row("2022-09-30", 3.80, "Q3"),
+            _row("2022-12-31", 5.00, "FY", "10-K"),
+            _row("2023-03-31", 1.80, "Q1"),
+        ]
+        val, quarter, method = compute_quarterly_latest(rows)
+        assert val == 1.80
+        assert quarter == "Q1"
+        assert method == "direct"
+
+    def test_empty_returns_none(self):
+        val, quarter, method = compute_quarterly_latest([])
+        assert val is None
+        assert quarter is None
+        assert method is None
+
+    def test_annual_only_no_quarterly_breakdown(self):
+        """FY with no quarterly data — can't derive quarterly, return None."""
+        rows = [_row("2023-12-31", 6.08, "FY", "10-K")]
+        val, quarter, method = compute_quarterly_latest(rows)
+        # annual_only method means we couldn't isolate a real quarter
+        assert val is None
+        assert quarter is None
+        assert method is None
+
+    def test_standalone_reporter(self):
+        """Standalone quarterly reporter returns latest Q directly."""
+        rows = [
+            _row("2023-03-31", 1.50, "Q1", duration_days=90,
+                 reporting_style="standalone_quarterly"),
+            _row("2023-06-30", 1.70, "Q2", duration_days=90,
+                 reporting_style="standalone_quarterly"),
+        ]
+        val, quarter, method = compute_quarterly_latest(rows)
+        assert val == 1.70
+        assert quarter == "Q2"
+        assert method == "standalone"
+
+    def test_with_normalized_value_key(self):
+        """Works with a custom value_key for split-adjusted data."""
+        rows = [
+            {"period_end": "2022-03-31", "fiscal_period": "Q1",
+             "metric_value": 6.00, "normalized_value": 1.50},
+            {"period_end": "2022-06-30", "fiscal_period": "Q2",
+             "metric_value": 12.00, "normalized_value": 3.00},
+            {"period_end": "2022-09-30", "fiscal_period": "Q3",
+             "metric_value": 18.00, "normalized_value": 4.50},
+            {"period_end": "2022-12-31", "fiscal_period": "FY",
+             "metric_value": 24.00, "normalized_value": 6.00},
+        ]
+        val, quarter, method = compute_quarterly_latest(rows, value_key="normalized_value")
+        # Q4 = 6.00 - 4.50 = 1.50
+        assert val == 1.50
+        assert quarter == "Q4"
+        assert method == "subtracted"

@@ -26,7 +26,7 @@ from src.splits import (
     normalize_latest_value,
     normalize_metrics,
 )
-from src.ttm import compute_ttm, compute_ttm_latest, is_flow_metric
+from src.ttm import compute_quarterly_latest, compute_ttm, compute_ttm_latest, is_flow_metric
 
 st.title("Stock Metrics")
 
@@ -180,22 +180,37 @@ for sym in sorted(metrics_data.keys()):
                 try:
                     val = float(raw_val)
 
-                    # Pipeline: split-normalize first, then TTM on adjusted values
-                    if is_flow_metric(metric_key) and fp and fp != "FY":
+                    # Pipeline: split-normalize first, then quarterly/TTM on adjusted values
+                    if is_flow_metric(metric_key) and fp:
                         history = get_stock_metrics(symbol=sym, metric_name=metric_key)
                         # Split-normalize all history first
                         history = normalize_metrics(history, sym_splits, metric_key)
                         vk = "normalized_value" if sym_splits else "metric_value"
+
+                        # Compute quarterly (isolated) value — comparable to Bloomberg
+                        try:
+                            q_val, q_label, q_method = compute_quarterly_latest(history, value_key=vk)
+                        except TypeError:
+                            q_val, q_label, q_method = None, None, None
+
+                        # Compute TTM (annualized)
                         try:
                             ttm_val, ttm_method = compute_ttm_latest(history, value_key=vk)
                         except TypeError:
                             ttm_val, ttm_method = None, None
-                        if ttm_val is not None:
+
+                        # Use quarterly value as the display value for consistency
+                        if q_val is not None:
+                            val = q_val
+                            if sym not in [n.split(":")[0] for n in ttm_notes]:
+                                ttm_notes.append(f"{sym}: {q_label} quarterly from {fp} data")
+                        elif ttm_val is not None:
                             val = ttm_val
                             if sym not in [n.split(":")[0] for n in ttm_notes]:
-                                ttm_notes.append(f"{sym}: TTM computed from {fp} data")
-                            if sym_splits and sym not in [n.split(":")[0] for n in split_notes]:
-                                split_notes.append(f"{sym}: {len(sym_splits)} split(s) detected — per-share metrics adjusted")
+                                ttm_notes.append(f"{sym}: TTM (annual) from {fp} data")
+
+                        if sym_splits and sym not in [n.split(":")[0] for n in split_notes]:
+                            split_notes.append(f"{sym}: {len(sym_splits)} split(s) detected — per-share metrics adjusted")
                     elif sym_splits and metric_key in (SPLIT_AFFECTED_PER_SHARE | SPLIT_AFFECTED_SHARE_COUNT):
                         # Non-flow metric (shares_outstanding) — just split-adjust
                         val, was_adjusted = normalize_latest_value(
@@ -276,20 +291,33 @@ if detail_symbol:
                     val = float(raw)
                     suffixes = []
 
-                    # Pipeline: split-normalize first, then TTM on adjusted values
-                    if is_flow_metric(key) and fp and fp != "FY":
+                    # Pipeline: split-normalize first, then quarterly/TTM on adjusted values
+                    if is_flow_metric(key) and fp:
                         history = get_stock_metrics(symbol=detail_symbol, metric_name=key)
                         history = normalize_metrics(history, detected_splits, key)
                         vk = "normalized_value" if detected_splits else "metric_value"
+
+                        # Compute quarterly (isolated) value
+                        try:
+                            q_val, q_label, q_method = compute_quarterly_latest(history, value_key=vk)
+                        except TypeError:
+                            q_val, q_label, q_method = None, None, None
+
+                        # Compute TTM (annualized)
                         try:
                             ttm_val, ttm_method = compute_ttm_latest(history, value_key=vk)
                         except TypeError:
                             ttm_val, ttm_method = None, None
-                        if ttm_val is not None:
+
+                        if q_val is not None:
+                            val = q_val
+                            suffixes.append(f"{q_label}")
+                        elif ttm_val is not None:
                             val = ttm_val
                             suffixes.append("TTM")
-                            if detected_splits:
-                                suffixes.append("adj")
+
+                        if detected_splits:
+                            suffixes.append("adj")
                     elif detected_splits and key in (SPLIT_AFFECTED_PER_SHARE | SPLIT_AFFECTED_SHARE_COUNT):
                         val, was_adj = normalize_latest_value(key, val, str(period), detected_splits)
                         if was_adj:
