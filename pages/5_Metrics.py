@@ -368,6 +368,9 @@ if detail_symbol:
             if hist_metric:
                 history = get_stock_metrics(symbol=detail_symbol, metric_name=hist_metric)
                 if history:
+                    # Sort chronologically (DB returns DESC, but TTM returns ASC)
+                    history.sort(key=lambda r: str(r.get("period_end", "")))
+
                     # Split normalization
                     history = normalize_metrics(history, detected_splits, hist_metric)
 
@@ -383,8 +386,14 @@ if detail_symbol:
                                 "This may indicate a version mismatch — try restarting the app."
                             )
                             ttm_history = []
-                        # Merge TTM columns back into history
-                        for orig, ttm_row in zip(history, ttm_history):
+                        # Merge TTM columns back into history by period_end
+                        # (both lists are now sorted ASC by period_end)
+                        ttm_by_pe = {
+                            str(r.get("period_end", "")): r for r in ttm_history
+                        }
+                        for orig in history:
+                            pe = str(orig.get("period_end", ""))
+                            ttm_row = ttm_by_pe.get(pe, {})
                             orig["quarterly_value"] = ttm_row.get("quarterly_value")
                             orig["ttm_value"] = ttm_row.get("ttm_value")
                             orig["ttm_method"] = ttm_row.get("ttm_method")
