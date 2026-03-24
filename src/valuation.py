@@ -217,131 +217,106 @@ def compute_historical_ratios(
     metric_history: dict[str, list[dict]],
     price_history: list[dict],
 ) -> list[dict]:
-    """Build a time series of valuation ratios from historical metrics + prices.
+    """Build a *daily* time series of valuation ratios from metrics + prices.
+
+    For each trading day, pairs the day's price with the most recent
+    fundamental data (TTM for flow metrics, point-in-time for balance sheet).
+    This produces one observation per trading day, not just per filing date.
 
     Args:
         metric_history: {metric_name: [rows sorted by period_end asc]}
         price_history: daily_prices rows sorted by price_date asc
 
-    Returns list of dicts with period_end, ratio values for each period
-    where we have both metrics and a price.
+    Returns list of dicts with period_end (= price_date), price, and ratio
+    values for each day where we have both fundamentals and a price.
     """
     if not price_history or not metric_history:
         return []
 
-    # Build price lookup: find closest price on or before a given date
-    price_by_date: dict[str, float] = {}
+    # Build sorted daily price list: [(date_str, price), ...]
+    daily_prices: list[tuple[str, float]] = []
     for row in price_history:
         try:
-            price_by_date[str(row["price_date"])] = float(row["adj_close"])
+            daily_prices.append((str(row["price_date"]), float(row["adj_close"])))
         except (KeyError, TypeError, ValueError):
             continue
-
-    sorted_dates = sorted(price_by_date.keys())
-    if not sorted_dates:
+    daily_prices.sort(key=lambda x: x[0])
+    if not daily_prices:
         return []
-
-    def _closest_price(target_date: str) -> float | None:
-        """Find closest price on or before target_date."""
-        # Binary search for efficiency
-        idx = _bisect_right(sorted_dates, target_date) - 1
-        if idx < 0:
-            return None
-        # Accept if within 10 days
-        found = sorted_dates[idx]
-        try:
-            diff = abs((date.fromisoformat(target_date) - date.fromisoformat(found)).days)
-        except ValueError:
-            return None
-        if diff > 10:
-            return None
-        return price_by_date[found]
 
     # Pre-compute TTM time series for flow metrics so historical ratios
     # use annualized values (not raw quarterly figures).
     _FLOW_RATIO_METRICS = ("eps_diluted", "eps_basic", "revenue",
                            "net_income", "operating_income")
-    ttm_by_metric: dict[str, dict[str, float]] = {}
+    ttm_by_metric: dict[str, list[tuple[str, float]]] = {}
     for name in _FLOW_RATIO_METRICS:
         rows = metric_history.get(name, [])
         if not rows:
             continue
         ttm_rows = compute_ttm(rows)
-        lookup: dict[str, float] = {}
+        entries: list[tuple[str, float]] = []
         for r in ttm_rows:
             pe = str(r.get("period_end", ""))
             ttm_val = r.get("ttm_value")
             if pe and ttm_val is not None:
-                lookup[pe] = ttm_val
-        if lookup:
-            ttm_by_metric[name] = lookup
+                entries.append((pe, ttm_val))
+        if entries:
+            entries.sort(key=lambda x: x[0])
+            ttm_by_metric[name] = entries
 
-    # Collect all unique period_end dates from point-in-time metrics
-    period_dates: set[str] = set()
-    for name in ("shares_outstanding", "stockholders_equity", "total_assets",
-                  "total_liabilities", "cash_and_equivalents"):
-        for row in metric_history.get(name, []):
+    # Build sorted time series for point-in-time metrics: [(date, value), ...]
+    _POINT_METRICS = ("shares_outstanding", "stockholders_equity", "total_assets",
+                      "total_liabilities", "cash_and_equivalents")
+    point_by_metric: dict[str, list[tuple[str, float]]] = {}
+    for name in _POINT_METRICS:
+        rows = metric_history.get(name, [])
+        entries = []
+        for row in rows:
             pe = str(row.get("period_end", ""))
+            try:
+                val = float(row["metric_value"])
+            except (KeyError, TypeError, ValueError):
+                continue
             if pe:
-                period_dates.add(pe)
+                entries.append((pe, val))
+        if entries:
+            entries.sort(key=lambda x: x[0])
+            point_by_metric[name] = entries
 
-    def _ttm_at(metric_name: str, pe_date: str) -> float | None:
-        """Get the TTM value for a flow metric at or before pe_date."""
-        lookup = ttm_by_metric.get(metric_name)
-        if not lookup:
+    def _latest_on_or_before(
+        series: list[tuple[str, float]], target: str,
+    ) -> float | None:
+        """Binary search for the most recent value on or before target date."""
+        if not series:
             return None
-        # Find most recent TTM value on or before pe_date
-        best_date = None
-        for d in lookup:
-            if d <= pe_date:
-                if best_date is None or d > best_date:
-                    best_date = d
-        return lookup[best_date] if best_date else None
+        idx = _bisect_right_tuples(series, target) - 1
+        if idx < 0:
+            return None
+        return series[idx][1]
 
-    # For each period, build a snapshot of metrics and compute ratios
+    # Iterate over every trading day
     results = []
-    for pe_date in sorted(period_dates):
-        price = _closest_price(pe_date)
-        if price is None:
-            continue
-
-        # Build metrics snapshot at this period (point-in-time metrics only)
-        snapshot: dict[str, float | None] = {}
-        for name, rows in metric_history.items():
-            if name in _FLOW_RATIO_METRICS:
-                continue  # handled via TTM lookup
-            # Find the most recent value on or before pe_date
-            best = None
-            for row in rows:
-                row_pe = str(row.get("period_end", ""))
-                if row_pe <= pe_date:
-                    best = row
-            if best is not None:
-                try:
-                    snapshot[name] = float(best["metric_value"])
-                except (TypeError, ValueError):
-                    pass
-
-        shares = snapshot.get("shares_outstanding")
+    for price_date, price in daily_prices:
+        shares = _latest_on_or_before(point_by_metric.get("shares_outstanding", []), price_date)
         if shares is None or shares <= 0:
             continue
 
         market_cap = price * shares
-        equity = snapshot.get("stockholders_equity")
-        total_liabilities = snapshot.get("total_liabilities")
-        cash = snapshot.get("cash_and_equivalents")
+        equity = _latest_on_or_before(point_by_metric.get("stockholders_equity", []), price_date)
+        total_liabilities = _latest_on_or_before(point_by_metric.get("total_liabilities", []), price_date)
+        cash = _latest_on_or_before(point_by_metric.get("cash_and_equivalents", []), price_date)
 
-        # Use TTM values for flow metrics
-        revenue = _ttm_at("revenue", pe_date)
-        net_income = _ttm_at("net_income", pe_date)
-        operating_income = _ttm_at("operating_income", pe_date)
-        eps = _ttm_at("eps_diluted", pe_date) or _ttm_at("eps_basic", pe_date)
+        # TTM flow metrics
+        eps = (_latest_on_or_before(ttm_by_metric.get("eps_diluted", []), price_date)
+               or _latest_on_or_before(ttm_by_metric.get("eps_basic", []), price_date))
+        revenue = _latest_on_or_before(ttm_by_metric.get("revenue", []), price_date)
+        operating_income = _latest_on_or_before(ttm_by_metric.get("operating_income", []), price_date)
 
         ev = None
         if total_liabilities is not None and cash is not None:
             ev = market_cap + total_liabilities - cash
 
-        result_row: dict[str, Any] = {"period_end": pe_date, "price": price}
+        result_row: dict[str, Any] = {"period_end": price_date, "price": price}
         result_row["pe_ttm"] = price / eps if eps and eps > 0 else None
         result_row["pb"] = market_cap / equity if equity and equity > 0 else None
         result_row["ps"] = market_cap / revenue if revenue and revenue > 0 else None
@@ -357,6 +332,18 @@ def _bisect_right(sorted_list: list[str], target: str) -> int:
     while lo < hi:
         mid = (lo + hi) // 2
         if sorted_list[mid] <= target:
+            lo = mid + 1
+        else:
+            hi = mid
+    return lo
+
+
+def _bisect_right_tuples(sorted_tuples: list[tuple[str, float]], target: str) -> int:
+    """Binary search for insertion point (right) on a list of (date, value) tuples."""
+    lo, hi = 0, len(sorted_tuples)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if sorted_tuples[mid][0] <= target:
             lo = mid + 1
         else:
             hi = mid
