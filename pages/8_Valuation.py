@@ -641,6 +641,20 @@ if detail_symbol and detail_symbol in all_ratios:
                     range_cols[1].metric("Avg", f"{avg:.2f}")
                     range_cols[2].metric("Range", f"{mn:.1f} — {mx:.1f}")
                     range_cols[3].metric("Percentile", f"{pct:.0f}%" if pct is not None else "—")
+
+                # Diagnostic details
+                with st.expander("Percentile diagnostics"):
+                    st.markdown(f"**{hist_ratio_choice}** — {len(values)} historical data points")
+                    diag_df = chart_df[["period_end", "price", hist_ratio_choice]].copy()
+                    diag_df = diag_df.rename(columns={hist_ratio_choice: "ratio_value"})
+                    st.dataframe(diag_df, use_container_width=True, hide_index=True)
+                    if current is not None:
+                        count_below = sum(1 for v in values if v < current)
+                        st.markdown(
+                            f"Current value: **{current:.2f}** · "
+                            f"Values below current: **{count_below}/{len(values)}** · "
+                            f"Percentile: **{(count_below / len(values)) * 100:.1f}%**"
+                        )
             else:
                 st.info("Not enough historical data points to chart this ratio.")
         else:
