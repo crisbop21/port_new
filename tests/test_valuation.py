@@ -52,17 +52,18 @@ class TestComputeHistoricalRatiosTTM:
             _make_metric_row("2024-12-31", 1_000_000, "FY", 2024),
         ]
 
+        # Daily prices: one per month, $140 in 2023, $160 in 2024
         prices = [
-            _make_price_row(f"2023-0{m}-{28 if m == 2 else 30}", 140.0)
+            _make_price_row(f"2023-0{m}-{28 if m == 2 else 15}", 140.0)
             for m in range(1, 10)
         ] + [
-            _make_price_row(f"2023-{m}-30", 140.0)
+            _make_price_row(f"2023-{m}-15", 140.0)
             for m in range(10, 13)
         ] + [
-            _make_price_row(f"2024-0{m}-{28 if m == 2 else 30}", 160.0)
+            _make_price_row(f"2024-0{m}-{28 if m == 2 else 15}", 160.0)
             for m in range(1, 10)
         ] + [
-            _make_price_row(f"2024-{m}-30", 160.0)
+            _make_price_row(f"2024-{m}-15", 160.0)
             for m in range(10, 13)
         ]
 
@@ -73,35 +74,50 @@ class TestComputeHistoricalRatiosTTM:
 
         results = compute_historical_ratios(metric_hist, prices)
 
-        # Find results that have a pe_ttm
+        # Should produce daily observations (one per price row that has fundamentals)
         pe_results = [r for r in results if r.get("pe_ttm") is not None]
         assert len(pe_results) > 0, "Should have at least one P/E ratio computed"
 
-        # The FY 2023 row (price=140, FY EPS=14.00) should give P/E = 10.0
-        fy_2023 = [r for r in pe_results if r["period_end"] == "2023-12-31"]
-        if fy_2023:
-            assert abs(fy_2023[0]["pe_ttm"] - 10.0) < 0.5, \
-                f"FY2023 P/E should be ~10.0 (140/14), got {fy_2023[0]['pe_ttm']}"
-
-        # The FY 2024 row (price=160, FY EPS=16.00) should give P/E = 10.0
-        fy_2024 = [r for r in pe_results if r["period_end"] == "2024-12-31"]
-        if fy_2024:
-            assert abs(fy_2024[0]["pe_ttm"] - 10.0) < 0.5, \
-                f"FY2024 P/E should be ~10.0 (160/16), got {fy_2024[0]['pe_ttm']}"
-
-        # At quarterly periods, P/E must also use TTM EPS, not raw quarterly.
-        # Q1 2024: price=160, raw quarterly EPS=3.80 → raw P/E=42 (WRONG)
-        # Q1 2024: TTM EPS = Q2'23(3.20)+Q3'23(3.40)+Q4'23(4.40)+Q1'24(3.80) = 14.80
-        #          → TTM P/E = 160/14.80 ≈ 10.8 (CORRECT)
-        q1_2024 = [r for r in pe_results if r["period_end"] == "2024-03-31"]
-        if q1_2024:
-            assert q1_2024[0]["pe_ttm"] < 15, \
-                f"Q1 2024 P/E should be ~10.8 (TTM), got {q1_2024[0]['pe_ttm']} (using raw quarterly EPS?)"
+        # Should have MORE than just quarterly observations (daily resolution)
+        assert len(pe_results) > 8, \
+            f"Expected daily observations, got only {len(pe_results)} (still quarterly?)"
 
         # No P/E should be wildly inflated (>20 with these prices/EPS)
         for r in pe_results:
             assert r["pe_ttm"] < 20, \
                 f"P/E at {r['period_end']} = {r['pe_ttm']} is suspiciously high (quarterly EPS bug?)"
+
+    def test_daily_pe_reflects_price_changes(self):
+        """P/E should change when price changes, even with same EPS."""
+        eps_rows = [
+            _make_metric_row("2023-03-31", 3.00, "Q1", 2023, duration_days=90),
+            _make_metric_row("2023-06-30", 3.00, "Q2", 2023, duration_days=90),
+            _make_metric_row("2023-09-30", 3.00, "Q3", 2023, duration_days=90),
+            _make_metric_row("2023-12-31", 12.00, "FY", 2023),
+        ]
+
+        shares_rows = [
+            _make_metric_row("2023-03-31", 1_000, "Q1", 2023),
+            _make_metric_row("2023-12-31", 1_000, "FY", 2023),
+        ]
+
+        # Two different prices on consecutive days after FY filing
+        prices = [
+            _make_price_row("2024-01-02", 120.0),  # P/E = 120/12 = 10
+            _make_price_row("2024-01-03", 180.0),  # P/E = 180/12 = 15
+        ]
+
+        metric_hist = {
+            "shares_outstanding": sorted(shares_rows, key=lambda r: r["period_end"]),
+            "eps_diluted": sorted(eps_rows, key=lambda r: r["period_end"]),
+        }
+
+        results = compute_historical_ratios(metric_hist, prices)
+        pe_results = [r for r in results if r.get("pe_ttm") is not None]
+
+        assert len(pe_results) == 2, f"Expected 2 daily P/E observations, got {len(pe_results)}"
+        assert abs(pe_results[0]["pe_ttm"] - 10.0) < 0.01
+        assert abs(pe_results[1]["pe_ttm"] - 15.0) < 0.01
 
     def test_ps_uses_ttm_revenue(self):
         """Historical P/S should use TTM revenue, not quarterly."""
@@ -136,10 +152,10 @@ class TestComputeHistoricalRatiosTTM:
 
         # At FY 2023: market_cap = 100*1000 = 100_000, TTM revenue = 22_000
         # P/S should be ~4.5, NOT ~20 (100_000/5_000 from quarterly)
-        for r in ps_results:
-            if r["period_end"] == "2023-12-31":
-                assert r["ps"] < 10, \
-                    f"P/S at FY2023 = {r['ps']} is too high (quarterly revenue bug?)"
+        fy_result = [r for r in ps_results if r["period_end"] == "2023-12-29"]
+        if fy_result:
+            assert fy_result[0]["ps"] < 10, \
+                f"P/S near FY2023 = {fy_result[0]['ps']} is too high (quarterly revenue bug?)"
 
 
 class TestComputePercentile:
