@@ -626,6 +626,47 @@ class TestComputeQuarterlyLatest:
         assert quarter == "Q2"
         assert method == "standalone"
 
+    def test_quarterly_isolation_order_independent(self):
+        """Quarter isolation must work regardless of input row order (DESC vs ASC).
+
+        Regression: get_stock_metrics returns rows period_end DESC, but
+        compute_ttm sorts ASC internally. If the caller zips them directly,
+        the quarterly values get mapped to the wrong rows.
+        """
+        rows_asc = [
+            _row("2024-03-31", 3.23, "Q1"),
+            _row("2024-06-30", 6.74, "Q2"),
+            _row("2024-09-30", 10.27, "Q3"),
+            _row("2024-12-31", 13.91, "FY", "10-K"),
+        ]
+        rows_desc = list(reversed(rows_asc))
+
+        result_asc = compute_ttm(rows_asc)
+        result_desc = compute_ttm(rows_desc)
+
+        # Both should produce the same quarterly values in the same chronological order
+        assert len(result_asc) == len(result_desc)
+        for a, d in zip(result_asc, result_desc):
+            assert a["quarterly_value"] == d["quarterly_value"], (
+                f"Mismatch at {a.get('period_end')}: {a['quarterly_value']} vs {d['quarterly_value']}"
+            )
+            assert a["period_end"] == d["period_end"]
+
+        # Verify Q1 is direct (must equal metric_value)
+        q1 = [r for r in result_asc if r["fiscal_period"] == "Q1"][0]
+        assert q1["quarterly_value"] == 3.23, (
+            f"Q1 quarterly should be 3.23 (direct), got {q1['quarterly_value']}"
+        )
+        # Q2 isolated = 6.74 - 3.23 = 3.51
+        q2 = [r for r in result_asc if r["fiscal_period"] == "Q2"][0]
+        assert q2["quarterly_value"] == 3.51
+        # Q3 isolated = 10.27 - 6.74 = 3.53
+        q3 = [r for r in result_asc if r["fiscal_period"] == "Q3"][0]
+        assert q3["quarterly_value"] == 3.53
+        # Q4 = FY - Q3 = 13.91 - 10.27 = 3.64
+        fy = [r for r in result_asc if r["fiscal_period"] == "FY"][0]
+        assert fy["quarterly_value"] == 3.64
+
     def test_with_normalized_value_key(self):
         """Works with a custom value_key for split-adjusted data."""
         rows = [
