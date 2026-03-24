@@ -229,9 +229,16 @@ for sym in symbols_with_data:
 
         for ratio_key in ("pe_ttm", "pb", "ps", "ev_ebitda"):
             hist_values = [r[ratio_key] for r in hist_ratios if r.get(ratio_key) is not None]
+            # Use the last historical observation as the canonical "current"
+            # value so that ratios, percentiles, scores, and chart all agree.
+            if hist_values:
+                ratios[ratio_key] = hist_values[-1]
             percentiles[ratio_key] = compute_percentile(ratios.get(ratio_key), hist_values)
 
     all_percentiles[sym] = percentiles
+
+    # Recompute PEG with the (possibly overridden) pe_ttm
+    ratios["peg"] = compute_peg(ratios.get("pe_ttm"), growth.get("eps_growth"))
 
     # Fundamental score
     score, cat_scores = compute_fundamental_score(ratios, percentiles, growth, preset=preset)
@@ -538,14 +545,6 @@ if detail_symbol and detail_symbol in all_ratios:
                 _dd_metric_hist[_m_name] = sorted(_m_rows, key=lambda r: str(r.get("period_end", "")))
 
     _dd_hist_data = compute_historical_ratios(_dd_metric_hist, _dd_prices) if _dd_prices else []
-
-    # Override valuation-card ratios with the last historical observation
-    # so the cards match the chart endpoint.
-    if _dd_hist_data:
-        _last_obs = _dd_hist_data[-1]
-        for _rk in ("pe_ttm", "pb", "ps", "ev_ebitda"):
-            if _last_obs.get(_rk) is not None:
-                ratios[_rk] = _last_obs[_rk]
 
     # Score overview
     cols = st.columns(5)
