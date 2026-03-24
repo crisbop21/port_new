@@ -518,6 +518,35 @@ if detail_symbol and detail_symbol in all_ratios:
     percentiles = all_percentiles.get(detail_symbol, {})
     score, cat_scores = all_scores.get(detail_symbol, (None, {}))
 
+    # Pre-compute historical ratios so the valuation cards and chart
+    # use the same last-observation values (avoids price-source mismatch).
+    if pct_lookback == "3 Years":
+        _dd_hist_start = date.today() - timedelta(days=3 * 365)
+    elif pct_lookback == "5 Years":
+        _dd_hist_start = date.today() - timedelta(days=5 * 365)
+    else:
+        _dd_hist_start = None
+
+    _dd_prices = get_daily_prices(detail_symbol, date_from=_dd_hist_start)
+    _dd_metric_hist: dict[str, list[dict]] = {}
+    if _dd_prices:
+        for _m_name in ("shares_outstanding", "stockholders_equity", "total_assets",
+                        "total_liabilities", "cash_and_equivalents", "revenue",
+                        "net_income", "operating_income", "eps_diluted", "eps_basic"):
+            _m_rows = get_stock_metrics(symbol=detail_symbol, metric_name=_m_name)
+            if _m_rows:
+                _dd_metric_hist[_m_name] = sorted(_m_rows, key=lambda r: str(r.get("period_end", "")))
+
+    _dd_hist_data = compute_historical_ratios(_dd_metric_hist, _dd_prices) if _dd_prices else []
+
+    # Override valuation-card ratios with the last historical observation
+    # so the cards match the chart endpoint.
+    if _dd_hist_data:
+        _last_obs = _dd_hist_data[-1]
+        for _rk in ("pe_ttm", "pb", "ps", "ev_ebitda"):
+            if _last_obs.get(_rk) is not None:
+                ratios[_rk] = _last_obs[_rk]
+
     # Score overview
     cols = st.columns(5)
     score_items = [
@@ -603,68 +632,49 @@ if detail_symbol and detail_symbol in all_ratios:
         key="hist_ratio",
     )
 
-    if pct_lookback == "3 Years":
-        hist_start = date.today() - timedelta(days=3 * 365)
-    elif pct_lookback == "5 Years":
-        hist_start = date.today() - timedelta(days=5 * 365)
-    else:
-        hist_start = None
+    # Reuse the pre-computed historical data (avoids duplicate DB queries).
+    if _dd_hist_data:
+        chart_df = pd.DataFrame(_dd_hist_data)
+        chart_df["period_end"] = pd.to_datetime(chart_df["period_end"])
+        chart_df = chart_df.dropna(subset=[hist_ratio_choice])
+        chart_df = chart_df.sort_values("period_end")
 
-    prices = get_daily_prices(detail_symbol, date_from=hist_start)
-    if prices:
-        metric_hist: dict[str, list[dict]] = {}
-        for m_name in ("shares_outstanding", "stockholders_equity", "total_assets",
-                        "total_liabilities", "cash_and_equivalents", "revenue",
-                        "net_income", "operating_income", "eps_diluted", "eps_basic"):
-            rows = get_stock_metrics(symbol=detail_symbol, metric_name=m_name)
-            if rows:
-                metric_hist[m_name] = sorted(rows, key=lambda r: str(r.get("period_end", "")))
+        if not chart_df.empty:
+            st.line_chart(chart_df, x="period_end", y=hist_ratio_choice)
 
-        hist_data = compute_historical_ratios(metric_hist, prices)
-        if hist_data:
-            chart_df = pd.DataFrame(hist_data)
-            chart_df["period_end"] = pd.to_datetime(chart_df["period_end"])
-            chart_df = chart_df.dropna(subset=[hist_ratio_choice])
-            chart_df = chart_df.sort_values("period_end")
+            # Show percentile context
+            # Use the last observation from the chart so metrics match
+            # the visible chart endpoint (not compute_ratios which may
+            # use a different latest price).
+            values = chart_df[hist_ratio_choice].tolist()
+            current = values[-1] if values else None
+            if current is not None and len(values) >= 4:
+                mn, mx, avg = min(values), max(values), sum(values) / len(values)
+                pct = compute_percentile(current, values)
+                range_cols = st.columns(4)
+                range_cols[0].metric("Current", f"{current:.2f}")
+                range_cols[1].metric("Avg", f"{avg:.2f}")
+                range_cols[2].metric("Range", f"{mn:.1f} — {mx:.1f}")
+                range_cols[3].metric("Percentile", f"{pct:.0f}%" if pct is not None else "—")
 
-            if not chart_df.empty:
-                st.line_chart(chart_df, x="period_end", y=hist_ratio_choice)
-
-                # Show percentile context
-                # Use the last observation from the chart so metrics match
-                # the visible chart endpoint (not compute_ratios which may
-                # use a different latest price).
-                values = chart_df[hist_ratio_choice].tolist()
-                current = values[-1] if values else None
-                if current is not None and len(values) >= 4:
-                    mn, mx, avg = min(values), max(values), sum(values) / len(values)
-                    pct = compute_percentile(current, values)
-                    range_cols = st.columns(4)
-                    range_cols[0].metric("Current", f"{current:.2f}")
-                    range_cols[1].metric("Avg", f"{avg:.2f}")
-                    range_cols[2].metric("Range", f"{mn:.1f} — {mx:.1f}")
-                    range_cols[3].metric("Percentile", f"{pct:.0f}%" if pct is not None else "—")
-
-                # Diagnostic details
-                with st.expander("Percentile diagnostics"):
+            # Diagnostic details
+            with st.expander("Percentile diagnostics"):
+                st.markdown(
+                    f"**{hist_ratio_choice}** — {len(values)} ratio data points "
+                    f"from {len(_dd_prices)} daily prices"
+                )
+                diag_df = chart_df[["period_end", "price", hist_ratio_choice]].copy()
+                diag_df = diag_df.rename(columns={hist_ratio_choice: "ratio_value"})
+                st.dataframe(diag_df, use_container_width=True, hide_index=True)
+                if current is not None:
+                    count_below = sum(1 for v in values if v < current)
                     st.markdown(
-                        f"**{hist_ratio_choice}** — {len(values)} ratio data points "
-                        f"from {len(prices)} daily prices"
+                        f"Current value: **{current:.2f}** · "
+                        f"Values below current: **{count_below}/{len(values)}** · "
+                        f"Percentile: **{(count_below / len(values)) * 100:.1f}%**"
                     )
-                    diag_df = chart_df[["period_end", "price", hist_ratio_choice]].copy()
-                    diag_df = diag_df.rename(columns={hist_ratio_choice: "ratio_value"})
-                    st.dataframe(diag_df, use_container_width=True, hide_index=True)
-                    if current is not None:
-                        count_below = sum(1 for v in values if v < current)
-                        st.markdown(
-                            f"Current value: **{current:.2f}** · "
-                            f"Values below current: **{count_below}/{len(values)}** · "
-                            f"Percentile: **{(count_below / len(values)) * 100:.1f}%**"
-                        )
-            else:
-                st.info("Not enough historical data points to chart this ratio.")
         else:
-            st.info("Could not compute historical ratios — check metrics and price data.")
+            st.info("Not enough historical data points to chart this ratio.")
     else:
         st.info("No price history available. Fetch prices first.")
 
