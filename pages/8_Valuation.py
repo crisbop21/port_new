@@ -631,11 +631,14 @@ if detail_symbol and detail_symbol in all_ratios:
                 st.line_chart(chart_df, x="period_end", y=hist_ratio_choice)
 
                 # Show percentile context
+                # Use the last observation from the chart so metrics match
+                # the visible chart endpoint (not compute_ratios which may
+                # use a different latest price).
                 values = chart_df[hist_ratio_choice].tolist()
-                current = ratios.get(hist_ratio_choice)
+                current = values[-1] if values else None
                 if current is not None and len(values) >= 4:
                     mn, mx, avg = min(values), max(values), sum(values) / len(values)
-                    pct = percentiles.get(hist_ratio_choice)
+                    pct = compute_percentile(current, values)
                     range_cols = st.columns(4)
                     range_cols[0].metric("Current", f"{current:.2f}")
                     range_cols[1].metric("Avg", f"{avg:.2f}")
