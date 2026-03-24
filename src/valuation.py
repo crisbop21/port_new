@@ -11,6 +11,8 @@ from typing import Any
 
 import numpy as np
 
+from src.ttm import compute_ttm, is_flow_metric
+
 logger = logging.getLogger(__name__)
 
 
@@ -255,6 +257,25 @@ def compute_historical_ratios(
             return None
         return price_by_date[found]
 
+    # Pre-compute TTM time series for flow metrics so historical ratios
+    # use annualized values (not raw quarterly figures).
+    _FLOW_RATIO_METRICS = ("eps_diluted", "eps_basic", "revenue",
+                           "net_income", "operating_income")
+    ttm_by_metric: dict[str, dict[str, float]] = {}
+    for name in _FLOW_RATIO_METRICS:
+        rows = metric_history.get(name, [])
+        if not rows:
+            continue
+        ttm_rows = compute_ttm(rows)
+        lookup: dict[str, float] = {}
+        for r in ttm_rows:
+            pe = str(r.get("period_end", ""))
+            ttm_val = r.get("ttm_value")
+            if pe and ttm_val is not None:
+                lookup[pe] = ttm_val
+        if lookup:
+            ttm_by_metric[name] = lookup
+
     # Collect all unique period_end dates from point-in-time metrics
     period_dates: set[str] = set()
     for name in ("shares_outstanding", "stockholders_equity", "total_assets",
@@ -264,6 +285,19 @@ def compute_historical_ratios(
             if pe:
                 period_dates.add(pe)
 
+    def _ttm_at(metric_name: str, pe_date: str) -> float | None:
+        """Get the TTM value for a flow metric at or before pe_date."""
+        lookup = ttm_by_metric.get(metric_name)
+        if not lookup:
+            return None
+        # Find most recent TTM value on or before pe_date
+        best_date = None
+        for d in lookup:
+            if d <= pe_date:
+                if best_date is None or d > best_date:
+                    best_date = d
+        return lookup[best_date] if best_date else None
+
     # For each period, build a snapshot of metrics and compute ratios
     results = []
     for pe_date in sorted(period_dates):
@@ -271,9 +305,11 @@ def compute_historical_ratios(
         if price is None:
             continue
 
-        # Build metrics snapshot at this period
+        # Build metrics snapshot at this period (point-in-time metrics only)
         snapshot: dict[str, float | None] = {}
         for name, rows in metric_history.items():
+            if name in _FLOW_RATIO_METRICS:
+                continue  # handled via TTM lookup
             # Find the most recent value on or before pe_date
             best = None
             for row in rows:
@@ -292,12 +328,14 @@ def compute_historical_ratios(
 
         market_cap = price * shares
         equity = snapshot.get("stockholders_equity")
-        revenue = snapshot.get("revenue")
-        net_income = snapshot.get("net_income")
-        operating_income = snapshot.get("operating_income")
         total_liabilities = snapshot.get("total_liabilities")
         cash = snapshot.get("cash_and_equivalents")
-        eps = snapshot.get("eps_diluted") or snapshot.get("eps_basic")
+
+        # Use TTM values for flow metrics
+        revenue = _ttm_at("revenue", pe_date)
+        net_income = _ttm_at("net_income", pe_date)
+        operating_income = _ttm_at("operating_income", pe_date)
+        eps = _ttm_at("eps_diluted", pe_date) or _ttm_at("eps_basic", pe_date)
 
         ev = None
         if total_liabilities is not None and cash is not None:
