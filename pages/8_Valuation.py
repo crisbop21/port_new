@@ -644,7 +644,10 @@ if detail_symbol and detail_symbol in all_ratios:
 
                 # Diagnostic details
                 with st.expander("Percentile diagnostics"):
-                    st.markdown(f"**{hist_ratio_choice}** — {len(values)} historical data points")
+                    st.markdown(
+                        f"**{hist_ratio_choice}** — {len(values)} ratio data points "
+                        f"from {len(prices)} daily prices"
+                    )
                     diag_df = chart_df[["period_end", "price", hist_ratio_choice]].copy()
                     diag_df = diag_df.rename(columns={hist_ratio_choice: "ratio_value"})
                     st.dataframe(diag_df, use_container_width=True, hide_index=True)
