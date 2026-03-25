@@ -19,6 +19,11 @@ class TestSystemPrompt:
     def test_warns_not_financial_advice(self):
         assert "not financial advice" in SYSTEM_PROMPT.lower() or "educational" in SYSTEM_PROMPT.lower()
 
+    def test_requires_profit_target_and_stop_loss(self):
+        prompt_lower = SYSTEM_PROMPT.lower()
+        assert "profit target" in prompt_lower
+        assert "stop-loss" in prompt_lower
+
 
 class TestBuildMessages:
     def test_first_message(self):

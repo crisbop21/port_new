@@ -16,12 +16,13 @@ from src.db import (
     get_daily_prices,
     get_latest_price,
     get_latest_stock_metrics,
+    get_latest_valuation_snapshots,
     get_positions_as_of,
     get_snapshot_dates,
     get_trades,
     get_account_ids,
 )
-from src.technical import compute_signals, score_signals
+from src.technical import SIGNAL_LABELS, compute_signals, compute_ma_flags, score_signals
 
 logger = logging.getLogger(__name__)
 
@@ -219,22 +220,28 @@ def build_position_context(
 
         # Technical signals
         tech_signals = {}
+        ma_flags = {}
         if daily_rows and len(daily_rows) >= 15:
             df = pd.DataFrame(daily_rows)
             raw_signals = compute_signals(df)
             scored = score_signals(raw_signals)
+            ma_flags = compute_ma_flags(df)
             tech_signals = {
                 "raw": {k: v for k, v in raw_signals.items() if v is not None},
                 "scores": {k: v for k, v in scored.items() if v is not None},
             }
 
-        # Fundamentals
+        # Fundamentals (raw metrics)
         metrics = get_latest_stock_metrics(underlying)
         fundamentals = {}
         for name, row in metrics.items():
             val = row.get("metric_value")
             if val is not None:
                 fundamentals[name] = _format_number(val)
+
+        # Valuation snapshot (precomputed ratios & scores)
+        valuation_snaps = get_latest_valuation_snapshots([underlying])
+        valuation = valuation_snaps.get(underlying, {})
 
         # Recent trades for this underlying
         recent_trades = get_trades(account_id=account_id)
@@ -261,7 +268,9 @@ def build_position_context(
             "realized_vol_20d": realized_vol,
             "volatility_override": vol_override,
             "fundamentals": fundamentals,
+            "valuation": valuation,
             "technical_signals": tech_signals,
+            "ma_flags": ma_flags,
             "recent_trades": trade_summary,
         }
 
@@ -276,15 +285,46 @@ def build_position_context(
 # ── Serialization ───────────────────────────────────────────────────────────
 
 
+def _moneyness_str(moneyness: float | None) -> str:
+    """Format moneyness as a readable string."""
+    if moneyness is None:
+        return "N/A"
+    if moneyness > 0.01:
+        return f"ITM ({moneyness:+.1%})"
+    elif moneyness < -0.01:
+        return f"OTM ({moneyness:+.1%})"
+    return "ATM"
+
+
+def _fmt_pct(val, mult: float = 1.0) -> str:
+    """Format a value as percentage, or N/A."""
+    if val is None:
+        return "N/A"
+    try:
+        return f"{float(val) * mult:.1%}"
+    except (TypeError, ValueError):
+        return str(val)
+
+
+def _fmt_ratio(val) -> str:
+    """Format a ratio value, or N/A."""
+    if val is None:
+        return "N/A"
+    try:
+        return f"{float(val):.2f}"
+    except (TypeError, ValueError):
+        return str(val)
+
+
 def serialize_context(ctx: dict) -> str:
-    """Convert the context dict into a markdown string for the Claude prompt."""
+    """Convert the context dict into a markdown string with tables for the Claude prompt."""
     lines: list[str] = []
 
     lines.append(f"# Portfolio Context (as of {ctx.get('as_of_date', 'unknown')})")
     lines.append(f"Account: {ctx.get('account_id', 'unknown')}")
     lines.append("")
 
-    # Positions
+    # ── Positions table ──────────────────────────────────────────────────────
     positions = ctx.get("positions", [])
     if not positions:
         lines.append("## Positions\nNo open positions.")
@@ -292,50 +332,55 @@ def serialize_context(ctx: dict) -> str:
         lines.append(f"## Positions ({len(positions)} total)")
         lines.append("")
 
-        # Group by underlying
-        by_underlying: dict[str, list[dict]] = {}
-        for pos in positions:
-            u = pos.get("underlying", pos.get("symbol", "?"))
-            by_underlying.setdefault(u, []).append(pos)
+        # Options positions table
+        opt_positions = [p for p in positions if p.get("asset_class") == "OPT"]
+        stk_positions = [p for p in positions if p.get("asset_class") != "OPT"]
 
-        for underlying, pos_list in sorted(by_underlying.items()):
-            lines.append(f"### {underlying}")
-
-            for pos in pos_list:
-                ac = pos.get("asset_class", "?")
-                if ac == "OPT":
-                    right_label = "Call" if pos.get("right") == "C" else "Put"
-                    moneyness = pos.get("moneyness")
-                    if moneyness is not None:
-                        if moneyness > 0.01:
-                            money_str = f"ITM ({moneyness:+.1%})"
-                        elif moneyness < -0.01:
-                            money_str = f"OTM ({moneyness:+.1%})"
-                        else:
-                            money_str = "ATM"
-                    else:
-                        money_str = "Moneyness: N/A"
-
-                    lines.append(
-                        f"- **{right_label}** | Strike: {pos.get('strike', '?')} | "
-                        f"DTE: {pos.get('dte', '?')} | {money_str} | "
-                        f"Qty: {pos.get('quantity', '?')} contracts"
-                    )
-                    if pos.get("breakeven"):
-                        lines.append(f"  Breakeven: {pos['breakeven']}")
-                else:
-                    lines.append(
-                        f"- **{ac}** | Qty: {pos.get('quantity', '?')} shares"
-                    )
-
+        if opt_positions:
+            lines.append("### Options Positions")
+            lines.append("")
+            lines.append(
+                "| Underlying | Type | Strike | Expiry | DTE | Moneyness | "
+                "Qty | Breakeven | Cost | Value | P&L |"
+            )
+            lines.append(
+                "|------------|------|--------|--------|-----|-----------|"
+                "-----|-----------|------|-------|-----|"
+            )
+            for pos in opt_positions:
+                right_label = "Call" if pos.get("right") == "C" else "Put"
                 lines.append(
-                    f"  Cost: {_format_number(pos.get('cost_basis'))} | "
-                    f"Value: {_format_number(pos.get('market_value'))} | "
-                    f"P&L: {_format_number(pos.get('unrealized_pnl'))}"
+                    f"| {pos.get('underlying', '?')} "
+                    f"| {right_label} "
+                    f"| {pos.get('strike', '?')} "
+                    f"| {pos.get('expiry', '?')} "
+                    f"| {pos.get('dte', '?')} "
+                    f"| {_moneyness_str(pos.get('moneyness'))} "
+                    f"| {pos.get('quantity', '?')} "
+                    f"| {pos.get('breakeven', 'N/A')} "
+                    f"| {_format_number(pos.get('cost_basis'))} "
+                    f"| {_format_number(pos.get('market_value'))} "
+                    f"| {_format_number(pos.get('unrealized_pnl'))} |"
                 )
             lines.append("")
 
-    # Underlyings
+        if stk_positions:
+            lines.append("### Stock/ETF Positions")
+            lines.append("")
+            lines.append("| Symbol | Type | Qty | Cost | Value | P&L |")
+            lines.append("|--------|------|-----|------|-------|-----|")
+            for pos in stk_positions:
+                lines.append(
+                    f"| {pos.get('symbol', '?')} "
+                    f"| {pos.get('asset_class', '?')} "
+                    f"| {pos.get('quantity', '?')} "
+                    f"| {_format_number(pos.get('cost_basis'))} "
+                    f"| {_format_number(pos.get('market_value'))} "
+                    f"| {_format_number(pos.get('unrealized_pnl'))} |"
+                )
+            lines.append("")
+
+    # ── Underlying analysis tables ───────────────────────────────────────────
     underlyings = ctx.get("underlyings", {})
     if underlyings:
         lines.append("## Underlying Analysis")
@@ -345,47 +390,166 @@ def serialize_context(ctx: dict) -> str:
             lines.append(f"### {sym}")
 
             price = data.get("current_price")
-            lines.append(f"- Current Price: {_format_number(price)}")
-
             vol = data.get("realized_vol_20d")
             vol_override = data.get("volatility_override")
+
+            lines.append(f"- **Current Price**: {_format_number(price)}")
             if vol_override is not None:
-                lines.append(
-                    f"- Volatility: {vol_override:.1%} (user override) | "
-                    f"Realized 20d: {vol:.1%}" if vol else
-                    f"- Volatility: {vol_override:.1%} (user override)"
-                )
+                vol_line = f"- **Volatility**: {vol_override:.1%} (user override)"
+                if vol is not None:
+                    vol_line += f" | Realized 20d: {vol:.1%}"
+                lines.append(vol_line)
             elif vol is not None:
-                lines.append(f"- Realized Vol 20d: {vol:.1%}")
+                lines.append(f"- **Realized Vol 20d**: {vol:.1%}")
+            lines.append("")
 
-            # Fundamentals
+            # ── Fundamental Evaluation Table ─────────────────────────────────
+            valuation = data.get("valuation", {})
             fundamentals = data.get("fundamentals", {})
-            if fundamentals:
-                fund_items = [f"{k}: {v}" for k, v in fundamentals.items()]
-                lines.append(f"- Fundamentals: {' | '.join(fund_items)}")
 
-            # Technicals
+            if valuation or fundamentals:
+                lines.append("#### Fundamental Evaluation")
+                lines.append("")
+                lines.append("| Category | Metric | Value |")
+                lines.append("|----------|--------|-------|")
+
+                # Valuation ratios (from precomputed snapshot)
+                val_metrics = [
+                    ("Valuation", "P/E (TTM)", valuation.get("pe_ttm")),
+                    ("Valuation", "P/B", valuation.get("pb")),
+                    ("Valuation", "P/S", valuation.get("ps")),
+                    ("Valuation", "EV/EBITDA", valuation.get("ev_ebitda")),
+                    ("Valuation", "EV/Revenue", valuation.get("ev_revenue")),
+                    ("Valuation", "PEG", valuation.get("peg")),
+                    ("Valuation", "Earnings Yield", valuation.get("earnings_yield")),
+                    ("Valuation", "Market Cap", valuation.get("market_cap")),
+                ]
+                for cat, name, val in val_metrics:
+                    if val is not None:
+                        if name in ("Earnings Yield",):
+                            lines.append(f"| {cat} | {name} | {_fmt_pct(val)} |")
+                        elif name == "Market Cap":
+                            lines.append(f"| {cat} | {name} | {_format_number(val)} |")
+                        else:
+                            lines.append(f"| {cat} | {name} | {_fmt_ratio(val)} |")
+
+                # Profitability
+                prof_metrics = [
+                    ("Profitability", "Gross Margin", valuation.get("gross_margin")),
+                    ("Profitability", "Operating Margin", valuation.get("operating_margin")),
+                    ("Profitability", "Net Margin", valuation.get("net_margin")),
+                    ("Profitability", "ROE", valuation.get("roe")),
+                    ("Profitability", "ROA", valuation.get("roa")),
+                ]
+                for cat, name, val in prof_metrics:
+                    if val is not None:
+                        lines.append(f"| {cat} | {name} | {_fmt_pct(val)} |")
+
+                # Financial Health
+                health_metrics = [
+                    ("Health", "Debt/Equity", valuation.get("debt_to_equity")),
+                    ("Health", "Current Ratio", valuation.get("current_ratio")),
+                    ("Health", "Interest Coverage", valuation.get("interest_coverage")),
+                    ("Health", "Dividend Yield", valuation.get("dividend_yield")),
+                ]
+                for cat, name, val in health_metrics:
+                    if val is not None:
+                        if name == "Dividend Yield":
+                            lines.append(f"| {cat} | {name} | {_fmt_pct(val)} |")
+                        else:
+                            lines.append(f"| {cat} | {name} | {_fmt_ratio(val)} |")
+
+                # Growth
+                growth_metrics = [
+                    ("Growth", "Revenue Growth", valuation.get("revenue_growth")),
+                    ("Growth", "EPS Growth", valuation.get("eps_growth")),
+                    ("Growth", "Net Income Growth", valuation.get("net_income_growth")),
+                ]
+                for cat, name, val in growth_metrics:
+                    if val is not None:
+                        lines.append(f"| {cat} | {name} | {_fmt_pct(val)} |")
+
+                # Scores (from valuation snapshot)
+                score_fields = [
+                    ("Score", "Composite", valuation.get("score_composite")),
+                    ("Score", "Valuation", valuation.get("score_valuation")),
+                    ("Score", "Profitability", valuation.get("score_profitability")),
+                    ("Score", "Health", valuation.get("score_health")),
+                    ("Score", "Growth", valuation.get("score_growth")),
+                ]
+                for cat, name, val in score_fields:
+                    if val is not None:
+                        lines.append(f"| {cat} | {name} | {_fmt_ratio(val)}/100 |")
+
+                # Raw fundamentals not covered by valuation snapshot
+                shown = {
+                    "pe_ttm", "pb", "ps", "ev_ebitda", "ev_revenue", "peg",
+                    "earnings_yield", "market_cap", "gross_margin",
+                    "operating_margin", "net_margin", "roe", "roa",
+                    "debt_to_equity", "current_ratio", "interest_coverage",
+                    "dividend_yield", "revenue_growth", "eps_growth",
+                    "net_income_growth",
+                }
+                for name, val in fundamentals.items():
+                    if name not in shown:
+                        lines.append(f"| Fundamental | {name} | {val} |")
+
+                lines.append("")
+
+            # ── Technical Evaluation Table ───────────────────────────────────
             tech = data.get("technical_signals", {})
+            raw = tech.get("raw", {})
             scores = tech.get("scores", {})
-            if scores:
-                top_signals = sorted(scores.items(), key=lambda x: x[1] or 0, reverse=True)[:5]
-                sig_items = [f"{k}: {v:.0f}" for k, v in top_signals if v is not None]
-                if sig_items:
-                    lines.append(f"- Technical Scores (top 5): {' | '.join(sig_items)}")
+            ma_flags = data.get("ma_flags", {})
 
-            # Recent trades
+            if scores:
+                lines.append("#### Technical Evaluation")
+                lines.append("")
+                lines.append("| Signal | Raw Value | Score (0-100) |")
+                lines.append("|--------|-----------|---------------|")
+
+                for key, label in SIGNAL_LABELS.items():
+                    raw_val = raw.get(key)
+                    score_val = scores.get(key)
+                    if raw_val is not None or score_val is not None:
+                        if key in ("momentum_12_1", "roc_20", "realized_vol_20",
+                                   "atr_pct", "sma_trend"):
+                            raw_str = f"{raw_val:.1%}" if raw_val is not None else "N/A"
+                        elif key == "rsi_14":
+                            raw_str = f"{raw_val:.1f}" if raw_val is not None else "N/A"
+                        elif key == "volume_trend":
+                            raw_str = f"{raw_val:.2f}x" if raw_val is not None else "N/A"
+                        elif key == "bollinger_pctb":
+                            raw_str = f"{raw_val:.2f}" if raw_val is not None else "N/A"
+                        else:
+                            raw_str = f"{raw_val:.4f}" if raw_val is not None else "N/A"
+                        score_str = f"{score_val:.0f}" if score_val is not None else "N/A"
+                        lines.append(f"| {label} | {raw_str} | {score_str} |")
+
+                # MA flags
+                if ma_flags:
+                    for key, label in [("above_sma50", "SMA 50"), ("above_sma100", "SMA 100"), ("above_sma200", "SMA 200")]:
+                        flag = ma_flags.get(key)
+                        if flag is not None:
+                            status = "Above" if flag else "Below"
+                            lines.append(f"| {label} | {status} | — |")
+
+                lines.append("")
+
+            # ── Recent Trades ────────────────────────────────────────────────
             trades = data.get("recent_trades", [])
             if trades:
-                lines.append(f"- Recent Trades ({len(trades)}):")
-                for t in trades[:5]:
+                lines.append("#### Recent Trades")
+                lines.append("")
+                lines.append("| Date | Side | Qty | Symbol | Price | P&L |")
+                lines.append("|------|------|-----|--------|-------|-----|")
+                for t in trades[:10]:
                     lines.append(
-                        f"  {t['date']} {t['side']} {t['quantity']}x "
-                        f"{t['symbol']} @ {t['price']} "
-                        f"(P&L: {t['realized_pnl']})"
+                        f"| {t['date']} | {t['side']} | {t['quantity']} "
+                        f"| {t['symbol']} | {t['price']} | {t['realized_pnl']} |"
                     )
-                if len(trades) > 5:
-                    lines.append(f"  ... and {len(trades) - 5} more trades")
-
-            lines.append("")
+                if len(trades) > 10:
+                    lines.append(f"\n*... and {len(trades) - 10} more trades*")
+                lines.append("")
 
     return "\n".join(lines)
