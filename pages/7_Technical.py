@@ -15,6 +15,7 @@ from src.technical import (
     SIGNAL_LABELS,
     WEIGHT_PRESETS,
     compute_all_rankings,
+    compute_ma_flags,
     compute_signals,
     score_signals,
 )
@@ -124,13 +125,28 @@ if rankings_df.empty:
 
 st.subheader("Composite Ranking")
 
-# Build display table with scores only
+# Build display table with scores and MA flags
 display_cols = ["Rank", "Symbol", "Composite"]
+ma_flag_cols = ["above_sma50", "above_sma100", "above_sma200"]
+for col in ma_flag_cols:
+    if col in rankings_df.columns:
+        display_cols.append(col)
 for key in SIGNAL_LABELS:
     display_cols.append(f"{key}_score")
 
 display_df = rankings_df[display_cols].copy()
 rename_map = {f"{k}_score": SIGNAL_LABELS[k] for k in SIGNAL_LABELS}
+# Convert MA flags to visual indicators
+ma_rename = {}
+for col in ma_flag_cols:
+    if col in display_df.columns:
+        period = col.replace("above_sma", "")
+        label = f"SMA {period}"
+        display_df[col] = display_df[col].map(
+            {True: "\u2705", False: "\u274c", None: "\u2014"}
+        )
+        ma_rename[col] = label
+rename_map.update(ma_rename)
 display_df = display_df.rename(columns=rename_map)
 
 # Color-code the composite score
@@ -178,6 +194,18 @@ if detail_symbol and detail_symbol in price_data:
     df = price_data[detail_symbol]
     raw = compute_signals(df)
     scores = score_signals(raw)
+    ma_flags = compute_ma_flags(df)
+
+    # Moving average flags
+    ma_cols = st.columns(3)
+    for col, (period, key) in zip(ma_cols, [("50", "above_sma50"), ("100", "above_sma100"), ("200", "above_sma200")]):
+        flag = ma_flags.get(key)
+        if flag is True:
+            col.metric(f"SMA {period}", "\u2705 Above")
+        elif flag is False:
+            col.metric(f"SMA {period}", "\u274c Below")
+        else:
+            col.metric(f"SMA {period}", "\u2014 N/A")
 
     # Signal cards in two rows
     signal_keys = list(SIGNAL_LABELS.keys())

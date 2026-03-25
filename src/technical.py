@@ -221,6 +221,30 @@ def compute_signals(df: pd.DataFrame) -> dict:
     return signals
 
 
+def compute_ma_flags(df: pd.DataFrame) -> dict:
+    """Return flags indicating whether current price is above/below key SMAs.
+
+    Returns dict with keys: above_sma50, above_sma100, above_sma200.
+    Each value is True/False or None if insufficient data for that SMA.
+    """
+    df = df.copy()
+    df["adj_close"] = pd.to_numeric(df["adj_close"], errors="coerce")
+    df = df.sort_values("price_date").reset_index(drop=True)
+    close = df["adj_close"]
+    n = len(df)
+    last_close = close.iloc[-1]
+
+    flags: dict = {}
+    for period in (50, 100, 200):
+        key = f"above_sma{period}"
+        if n >= period:
+            sma = close.rolling(period).mean().iloc[-1]
+            flags[key] = bool(last_close >= sma) if pd.notna(sma) else None
+        else:
+            flags[key] = None
+    return flags
+
+
 # ── Absolute scoring functions ────────────────────────────────────────────────
 # Each maps a raw signal value to a 0–100 score.
 
@@ -361,12 +385,14 @@ def compute_all_rankings(
         raw = compute_signals(df)
         scores = score_signals(raw)
         comp = composite_score(scores, preset)
+        ma_flags = compute_ma_flags(df)
 
         row = {"Symbol": symbol}
         for key in SIGNAL_LABELS:
             row[f"{key}_raw"] = raw.get(key)
             row[f"{key}_score"] = scores.get(key)
         row["Composite"] = comp
+        row.update(ma_flags)
         rows.append(row)
 
     if not rows:
