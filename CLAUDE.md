@@ -10,6 +10,7 @@ Never import from a layer above.
 - supabase-py for database
 - streamlit for UI
 - pydantic for schema validation
+- anthropic for Claude API (Options Advisor)
 
 ## How to run locally
 pip install -r requirements.txt
@@ -27,8 +28,8 @@ Before any code change, MUST run `/inspect-db` to review the current Supabase sc
 Every code change MUST follow the `/tdd` skill: write failing tests first, implement to pass, then verify the full suite. Use `/tdd` to invoke the workflow.
 
 ## Constraints (non-negotiable)
-- Free tiers only — no paid APIs in Phase 1
-- No Anthropic API until Phase 3
+- Free tiers only — no paid APIs in Phase 1 (except Anthropic API for Advisor)
+- Anthropic API allowed for Options Advisor page (Phase 2+)
 - No hardcoded credentials anywhere
 - All Supabase queries must use st.cache_data or st.cache_resource
 - Errors must surface via st.error, never swallowed silently
