@@ -42,7 +42,7 @@ st.markdown(
 )
 
 # --- Resolve secrets: prefer env vars, fall back to st.secrets ---
-for var in ("SUPABASE_URL", "SUPABASE_KEY"):
+for var in ("SUPABASE_URL", "SUPABASE_KEY", "ANTHROPIC_API_KEY"):
     if not os.environ.get(var):
         try:
             os.environ[var] = st.secrets[var]
