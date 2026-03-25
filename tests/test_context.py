@@ -294,7 +294,7 @@ class TestBuildPositionContext:
 
 
 class TestSerializeContext:
-    def test_serializes_to_string(self):
+    def test_serializes_to_string_with_tables(self):
         ctx = {
             "account_id": "U1234",
             "as_of_date": "2026-03-20",
@@ -312,6 +312,7 @@ class TestSerializeContext:
                     "right": "C",
                     "moneyness": -0.025,
                     "breakeven": Decimal("205.0"),
+                    "expiry": "2026-04-17",
                 },
             ],
             "underlyings": {
@@ -320,7 +321,16 @@ class TestSerializeContext:
                     "realized_vol_20d": 0.28,
                     "volatility_override": None,
                     "fundamentals": {"revenue": "400.00B", "eps_diluted": "6.50"},
-                    "technical_signals": {"rsi_14": 55.0, "sma_trend": 0.05},
+                    "valuation": {
+                        "pe_ttm": "22.5", "gross_margin": "0.45",
+                        "score_composite": "65", "revenue_growth": "0.08",
+                    },
+                    "technical_signals": {
+                        "raw": {"rsi_14": 55.0, "sma_trend": 0.05},
+                        "scores": {"rsi_14": 45.0, "sma_trend": 60.0},
+                    },
+                    "ma_flags": {"above_sma50": True, "above_sma200": True},
+                    "recent_trades": [],
                 },
             },
         }
@@ -328,9 +338,19 @@ class TestSerializeContext:
         result = serialize_context(ctx)
         assert isinstance(result, str)
         assert "AAPL" in result
-        assert "DTE: 23" in result
-        assert "Strike: 200" in result
-        assert "OTM" in result or "ITM" in result or "Moneyness" in result
+        # Table format checks
+        assert "| Underlying |" in result or "| Type |" in result  # options table header
+        assert "| 23 |" in result  # DTE in table cell
+        assert "| 200 |" in result  # strike in table cell
+        assert "OTM" in result
+        # Fundamental table
+        assert "Fundamental Evaluation" in result
+        assert "P/E (TTM)" in result
+        assert "22.5" in result
+        # Technical table
+        assert "Technical Evaluation" in result
+        assert "RSI" in result
+        assert "SMA" in result
 
     def test_includes_vol_override(self):
         ctx = {
@@ -343,10 +363,69 @@ class TestSerializeContext:
                     "realized_vol_20d": 0.28,
                     "volatility_override": 0.35,
                     "fundamentals": {},
+                    "valuation": {},
                     "technical_signals": {},
+                    "ma_flags": {},
+                    "recent_trades": [],
                 },
             },
         }
 
         result = serialize_context(ctx)
-        assert "Override" in result or "override" in result or "35" in result
+        assert "override" in result.lower()
+        assert "35" in result
+
+    def test_stock_position_table(self):
+        ctx = {
+            "account_id": "U1234",
+            "as_of_date": "2026-03-20",
+            "positions": [
+                {
+                    "symbol": "MSFT",
+                    "underlying": "MSFT",
+                    "asset_class": "STK",
+                    "quantity": 100,
+                    "cost_basis": 38000,
+                    "market_value": 40000,
+                    "unrealized_pnl": 2000,
+                    "dte": None,
+                    "strike": None,
+                    "right": None,
+                    "moneyness": None,
+                    "breakeven": None,
+                },
+            ],
+            "underlyings": {},
+        }
+
+        result = serialize_context(ctx)
+        assert "Stock/ETF Positions" in result
+        assert "| MSFT |" in result
+
+    def test_valuation_scores_in_table(self):
+        ctx = {
+            "account_id": "U1234",
+            "as_of_date": "2026-03-20",
+            "positions": [],
+            "underlyings": {
+                "AAPL": {
+                    "current_price": 195.0,
+                    "realized_vol_20d": None,
+                    "volatility_override": None,
+                    "fundamentals": {},
+                    "valuation": {
+                        "score_composite": "72",
+                        "score_valuation": "60",
+                        "score_profitability": "85",
+                    },
+                    "technical_signals": {},
+                    "ma_flags": {},
+                    "recent_trades": [],
+                },
+            },
+        }
+
+        result = serialize_context(ctx)
+        assert "72.00/100" in result
+        assert "60.00/100" in result
+        assert "85.00/100" in result
