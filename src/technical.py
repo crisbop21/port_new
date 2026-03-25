@@ -19,43 +19,43 @@ logger = logging.getLogger(__name__)
 
 WEIGHT_PRESETS = {
     "Momentum": {
-        "momentum_12_1": 0.12,
+        "momentum_12_1": 0.14,
         "rsi_14": 0.04,
-        "sma_trend": 0.15,
+        "sma_trend": 0.16,
         "realized_vol_20": 0.04,
-        "volume_trend": 0.07,
-        "macd": 0.12,
+        "volume_trend": 0.08,
+        "macd": 0.14,
         "bollinger_pctb": 0.04,
-        "atr_pct": 0.07,
-        "obv_trend": 0.13,
-        "roc_20": 0.12,
-        # Momentum: 36%, Trend: 15%, Volume: 20%, Risk: 19%  (momentum-tilted)
+        "atr_pct": 0.08,
+        "obv_trend": 0.14,
+        "roc_20": 0.14,
+        # Momentum: 42%, Trend: 16%, Volume: 22%, Risk: 20%  (momentum-tilted)
     },
     "Balanced": {
-        "momentum_12_1": 0.09,
-        "rsi_14": 0.07,
-        "sma_trend": 0.12,
-        "realized_vol_20": 0.07,
-        "volume_trend": 0.09,
-        "macd": 0.09,
-        "bollinger_pctb": 0.07,
-        "atr_pct": 0.09,
-        "obv_trend": 0.12,
-        "roc_20": 0.09,
+        "momentum_12_1": 0.10,
+        "rsi_14": 0.08,
+        "sma_trend": 0.13,
+        "realized_vol_20": 0.08,
+        "volume_trend": 0.10,
+        "macd": 0.10,
+        "bollinger_pctb": 0.08,
+        "atr_pct": 0.10,
+        "obv_trend": 0.13,
+        "roc_20": 0.10,
         # ~25% each category
     },
     "Defensive": {
-        "momentum_12_1": 0.05,
-        "rsi_14": 0.10,
-        "sma_trend": 0.10,
-        "realized_vol_20": 0.12,
-        "volume_trend": 0.08,
-        "macd": 0.05,
-        "bollinger_pctb": 0.10,
-        "atr_pct": 0.12,
-        "obv_trend": 0.08,
+        "momentum_12_1": 0.06,
+        "rsi_14": 0.12,
+        "sma_trend": 0.11,
+        "realized_vol_20": 0.14,
+        "volume_trend": 0.10,
+        "macd": 0.06,
+        "bollinger_pctb": 0.12,
+        "atr_pct": 0.14,
+        "obv_trend": 0.10,
         "roc_20": 0.05,
-        # Risk/Mean-rev: 44%, Volume: 16%, Trend: 10%, Momentum: 15%
+        # Risk/Mean-rev: 52%, Volume: 20%, Trend: 11%, Momentum: 17%  (defensive-tilted)
     },
 }
 
@@ -108,11 +108,9 @@ def compute_signals(df: pd.DataFrame) -> dict:
 
     signals: dict = {}
 
-    # 1. Momentum 12-1mo: return over months 12 to 1 (skip most recent month)
+    # 1. Momentum 12-1mo: return from 12 months ago to 1 month ago (skip recent month)
     if n >= 252:
-        ret_12m = close.iloc[-1] / close.iloc[-252] - 1
-        ret_1m = close.iloc[-1] / close.iloc[-21] - 1
-        signals["momentum_12_1"] = float(ret_12m - ret_1m)
+        signals["momentum_12_1"] = float(close.iloc[-21] / close.iloc[-252] - 1)
     else:
         signals["momentum_12_1"] = None
 
