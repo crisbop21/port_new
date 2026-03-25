@@ -9,6 +9,7 @@ from src.technical import (
     WEIGHT_PRESETS,
     composite_score,
     compute_all_rankings,
+    compute_ma_flags,
     compute_signals,
     score_bollinger_pctb,
     score_macd,
@@ -207,3 +208,64 @@ class TestComputeAllRankings:
     def test_empty_input(self):
         df = compute_all_rankings({})
         assert df.empty
+
+    def test_rankings_include_ma_flags(self):
+        """Rankings DataFrame should include MA flag columns."""
+        price_data = {"AAA": _make_ohlcv(n=300, seed=1)}
+        df = compute_all_rankings(price_data, preset="Balanced")
+        for col in ("above_sma50", "above_sma100", "above_sma200"):
+            assert col in df.columns, f"Missing column: {col}"
+
+
+# ── Moving average flag tests ──────────────────────────────────────────────
+
+class TestMAFlags:
+    def test_flags_returned_with_enough_data(self):
+        df = _make_ohlcv(n=300)
+        flags = compute_ma_flags(df)
+        assert "above_sma50" in flags
+        assert "above_sma100" in flags
+        assert "above_sma200" in flags
+
+    def test_flags_are_boolean(self):
+        df = _make_ohlcv(n=300)
+        flags = compute_ma_flags(df)
+        for key in ("above_sma50", "above_sma100", "above_sma200"):
+            assert isinstance(flags[key], bool), f"{key} should be bool"
+
+    def test_flags_none_when_insufficient_data(self):
+        """With only 30 days, SMA100 and SMA200 flags should be None."""
+        df = _make_ohlcv(n=30)
+        flags = compute_ma_flags(df)
+        assert flags["above_sma100"] is None
+        assert flags["above_sma200"] is None
+
+    def test_flag_above_when_price_above_sma(self):
+        """If the last close is well above the mean, flag should be True."""
+        df = _make_ohlcv(n=300, start_price=50.0, seed=10)
+        # Force last close far above the rolling mean
+        df = df.copy()
+        df.loc[df.index[-1], "adj_close"] = 9999.0
+        df.loc[df.index[-1], "close"] = 9999.0
+        flags = compute_ma_flags(df)
+        assert flags["above_sma50"] is True
+        assert flags["above_sma100"] is True
+        assert flags["above_sma200"] is True
+
+    def test_flag_below_when_price_below_sma(self):
+        """If the last close is well below the mean, flag should be False."""
+        df = _make_ohlcv(n=300, start_price=200.0, seed=10)
+        df = df.copy()
+        df.loc[df.index[-1], "adj_close"] = 0.01
+        df.loc[df.index[-1], "close"] = 0.01
+        flags = compute_ma_flags(df)
+        assert flags["above_sma50"] is False
+        assert flags["above_sma100"] is False
+        assert flags["above_sma200"] is False
+
+    def test_sma50_available_without_sma200(self):
+        """With 60 days, SMA50 should be available but SMA200 should not."""
+        df = _make_ohlcv(n=60)
+        flags = compute_ma_flags(df)
+        assert flags["above_sma50"] is not None
+        assert flags["above_sma200"] is None
