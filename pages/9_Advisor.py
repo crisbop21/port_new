@@ -8,6 +8,29 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import streamlit as st
 
+# Tighten margins for the advisor chat layout
+st.markdown(
+    """
+    <style>
+    .block-container {
+        padding-left: 1rem;
+        padding-right: 1rem;
+        padding-top: 1rem;
+        max-width: 100%;
+    }
+    /* Widen chat messages to use available space */
+    .stChatMessage {
+        max-width: 100%;
+    }
+    /* Reduce sidebar padding on this page */
+    section[data-testid="stSidebar"] .block-container {
+        padding: 1rem 0.5rem;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 from src.context import build_position_context, serialize_context
 from src.advisor import ask_advisor
 from src.db import get_account_ids, get_portfolio_symbols
@@ -31,58 +54,52 @@ if not api_key:
     )
     st.stop()
 
-# ── Account selector ────────────────────────────────────────────────────────
+# ── Sidebar: account & vol overrides ────────────────────────────────────────
 
 account_ids = get_account_ids()
 if not account_ids:
     st.info("No statements uploaded yet. Go to **Upload** to import a PDF.")
     st.stop()
 
-account_options = ["All Accounts"] + account_ids
-selected_account = st.selectbox("Account", account_options, key="advisor_account")
-account_filter = None if selected_account == "All Accounts" else selected_account
+with st.sidebar:
+    st.subheader("Settings")
+    account_options = ["All Accounts"] + account_ids
+    selected_account = st.selectbox("Account", account_options, key="advisor_account")
+    account_filter = None if selected_account == "All Accounts" else selected_account
 
-# ── Volatility overrides ────────────────────────────────────────────────────
+    # Get symbols that have positions
+    symbols = get_portfolio_symbols(account_id=account_filter)
 
-# Get symbols that have options positions
-symbols = get_portfolio_symbols(account_id=account_filter)
-
-with st.expander("Volatility Overrides (optional)"):
-    st.caption(
-        "Override the realized volatility with your own implied volatility "
-        "estimate for any underlying. Leave blank to use computed realized vol."
-    )
+    st.divider()
+    st.subheader("Volatility Overrides")
+    st.caption("Set IV % per underlying. Leave 0 to use realized vol.")
 
     if "vol_overrides" not in st.session_state:
         st.session_state.vol_overrides = {}
 
-    # Show input for each symbol
     if symbols:
-        cols = st.columns(min(len(symbols), 4))
-        for i, sym in enumerate(symbols):
-            with cols[i % len(cols)]:
-                current_override = st.session_state.vol_overrides.get(sym)
-                val = st.number_input(
-                    f"{sym} IV %",
-                    min_value=0.0,
-                    max_value=500.0,
-                    value=float(current_override * 100) if current_override else 0.0,
-                    step=1.0,
-                    key=f"vol_{sym}",
-                    help=f"Enter implied volatility for {sym} as a percentage (e.g., 35 for 35%)",
-                )
-                if val > 0:
-                    st.session_state.vol_overrides[sym] = val / 100
-                elif sym in st.session_state.vol_overrides:
-                    del st.session_state.vol_overrides[sym]
+        for sym in symbols:
+            current_override = st.session_state.vol_overrides.get(sym)
+            val = st.number_input(
+                f"{sym} IV %",
+                min_value=0.0,
+                max_value=500.0,
+                value=float(current_override * 100) if current_override else 0.0,
+                step=1.0,
+                key=f"vol_{sym}",
+            )
+            if val > 0:
+                st.session_state.vol_overrides[sym] = val / 100
+            elif sym in st.session_state.vol_overrides:
+                del st.session_state.vol_overrides[sym]
     else:
-        st.info("No stock/ETF symbols found. Upload a statement with holdings first.")
+        st.info("No symbols found.")
 
     if st.session_state.vol_overrides:
         st.caption(
-            "Active overrides: "
+            "Active: "
             + ", ".join(
-                f"**{s}**: {v:.0%}" for s, v in st.session_state.vol_overrides.items()
+                f"**{s}** {v:.0%}" for s, v in st.session_state.vol_overrides.items()
             )
         )
 
