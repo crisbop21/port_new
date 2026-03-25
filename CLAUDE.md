@@ -20,6 +20,9 @@ streamlit run app.py
 streamlit run app.py and manually test the affected page.
 Tests live in tests/ and run with `pytest`.
 
+## Database-First Workflow (mandatory)
+Before any code change, MUST run `/inspect-db` to review the current Supabase schema and confirm whether adjustments are needed. If schema changes are required, use `/modify-db` to create a migration before writing application code.
+
 ## TDD Workflow (mandatory)
 Every code change MUST follow the `/tdd` skill: write failing tests first, implement to pass, then verify the full suite. Use `/tdd` to invoke the workflow.
 
