@@ -86,24 +86,32 @@ if uploaded is not None:
 
     # ── Parser diagnostic: row-by-row classification ─────────────────────
     diag_key = f"diag_{uploaded.name}_{uploaded.size}"
-    if diag_key not in st.session_state:
+
+    def _run_diagnostic():
         try:
             uploaded.seek(0)
             raw_rows = _extract_tables(uploaded)
             uploaded.seek(0)
             account_groups = _split_accounts(raw_rows)
-            diag_data = {}
+            data = {}
             for group in account_groups:
                 from src.parser import _extract_meta
                 try:
                     meta = _extract_meta(group)
                     acct_id = meta.account_id
                 except Exception:
-                    acct_id = f"Unknown-{len(diag_data)}"
-                diag_data[acct_id] = diagnose_positions(group)
-            st.session_state[diag_key] = diag_data
+                    acct_id = f"Unknown-{len(data)}"
+                data[acct_id] = diagnose_positions(group)
+            st.session_state[diag_key] = data
         except Exception as e:
             st.session_state[diag_key] = {"error": str(e)}
+
+    if diag_key not in st.session_state:
+        _run_diagnostic()
+
+    if st.button("🔄 Re-analyze PDF (clear diagnostic cache)"):
+        _run_diagnostic()
+        st.rerun()
 
     diag_data = st.session_state.get(diag_key, {})
 
@@ -143,21 +151,26 @@ if uploaded is not None:
                 )
 
                 # Build display data
+                import pandas as pd
                 display_rows = []
                 for r in rows:
-                    raw_first = ""
-                    if r["raw_row"]:
-                        raw_first = str(r["raw_row"][0] or "")[:50]
+                    raw_cells = r["raw_row"] or []
+                    # Show first 3 cells for quick scanning
+                    first_cell = str(raw_cells[0] or "")[:50] if len(raw_cells) > 0 else ""
+                    raw_preview = " | ".join(
+                        str(c or "")[:20] for c in raw_cells[:4]
+                    )
 
                     display_rows.append({
                         "Row #": r["row_num"],
                         "Classification": r["classification"],
                         "Asset Class": r["asset_class"] or "",
                         "Detail": r["detail"],
-                        "First Cell": raw_first,
+                        "First Cell": first_cell,
+                        "Raw Preview": raw_preview,
+                        "Cols": len(raw_cells),
                     })
 
-                import pandas as pd
                 df = pd.DataFrame(display_rows)
 
                 if search:
@@ -186,15 +199,25 @@ if uploaded is not None:
                         ]
                         if problem_matches:
                             st.markdown("**Context around skipped/errored rows** "
-                                        "(5 rows before & after):")
+                                        "(10 rows before & 5 after):")
                             context_indices: set[int] = set()
                             for idx in problem_matches:
-                                for offset in range(-5, 6):
+                                for offset in range(-10, 6):
                                     ctx = idx + offset
                                     if 0 <= ctx < len(df):
                                         context_indices.add(ctx)
                             ctx_df = df.loc[sorted(context_indices)]
                             st.dataframe(ctx_df, use_container_width=True, hide_index=True)
+
+                            # Show full raw rows for the problem entries
+                            st.markdown("**Full raw row data for skipped entries:**")
+                            for idx in problem_matches:
+                                r = rows[idx]
+                                st.code(
+                                    f"Row {r['row_num']} ({r['classification']}):\n"
+                                    f"  Cells ({len(r['raw_row'])}): {r['raw_row']}",
+                                    language=None,
+                                )
                 else:
                     # Color-code: show problem rows prominently
                     problem_classifications = {
