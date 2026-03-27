@@ -611,6 +611,83 @@ class TestExtractPositions:
         assert sofi.asset_class == "STK"
 
 
+    def test_continuation_page_no_headers_no_asset_class(self):
+        """Real IBKR PDF scenario: page 25 re-emits 'Open Positions' but has
+        NO column headers and NO 'Stocks' label before the data rows.
+
+        Page 24: Open Positions → Symbol headers → Stocks → AMZN..MSFT
+        Page 25: Open Positions (re-emitted) → NFLX, SOFI, SPGI (bare data)
+                 → Totals → Symbol headers → Equity and Index Options → options
+        """
+        rows = [
+            # ── Page 24 ──
+            ["Open Positions", "", "", "", "", "", "", "", ""],
+            ["Symbol", "Quantity", "Mult", "Cost Price", "Cost Basis",
+             "Close Price", "Value", "Unrealized P/L", "Code"],
+            ["Stocks", "", "", "", "", "", "", "", ""],
+            ["USD", "", "", "", "", "", "", "", ""],
+            ["AMZN", "140", "1", "221.58", "31,021.40",
+             "211.71", "29,639.40", "-1,382.00", ""],
+            ["MSFT", "35", "1", "413.96", "14,488.48",
+             "371.04", "12,986.40", "-1,502.08", ""],
+            # ── Page 25: re-emitted header, NO column headers, NO Stocks ──
+            ["Open Positions", "", "", "", "", "", "", "", ""],
+            # Data rows directly — no Symbol header, no Stocks label
+            ["NFLX", "60", "1", "85.98", "5,158.88",
+             "92.28", "5,536.80", "377.92", ""],
+            ["SOFI", "750", "1", "22.82", "17,117.06",
+             "16.56", "12,420.00", "-4,697.06", ""],
+            ["SPGI", "55", "1", "493.74", "27,155.56",
+             "408.48", "22,466.40", "-4,689.16", ""],
+            ["XLE", "200", "1", "50.53", "10,105.18",
+             "60.57", "12,114.00", "2,008.82", ""],
+            ["XLU", "300", "1", "42.88", "12,863.18",
+             "45.25", "13,575.00", "711.82", ""],
+            ["Total", "", "", "", "236,408.12", "",
+             "223,556.59", "-12,851.53", ""],
+            ["Total in SGD", "", "", "", "302,933.36", "",
+             "286,465.41", "-16,467.95", ""],
+            # Column headers re-emitted for options
+            ["Symbol", "Quantity", "Mult", "Cost Price", "Cost Basis",
+             "Close Price", "Value", "Unrealized P/L", "Code"],
+            ["Equity and Index Options", "", "", "", "", "", "", "", ""],
+            ["USD", "", "", "", "", "", "", "", ""],
+            ["QQQ 15MAY26 530 P", "-5", "100", "6.34", "-3,171.18",
+             "6.7154", "-3,357.70", "-186.52", ""],
+            ["SOFI 01MAY26 19 C", "-6", "100", "0.70", "-421.41",
+             "0.5650", "-339.00", "82.41", ""],
+            ["Total", "", "", "", "1,584.09", "",
+             "1,866.42", "282.33", ""],
+        ]
+        positions, skipped = _extract_positions(rows, date(2026, 3, 25))
+        symbols = [p.symbol for p in positions]
+
+        # All page-24 stocks must be parsed
+        assert "AMZN" in symbols
+        assert "MSFT" in symbols
+
+        # All page-25 stocks must be parsed (the bug was these were dropped)
+        assert "NFLX" in symbols, f"NFLX missing: {symbols}"
+        assert "SOFI" in symbols, f"SOFI missing: {symbols}"
+        assert "SPGI" in symbols, f"SPGI missing: {symbols}"
+        assert "XLE" in symbols, f"XLE missing: {symbols}"
+        assert "XLU" in symbols, f"XLU missing: {symbols}"
+
+        # Options must be parsed
+        opts = [p for p in positions if p.asset_class == "OPT"]
+        assert len(opts) == 2
+
+        # 7 stocks + 2 options = 9 total
+        assert len(positions) == 9
+
+        # Verify SOFI has correct data
+        sofi = [p for p in positions if p.symbol == "SOFI"
+                and p.asset_class == "STK"][0]
+        assert sofi.quantity == Decimal("750")
+        assert sofi.market_value == Decimal("12420.00")
+        assert sofi.unrealized_pnl == Decimal("-4697.06")
+
+
 class TestExtractTrades:
     def test_buy_trade(self):
         rows = _trade_rows()
@@ -986,3 +1063,37 @@ class TestDiagnosePositions:
         result = diagnose_positions(rows)
         empty_sym = [r for r in result if r["classification"] == "skipped_empty_symbol"]
         assert len(empty_sym) == 1
+
+    def test_continuation_no_headers_diagnosed_as_parsed(self):
+        """Diagnose must show continuation-page stocks as 'parsed', not skipped.
+
+        Matches real IBKR PDF: page 25 re-emits 'Open Positions' but has
+        NO column headers and NO 'Stocks' before data rows.
+        """
+        rows = [
+            ["Open Positions", "", "", "", "", "", "", "", ""],
+            ["Symbol", "Quantity", "Mult", "Cost Price", "Cost Basis",
+             "Close Price", "Value", "Unrealized P/L", "Code"],
+            ["Stocks", "", "", "", "", "", "", "", ""],
+            ["USD", "", "", "", "", "", "", "", ""],
+            ["AMZN", "140", "1", "221.58", "31,021.40",
+             "211.71", "29,639.40", "-1,382.00", ""],
+            # ── Page 25: re-emitted header, bare data ──
+            ["Open Positions", "", "", "", "", "", "", "", ""],
+            ["SOFI", "750", "1", "22.82", "17,117.06",
+             "16.56", "12,420.00", "-4,697.06", ""],
+            ["Total", "", "", "", "236,408.12", "",
+             "223,556.59", "-12,851.53", ""],
+        ]
+        result = diagnose_positions(rows)
+        parsed = [r for r in result if r["classification"] == "parsed"]
+        parsed_symbols = [r["detail"] for r in parsed]
+
+        assert "AMZN" in parsed_symbols
+        assert "SOFI" in parsed_symbols, (
+            f"SOFI diagnosed as skipped, not parsed. "
+            f"Classifications: {[(r['detail'], r['classification']) for r in result]}"
+        )
+        # SOFI must be under STK
+        sofi_row = [r for r in result if r["detail"] == "SOFI"][0]
+        assert sofi_row["asset_class"] == "STK"
