@@ -20,6 +20,7 @@ from src.parser import (
     _parse_option_symbol,
     _split_accounts,
     _to_decimal,
+    diagnose_positions,
     parse_statement,
 )
 
@@ -655,3 +656,131 @@ class TestRealPDF:
         assert ewy_sell.price == Decimal("130.0400")
         assert ewy_sell.realized_pnl == Decimal("380.91")
         assert ewy_sell.commission == Decimal("-1.10")
+
+
+# ── Diagnostic function tests ─────────────────────────────────────────────
+
+
+class TestDiagnosePositions:
+    def test_returns_list_of_dicts(self):
+        rows = _position_rows()
+        result = diagnose_positions(rows)
+        assert isinstance(result, list)
+        assert all(isinstance(r, dict) for r in result)
+
+    def test_each_row_has_required_keys(self):
+        rows = _position_rows()
+        result = diagnose_positions(rows)
+        required_keys = {"row_num", "raw_row", "classification", "asset_class", "detail"}
+        for entry in result:
+            assert required_keys.issubset(entry.keys()), (
+                f"Missing keys in {entry}"
+            )
+
+    def test_classifies_section_header(self):
+        rows = _position_rows()
+        result = diagnose_positions(rows)
+        headers = [r for r in result if r["classification"] == "section_header"]
+        assert len(headers) >= 1
+        assert headers[0]["detail"] == "Open Positions"
+
+    def test_classifies_asset_class(self):
+        rows = _position_rows()
+        result = diagnose_positions(rows)
+        ac_rows = [r for r in result if r["classification"] == "asset_class"]
+        labels = [r["detail"] for r in ac_rows]
+        assert "Stocks → STK" in labels
+
+    def test_classifies_data_rows(self):
+        rows = _position_rows()
+        result = diagnose_positions(rows)
+        parsed = [r for r in result if r["classification"] == "parsed"]
+        symbols = [r["detail"] for r in parsed]
+        assert "AAPL" in symbols
+        assert "MSFT" in symbols
+
+    def test_classifies_total_rows(self):
+        rows = _position_rows()
+        result = diagnose_positions(rows)
+        totals = [r for r in result if r["classification"] == "total"]
+        assert len(totals) >= 1
+
+    def test_classifies_currency_rows(self):
+        rows = _position_rows()
+        result = diagnose_positions(rows)
+        currencies = [r for r in result if r["classification"] == "currency"]
+        assert len(currencies) >= 1
+
+    def test_classifies_column_header(self):
+        rows = _position_rows()
+        result = diagnose_positions(rows)
+        col_headers = [r for r in result if r["classification"] == "column_header"]
+        assert len(col_headers) >= 1
+
+    def test_skipped_asset_class_rows_classified(self):
+        """Rows under an unsupported asset class should be classified as skipped."""
+        rows = _position_rows() + [
+            ["Futures", "", "", "", "", "", "", "", ""],
+            ["USD", "", "", "", "", "", "", "", ""],
+            ["ESH4", "1", "1", "4800", "4800", "4850", "4850", "50", ""],
+        ]
+        result = diagnose_positions(rows)
+        skipped_ac = [r for r in result if r["classification"] == "asset_class_skipped"]
+        assert len(skipped_ac) >= 1
+        assert "Futures" in skipped_ac[0]["detail"]
+
+    def test_skipped_no_asset_class_rows(self):
+        """Data rows before any asset class header should be skipped."""
+        rows = [
+            ["Open Positions", "", "", "", "", "", "", "", ""],
+            ["Symbol", "Quantity", "Mult", "Cost Price", "Cost Basis",
+             "Close Price", "Value", "Unrealized P/L", "Code"],
+            # Data row with no asset class set
+            ["AAPL", "100", "1", "150.00", "15,000.00",
+             "175.50", "17,550.00", "2,550.00", ""],
+        ]
+        result = diagnose_positions(rows)
+        skipped = [r for r in result if r["classification"] == "skipped_no_asset_class"]
+        assert len(skipped) == 1
+
+    def test_validation_error_classified(self):
+        """Rows that fail Pydantic validation should be classified as error."""
+        rows = [
+            ["Open Positions", "", "", "", "", "", "", "", ""],
+            ["Symbol", "Quantity", "Mult", "Cost Price", "Cost Basis",
+             "Close Price", "Value", "Unrealized P/L", "Code"],
+            ["Equity and Index Options", "", "", "", "", "", "", "", ""],
+            ["USD", "", "", "", "", "", "", "", ""],
+            # Malformed option symbol → will fail OPT validation (no expiry/strike/right)
+            ["WEIRD", "10", "100", "1.00", "1000.00",
+             "2.00", "2000.00", "1000.00", ""],
+        ]
+        result = diagnose_positions(rows)
+        errors = [r for r in result if r["classification"] == "error"]
+        assert len(errors) == 1
+        assert "WEIRD" in str(errors[0]["detail"])
+
+    def test_outside_section_classified(self):
+        """Rows before Open Positions should be classified as outside_section."""
+        rows = [
+            ["Account Information", ""],
+            ["Name", "TEST USER"],
+        ] + _position_rows()
+        result = diagnose_positions(rows)
+        outside = [r for r in result if r["classification"] == "outside_section"]
+        assert len(outside) >= 1
+
+    def test_empty_symbol_classified(self):
+        """Row with empty symbol should be classified as skipped_empty_symbol."""
+        rows = [
+            ["Open Positions", "", "", "", "", "", "", "", ""],
+            ["Symbol", "Quantity", "Mult", "Cost Price", "Cost Basis",
+             "Close Price", "Value", "Unrealized P/L", "Code"],
+            ["Stocks", "", "", "", "", "", "", "", ""],
+            ["USD", "", "", "", "", "", "", "", ""],
+            ["", "100", "1", "150.00", "15,000.00",
+             "175.50", "17,550.00", "2,550.00", ""],
+        ]
+        result = diagnose_positions(rows)
+        empty_sym = [r for r in result if r["classification"] == "skipped_empty_symbol"]
+        assert len(empty_sym) == 1

@@ -7,7 +7,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import streamlit as st
 
-from src.parser import parse_statement
+from src.parser import parse_statement, _extract_tables, _split_accounts, diagnose_positions
 from src.db import (
     upsert_statement,
     check_duplicates,
@@ -83,6 +83,111 @@ if uploaded is not None:
                     "Stocks, ETFs, and Options are supported."
                 )
                 st.dataframe(parsed.skipped_rows, use_container_width=True)
+
+    # ── Parser diagnostic: row-by-row classification ─────────────────────
+    diag_key = f"diag_{uploaded.name}_{uploaded.size}"
+    if diag_key not in st.session_state:
+        try:
+            uploaded.seek(0)
+            raw_rows = _extract_tables(uploaded)
+            uploaded.seek(0)
+            account_groups = _split_accounts(raw_rows)
+            diag_data = {}
+            for group in account_groups:
+                from src.parser import _extract_meta
+                try:
+                    meta = _extract_meta(group)
+                    acct_id = meta.account_id
+                except Exception:
+                    acct_id = f"Unknown-{len(diag_data)}"
+                diag_data[acct_id] = diagnose_positions(group)
+            st.session_state[diag_key] = diag_data
+        except Exception as e:
+            st.session_state[diag_key] = {"error": str(e)}
+
+    diag_data = st.session_state.get(diag_key, {})
+
+    if diag_data and "error" not in diag_data:
+        with st.expander("🔍 Parser Diagnostic — row-by-row classification", expanded=False):
+            st.caption(
+                "Every row from the PDF's Open Positions section is shown below "
+                "with how the parser classified it. Use this to find missing positions. "
+                "Look for rows classified as **skipped**, **error**, or **outside_section** "
+                "that contain your expected symbol."
+            )
+
+            for acct_id, rows in diag_data.items():
+                st.markdown(f"**Account: {acct_id}**")
+
+                # Summary counts
+                from collections import Counter
+                counts = Counter(r["classification"] for r in rows)
+                col_a, col_b, col_c, col_d = st.columns(4)
+                col_a.metric("Parsed", counts.get("parsed", 0))
+                col_b.metric("Skipped / Errors",
+                             counts.get("skipped_no_asset_class", 0)
+                             + counts.get("skipped_no_mapping", 0)
+                             + counts.get("skipped_empty_symbol", 0)
+                             + counts.get("error", 0))
+                col_c.metric("Totals/Headers",
+                             counts.get("total", 0)
+                             + counts.get("column_header", 0)
+                             + counts.get("section_header", 0))
+                col_d.metric("Outside section", counts.get("outside_section", 0))
+
+                # Symbol search filter
+                search = st.text_input(
+                    "Search for a symbol",
+                    key=f"diag_search_{acct_id}",
+                    placeholder="e.g. SOFI, AAPL",
+                )
+
+                # Build display data
+                display_rows = []
+                for r in rows:
+                    raw_first = ""
+                    if r["raw_row"]:
+                        raw_first = str(r["raw_row"][0] or "")[:50]
+
+                    display_rows.append({
+                        "Row #": r["row_num"],
+                        "Classification": r["classification"],
+                        "Asset Class": r["asset_class"] or "",
+                        "Detail": r["detail"],
+                        "First Cell": raw_first,
+                    })
+
+                import pandas as pd
+                df = pd.DataFrame(display_rows)
+
+                if search:
+                    search_lower = search.strip().lower()
+                    mask = (
+                        df["Detail"].str.lower().str.contains(search_lower, na=False)
+                        | df["First Cell"].str.lower().str.contains(search_lower, na=False)
+                    )
+                    df_filtered = df[mask]
+                    if df_filtered.empty:
+                        st.warning(
+                            f"Symbol **{search}** not found in any row. "
+                            "This means pdfplumber did not extract it from the PDF at all. "
+                            "The issue is at the PDF extraction level, not the parser."
+                        )
+                    else:
+                        st.dataframe(df_filtered, use_container_width=True, hide_index=True)
+                else:
+                    # Color-code: show problem rows prominently
+                    problem_classifications = {
+                        "skipped_no_asset_class", "skipped_no_mapping",
+                        "skipped_empty_symbol", "error", "asset_class_skipped",
+                    }
+                    problem_df = df[df["Classification"].isin(problem_classifications)]
+                    if not problem_df.empty:
+                        st.markdown("**⚠️ Problem rows (skipped or errored):**")
+                        st.dataframe(problem_df, use_container_width=True, hide_index=True)
+
+                    st.markdown("**All rows:**")
+                    st.dataframe(df, use_container_width=True, hide_index=True)
 
     st.divider()
 
