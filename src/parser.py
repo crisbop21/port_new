@@ -439,6 +439,172 @@ def _extract_positions(
     return positions, skipped
 
 
+# ── Position diagnostic ──────────────────────────────────────────────────────
+
+def diagnose_positions(rows: list[list[str]]) -> list[dict]:
+    """Classify every row for diagnostic display.
+
+    Returns a list of dicts, one per row, with keys:
+        row_num: 1-based index
+        raw_row: the original row (list of strings)
+        classification: one of section_header, column_header, asset_class,
+            asset_class_skipped, currency, total, parsed, error,
+            skipped_no_asset_class, skipped_no_mapping, skipped_empty_symbol,
+            outside_section
+        asset_class: current asset class at this row (or None)
+        detail: human-readable explanation
+    """
+    result: list[dict] = []
+    in_section = False
+    current_asset_class: str | None = None
+    col_mapping: dict[int, str] = {}
+
+    for i, row in enumerate(rows):
+        entry: dict = {
+            "row_num": i + 1,
+            "raw_row": row,
+            "classification": "",
+            "asset_class": current_asset_class,
+            "detail": "",
+        }
+
+        if not row:
+            entry["classification"] = "empty"
+            entry["detail"] = "Empty row"
+            result.append(entry)
+            continue
+
+        section = _is_section_header(row)
+        if section == "Open Positions":
+            in_section = True
+            current_asset_class = None
+            col_mapping = {}
+            entry["classification"] = "section_header"
+            entry["detail"] = "Open Positions"
+            entry["asset_class"] = None
+            result.append(entry)
+            continue
+        elif section is not None and in_section:
+            entry["classification"] = "section_header"
+            entry["detail"] = f"{section} (exits Open Positions)"
+            entry["asset_class"] = current_asset_class
+            result.append(entry)
+            break
+        elif section is not None:
+            entry["classification"] = "outside_section"
+            entry["detail"] = f"Section: {section}"
+            result.append(entry)
+            continue
+
+        if not in_section:
+            entry["classification"] = "outside_section"
+            first_cell = (row[0] or "")[:40] if row else ""
+            entry["detail"] = f"Before Open Positions: {first_cell}"
+            result.append(entry)
+            continue
+
+        # Column header
+        if _is_column_header(row):
+            col_mapping = _map_columns(row, POSITION_COL_MAP)
+            entry["classification"] = "column_header"
+            entry["detail"] = f"Mapped {len(col_mapping)} columns"
+            entry["asset_class"] = current_asset_class
+            result.append(entry)
+            continue
+
+        # Asset class sub-header
+        ac_label = _is_asset_class(row)
+        if ac_label is not None:
+            if ac_label in ASSET_CLASS_MAP:
+                current_asset_class = ASSET_CLASS_MAP[ac_label]
+                entry["classification"] = "asset_class"
+                entry["detail"] = f"{ac_label} → {current_asset_class}"
+            else:
+                current_asset_class = None
+                entry["classification"] = "asset_class_skipped"
+                entry["detail"] = f"{ac_label} (unsupported — rows below will be skipped)"
+            entry["asset_class"] = current_asset_class
+            result.append(entry)
+            continue
+
+        # Currency
+        if _is_currency(row):
+            entry["classification"] = "currency"
+            entry["detail"] = (row[0] or "").strip()
+            entry["asset_class"] = current_asset_class
+            result.append(entry)
+            continue
+
+        # Total
+        if _is_total(row):
+            entry["classification"] = "total"
+            entry["detail"] = (row[0] or "").strip()
+            entry["asset_class"] = current_asset_class
+            result.append(entry)
+            continue
+
+        # No asset class set
+        if current_asset_class is None:
+            entry["classification"] = "skipped_no_asset_class"
+            first_cell = (row[0] or "").strip()[:40]
+            entry["detail"] = f"No active asset class: {first_cell}"
+            entry["asset_class"] = None
+            result.append(entry)
+            continue
+
+        # No column mapping
+        if not col_mapping:
+            entry["classification"] = "skipped_no_mapping"
+            first_cell = (row[0] or "").strip()[:40]
+            entry["detail"] = f"No column mapping: {first_cell}"
+            entry["asset_class"] = current_asset_class
+            result.append(entry)
+            continue
+
+        # Map columns to fields
+        fields: dict = {}
+        for idx, field_name in col_mapping.items():
+            if idx < len(row):
+                fields[field_name] = (row[idx] or "").strip()
+
+        symbol = fields.get("symbol", "").strip()
+        if not symbol:
+            entry["classification"] = "skipped_empty_symbol"
+            entry["detail"] = f"Empty symbol in row: {row[:3]}"
+            entry["asset_class"] = current_asset_class
+            result.append(entry)
+            continue
+
+        # Try to build a Position
+        try:
+            opt_fields: dict = {}
+            if current_asset_class == "OPT":
+                opt_fields = _parse_option_symbol(symbol)
+
+            Position(
+                symbol=symbol,
+                asset_class=current_asset_class,
+                quantity=_to_decimal(fields.get("quantity")),
+                cost_basis=_to_decimal(fields.get("cost_basis")),
+                market_price=_to_decimal(fields.get("market_price")),
+                market_value=_to_decimal(fields.get("market_value")),
+                unrealized_pnl=_to_decimal(fields.get("unrealized_pnl")),
+                currency="USD",
+                statement_date=date.today(),
+                **opt_fields,
+            )
+            entry["classification"] = "parsed"
+            entry["detail"] = symbol
+        except Exception as e:
+            entry["classification"] = "error"
+            entry["detail"] = f"{symbol}: {e}"
+
+        entry["asset_class"] = current_asset_class
+        result.append(entry)
+
+    return result
+
+
 # ── Trade extraction ─────────────────────────────────────────────────────────
 
 def _extract_trades(rows: list[list[str]]) -> tuple[list[Trade], list[dict]]:
