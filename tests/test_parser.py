@@ -478,19 +478,6 @@ class TestExtractPositions:
         assert "MSFT" in symbols
         assert "NFLX" in symbols
         assert len(positions) == 3
-            ["Total", "", "", "", "15,000.00", "", "17,550.00", "2,550.00", ""],
-            # ── Page break ──
-            ["Open Positions", "", "", "", "", "", "", "", ""],
-            ["Symbol", "Quantity", "Mult", "Cost Price", "Cost Basis",
-             "Close Price", "Value", "Unrealized P/L", "Code"],
-            ["USD", "", "", "", "", "", "", "", ""],
-            ["SOFI", "400", "1", "26.18", "10,472.00",
-             "16.56", "6,624.00", "-3,848.00", ""],
-        ]
-        positions, _ = _extract_positions(rows, date(2026, 3, 6))
-        symbols = [p.symbol for p in positions]
-        assert "SOFI" in symbols
-        assert len(positions) == 2
 
     def test_unsupported_asset_class_skipped(self):
         extra = [
