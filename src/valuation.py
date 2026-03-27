@@ -283,6 +283,49 @@ def compute_historical_ratios(
             entries.sort(key=lambda x: x[0])
             point_by_metric[name] = entries
 
+    # Fallback: derive shares_outstanding from net_income / eps_diluted
+    # when shares_outstanding data is missing (common for multi-class stocks
+    # like META where XBRL may not report a single aggregate figure).
+    if "shares_outstanding" not in point_by_metric:
+        ni_rows = metric_history.get("net_income", [])
+        eps_rows = metric_history.get("eps_diluted", [])
+        if ni_rows and eps_rows:
+            # Build lookup: period_end → eps_diluted (FY entries only)
+            eps_by_pe: dict[str, float] = {}
+            for row in eps_rows:
+                if row.get("fiscal_period") != "FY":
+                    continue
+                pe = str(row.get("period_end", ""))
+                try:
+                    val = float(row["metric_value"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if pe and val and val != 0:
+                    eps_by_pe[pe] = val
+
+            derived_shares: list[tuple[str, float]] = []
+            for row in ni_rows:
+                if row.get("fiscal_period") != "FY":
+                    continue
+                pe = str(row.get("period_end", ""))
+                try:
+                    ni_val = float(row["metric_value"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                eps_val = eps_by_pe.get(pe)
+                if pe and eps_val and ni_val:
+                    shares = ni_val / eps_val
+                    if shares > 0:
+                        derived_shares.append((pe, shares))
+
+            if derived_shares:
+                derived_shares.sort(key=lambda x: x[0])
+                point_by_metric["shares_outstanding"] = derived_shares
+                logger.info(
+                    "Derived shares_outstanding from net_income/eps_diluted "
+                    "(%d data points)", len(derived_shares),
+                )
+
     def _latest_on_or_before(
         series: list[tuple[str, float]], target: str,
     ) -> float | None:
