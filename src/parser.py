@@ -575,6 +575,185 @@ def _extract_trades(rows: list[list[str]]) -> tuple[list[Trade], list[dict]]:
     return trades, skipped
 
 
+# ── Mark-to-Market extraction (for cross-check) ─────────────────────────────
+
+# MTM column map — we only need symbol, current qty, and current price.
+MTM_COL_MAP: dict[str, str] = {
+    "symbol": "symbol",
+    "description": "symbol",
+    "financial instrument": "symbol",
+}
+
+
+def _extract_mtm_current(rows: list[list[str]]) -> list[dict]:
+    """Extract current positions from Mark-to-Market Performance Summary.
+
+    Returns a list of dicts with: symbol, quantity, market_price, asset_class.
+    Only includes entries with non-zero current quantity.
+    Used as a cross-check / fallback for Open Positions parsing.
+    """
+    result: list[dict] = []
+    in_section = False
+    # Stocks appear first in MTM with no explicit "Stocks" sub-header.
+    current_asset_class: str | None = "STK"
+    qty_col: int | None = None      # "Current" column for quantity
+    price_col: int | None = None    # "Current" column for price
+
+    for row in rows:
+        if not row:
+            continue
+
+        section = _is_section_header(row)
+        if section == "Mark-to-Market Performance Summary":
+            in_section = True
+            continue
+        elif section is not None and in_section:
+            break
+
+        if not in_section:
+            continue
+
+        # Detect column header row (has "Symbol" or "Prior"/"Current")
+        first = (row[0] or "").strip()
+        if first in _HEADER_FIRST_CELL or first == "Symbol":
+            # Find the "Current" columns — first one is qty, second is price
+            current_cols = [
+                i for i, c in enumerate(row)
+                if (c or "").strip().lower() == "current"
+            ]
+            if len(current_cols) >= 2:
+                qty_col = current_cols[0]
+                price_col = current_cols[1]
+            elif len(current_cols) == 1:
+                qty_col = current_cols[0]
+            continue
+
+        # Sub-header rows (spanning header like "Quantity", "Price", etc.)
+        if qty_col is None and any(
+            (c or "").strip().lower() in ("prior", "current") for c in row
+        ):
+            current_cols = [
+                i for i, c in enumerate(row)
+                if (c or "").strip().lower() == "current"
+            ]
+            if len(current_cols) >= 2:
+                qty_col = current_cols[0]
+                price_col = current_cols[1]
+            elif len(current_cols) == 1:
+                qty_col = current_cols[0]
+            continue
+
+        # Asset-class sub-headers
+        ac_label = _is_asset_class(row)
+        if ac_label is not None:
+            if ac_label in ASSET_CLASS_MAP:
+                current_asset_class = ASSET_CLASS_MAP[ac_label]
+            else:
+                current_asset_class = None
+            continue
+
+        if _is_currency(row):
+            continue
+        if _is_total(row):
+            continue
+
+        if current_asset_class is None:
+            continue
+        if qty_col is None:
+            continue
+
+        symbol = (row[0] or "").strip()
+        if not symbol:
+            continue
+
+        qty = _to_decimal(row[qty_col] if qty_col < len(row) else "")
+        if qty == 0:
+            continue
+
+        price = Decimal("0")
+        if price_col is not None and price_col < len(row):
+            price = _to_decimal(row[price_col])
+
+        result.append({
+            "symbol": symbol,
+            "quantity": qty,
+            "market_price": price,
+            "asset_class": current_asset_class,
+        })
+
+    return result
+
+
+def _cross_check_positions(
+    open_positions: list[Position],
+    mtm_current: list[dict],
+    period_end: date,
+) -> tuple[list[Position], list[str]]:
+    """Cross-check Open Positions against Mark-to-Market current holdings.
+
+    Any symbol present in MTM (with qty != 0) but absent from Open Positions
+    is filled in using available MTM data.  Returns (filled_positions, warnings).
+    """
+    warnings: list[str] = []
+
+    # Build set of symbols already in Open Positions
+    existing_symbols: set[str] = set()
+    for p in open_positions:
+        key = p.symbol
+        existing_symbols.add(key)
+
+    filled = list(open_positions)
+
+    for mtm in mtm_current:
+        sym = mtm["symbol"]
+        if sym in existing_symbols:
+            continue
+
+        # Missing from Open Positions — create fallback position from MTM
+        ac = mtm["asset_class"]
+        qty = mtm["quantity"]
+        price = mtm["market_price"]
+        market_value = qty * price
+
+        opt_fields: dict = {}
+        if ac == "OPT":
+            opt_fields = _parse_option_symbol(sym)
+            if not opt_fields:
+                warnings.append(
+                    f"Cannot parse option symbol '{sym}' from MTM — skipping."
+                )
+                continue
+
+        try:
+            fallback = Position(
+                symbol=sym,
+                asset_class=ac,
+                quantity=qty,
+                cost_basis=Decimal("0"),
+                market_price=price,
+                market_value=market_value,
+                unrealized_pnl=Decimal("0"),
+                currency="USD",
+                statement_date=period_end,
+                **opt_fields,
+            )
+            filled.append(fallback)
+            warnings.append(
+                f"Position '{sym}' (qty={qty}) missing from Open Positions — "
+                f"filled from Mark-to-Market (cost_basis=0, unrealized_pnl=0)."
+            )
+            logger.warning(
+                "MTM cross-check: '%s' qty=%s missing from Open Positions, "
+                "added fallback position.",
+                sym, qty,
+            )
+        except Exception as e:
+            warnings.append(f"Failed to create fallback for '{sym}': {e}")
+            logger.warning("Failed to create MTM fallback for %s: %s", sym, e)
+
+    return filled, warnings
+
+
 # ── Public API ────────────────────────────────────────────────────────────────
 
 def parse_statement(pdf_file: BinaryIO) -> list[ParsedStatement]:
@@ -603,6 +782,20 @@ def parse_statement(pdf_file: BinaryIO) -> list[ParsedStatement]:
         positions, pos_skipped = _extract_positions(group, meta.period_end)
         trades, trade_skipped = _extract_trades(group)
         skipped = pos_skipped + trade_skipped
+
+        # Cross-check Open Positions against Mark-to-Market
+        mtm_current = _extract_mtm_current(group)
+        if mtm_current:
+            positions, mtm_warnings = _cross_check_positions(
+                positions, mtm_current, meta.period_end,
+            )
+            for w in mtm_warnings:
+                logger.warning("Account %s: %s", meta.account_id, w)
+                skipped.append({
+                    "section": "MTM Cross-check",
+                    "reason": w,
+                    "row": [],
+                })
 
         logger.info(
             "Parsed account %s (%s to %s): %d positions, %d trades, %d skipped",

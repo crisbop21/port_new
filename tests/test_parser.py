@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 import pytest
 
+from src.models import Position
 from src.parser import (
     _extract_meta,
     _extract_positions,
@@ -564,6 +565,216 @@ class TestExtractTrades:
         assert sofi_trade.expiry == date(2026, 5, 1)
         assert sofi_trade.strike == Decimal("19")
         assert sofi_trade.right == "C"
+
+
+# ── Mark-to-Market cross-check ───────────────────────────────────────────────
+
+def _mtm_rows():
+    """Build Mark-to-Market Performance Summary rows matching real IBKR format."""
+    return [
+        ["Mark-to-Market Performance Summary", "", "", "", "", "", "", "", "", "", ""],
+        ["", "Quantity", "", "Price", "", "Mark-to-Market P/L", "", "", "", "", ""],
+        ["Symbol", "Prior", "Current", "Prior", "Current",
+         "Position", "Transaction", "Commissions", "Other", "Total", "Code"],
+        # Stocks (no "Stocks" sub-header in MTM — data starts immediately)
+        ["AAPL", "100", "100", "175.50", "180.00",
+         "450.00", "0.00", "0.00", "0.00", "450.00", ""],
+        ["SOFI", "150", "400", "26.18", "16.56",
+         "-3,758.36", "66.59", "-4.16", "0.00", "-3,695.94", ""],
+        ["MSFT", "50", "50", "400.00", "420.00",
+         "1,000.00", "0.00", "0.00", "0.00", "1,000.00", ""],
+        ["ACWX", "0", "0", "--", "--",
+         "0.00", "0.00", "0.00", "0.05", "0.05", ""],
+        ["Total Stocks", "", "", "", "",
+         "-2,308.36", "66.59", "-4.16", "0.05", "-2,245.89", ""],
+        ["Equity and Index Options", "", "", "", "", "", "", "", "", "", ""],
+        ["EEM 31MAR26 48 C", "6", "6", "7.42", "9.47",
+         "199.89", "0.00", "0.00", "0.00", "199.89", ""],
+        ["SOFI 01MAY26 19 C", "0", "-2", "--", "0.5650",
+         "39.85", "44.85", "-1.96", "0.00", "82.74", ""],
+        ["Total Equity and Index Options", "", "", "", "",
+         "239.74", "44.85", "-1.96", "0.00", "282.63", ""],
+        ["Forex", "", "", "", "", "", "", "", "", "", ""],
+        ["USD", "10,687.53", "-241.88", "1.2860", "1.2814",
+         "-95.19", "0.00", "0.00", "0.00", "-95.19", ""],
+        ["Total Forex", "", "", "", "",
+         "-95.19", "0.00", "0.00", "0.00", "-95.19", ""],
+        ["Total (All Assets)", "", "", "", "",
+         "-2,163.81", "111.44", "-6.12", "0.05", "-2,058.45", ""],
+    ]
+
+
+class TestExtractMtmCurrent:
+    def test_extracts_stocks_with_nonzero_qty(self):
+        from src.parser import _extract_mtm_current
+
+        rows = _mtm_rows()
+        result = _extract_mtm_current(rows)
+        symbols = {r["symbol"] for r in result}
+
+        # AAPL(100), SOFI(400), MSFT(50) have current qty != 0
+        # ACWX(0) should be excluded
+        assert "AAPL" in symbols
+        assert "SOFI" in symbols
+        assert "MSFT" in symbols
+        assert "ACWX" not in symbols
+
+    def test_extracts_correct_quantities(self):
+        from src.parser import _extract_mtm_current
+
+        rows = _mtm_rows()
+        result = _extract_mtm_current(rows)
+        by_sym = {r["symbol"]: r for r in result}
+
+        assert by_sym["SOFI"]["quantity"] == Decimal("400")
+        assert by_sym["AAPL"]["quantity"] == Decimal("100")
+
+    def test_extracts_options_with_nonzero_qty(self):
+        from src.parser import _extract_mtm_current
+
+        rows = _mtm_rows()
+        result = _extract_mtm_current(rows)
+        by_sym = {r["symbol"]: r for r in result}
+
+        assert "EEM 31MAR26 48 C" in by_sym
+        assert by_sym["EEM 31MAR26 48 C"]["quantity"] == Decimal("6")
+        assert "SOFI 01MAY26 19 C" in by_sym
+        assert by_sym["SOFI 01MAY26 19 C"]["quantity"] == Decimal("-2")
+
+    def test_tracks_asset_class(self):
+        from src.parser import _extract_mtm_current
+
+        rows = _mtm_rows()
+        result = _extract_mtm_current(rows)
+        by_sym = {r["symbol"]: r for r in result}
+
+        assert by_sym["SOFI"]["asset_class"] == "STK"
+        assert by_sym["EEM 31MAR26 48 C"]["asset_class"] == "OPT"
+
+    def test_skips_forex(self):
+        from src.parser import _extract_mtm_current
+
+        rows = _mtm_rows()
+        result = _extract_mtm_current(rows)
+        symbols = {r["symbol"] for r in result}
+        assert "USD" not in symbols
+
+    def test_extracts_market_price(self):
+        from src.parser import _extract_mtm_current
+
+        rows = _mtm_rows()
+        result = _extract_mtm_current(rows)
+        by_sym = {r["symbol"]: r for r in result}
+
+        assert by_sym["SOFI"]["market_price"] == Decimal("16.56")
+        assert by_sym["AAPL"]["market_price"] == Decimal("180.00")
+
+
+class TestCrossCheckPositions:
+    """parse_statement should cross-check Open Positions against MTM and
+    fill in any gaps with fallback positions from MTM data."""
+
+    def test_missing_position_filled_from_mtm(self):
+        """If SOFI appears in MTM (qty 400) but not in Open Positions,
+        a fallback position should be created from MTM data."""
+        from src.parser import _cross_check_positions, _extract_mtm_current
+
+        # Open Positions parsed AAPL and MSFT but missed SOFI
+        open_positions = [
+            Position(
+                symbol="AAPL", asset_class="STK", quantity=Decimal("100"),
+                cost_basis=Decimal("15000"), market_price=Decimal("180"),
+                market_value=Decimal("18000"), unrealized_pnl=Decimal("3000"),
+                currency="USD", statement_date=date(2026, 3, 25),
+            ),
+            Position(
+                symbol="MSFT", asset_class="STK", quantity=Decimal("50"),
+                cost_basis=Decimal("20000"), market_price=Decimal("420"),
+                market_value=Decimal("21000"), unrealized_pnl=Decimal("1000"),
+                currency="USD", statement_date=date(2026, 3, 25),
+            ),
+        ]
+
+        mtm = _extract_mtm_current(_mtm_rows())
+
+        filled, warnings = _cross_check_positions(
+            open_positions, mtm, period_end=date(2026, 3, 25),
+        )
+
+        symbols = {p.symbol for p in filled}
+        assert "SOFI" in symbols, f"SOFI not filled from MTM. Got: {symbols}"
+        sofi = [p for p in filled if p.symbol == "SOFI"][0]
+        assert sofi.quantity == Decimal("400")
+        assert sofi.market_price == Decimal("16.56")
+        assert sofi.asset_class == "STK"
+        assert len(warnings) >= 1  # should warn about SOFI
+
+    def test_no_false_positives_when_all_present(self):
+        """If all MTM symbols already exist in Open Positions, no extras added."""
+        from src.parser import _cross_check_positions, _extract_mtm_current
+
+        open_positions = [
+            Position(
+                symbol="AAPL", asset_class="STK", quantity=Decimal("100"),
+                cost_basis=Decimal("15000"), market_price=Decimal("180"),
+                market_value=Decimal("18000"), unrealized_pnl=Decimal("3000"),
+                currency="USD", statement_date=date(2026, 3, 25),
+            ),
+            Position(
+                symbol="SOFI", asset_class="STK", quantity=Decimal("400"),
+                cost_basis=Decimal("10472"), market_price=Decimal("16.56"),
+                market_value=Decimal("6624"), unrealized_pnl=Decimal("-3848"),
+                currency="USD", statement_date=date(2026, 3, 25),
+            ),
+            Position(
+                symbol="MSFT", asset_class="STK", quantity=Decimal("50"),
+                cost_basis=Decimal("20000"), market_price=Decimal("420"),
+                market_value=Decimal("21000"), unrealized_pnl=Decimal("1000"),
+                currency="USD", statement_date=date(2026, 3, 25),
+            ),
+            Position(
+                symbol="EEM 31MAR26 48 C", asset_class="OPT",
+                quantity=Decimal("6"), cost_basis=Decimal("4454"),
+                market_price=Decimal("9.47"), market_value=Decimal("5682"),
+                unrealized_pnl=Decimal("1228"), currency="USD",
+                statement_date=date(2026, 3, 25),
+                expiry=date(2026, 3, 31), strike=Decimal("48"), right="C",
+            ),
+            Position(
+                symbol="SOFI 01MAY26 19 C", asset_class="OPT",
+                quantity=Decimal("-2"), cost_basis=Decimal("0"),
+                market_price=Decimal("0.565"), market_value=Decimal("-113"),
+                unrealized_pnl=Decimal("-113"), currency="USD",
+                statement_date=date(2026, 3, 25),
+                expiry=date(2026, 5, 1), strike=Decimal("19"), right="C",
+            ),
+        ]
+
+        mtm = _extract_mtm_current(_mtm_rows())
+        filled, warnings = _cross_check_positions(
+            open_positions, mtm, period_end=date(2026, 3, 25),
+        )
+
+        assert len(filled) == len(open_positions)
+        assert len(warnings) == 0
+
+    def test_option_missing_filled_with_parsed_fields(self):
+        """A missing option position should include expiry/strike/right from
+        the symbol parsing."""
+        from src.parser import _cross_check_positions, _extract_mtm_current
+
+        mtm = _extract_mtm_current(_mtm_rows())
+        # No open positions at all — everything should be filled from MTM
+        filled, warnings = _cross_check_positions(
+            [], mtm, period_end=date(2026, 3, 25),
+        )
+
+        eem = [p for p in filled if "EEM" in p.symbol]
+        assert len(eem) == 1
+        assert eem[0].asset_class == "OPT"
+        assert eem[0].expiry == date(2026, 3, 31)
+        assert eem[0].strike == Decimal("48")
+        assert eem[0].right == "C"
 
 
 # ── End-to-end: parse_statement with mocked extraction ───────────────────────

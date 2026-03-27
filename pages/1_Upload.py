@@ -56,6 +56,21 @@ if uploaded is not None:
         col2.metric("Trades", len(parsed.trades))
         col3.metric("Skipped rows", len(parsed.skipped_rows))
 
+        # Warn about positions that appear in trades but not in positions
+        trade_symbols = {t.symbol for t in parsed.trades}
+        # For options, extract the underlying ticker from "SOFI 01MAY26 19 C" → "SOFI"
+        trade_underlyings = {s.split()[0] for s in trade_symbols}
+        position_symbols = {p.symbol for p in parsed.positions}
+        position_underlyings = {s.split()[0] for s in position_symbols}
+        traded_but_missing = trade_underlyings - position_underlyings
+        if traded_but_missing:
+            st.warning(
+                f"**Possible missing positions:** The following symbols appear in "
+                f"trades but have no matching open position: "
+                f"**{', '.join(sorted(traded_but_missing))}**. "
+                f"Check that these are not still held."
+            )
+
         # Preview positions
         if parsed.positions:
             with st.expander("Preview positions", expanded=False):
