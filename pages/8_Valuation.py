@@ -157,6 +157,7 @@ all_growth: dict[str, dict] = {}
 all_percentiles: dict[str, dict] = {}
 all_scores: dict[str, tuple] = {}
 missing_prices: list[str] = []
+_valuation_diag: dict[str, dict] = {}  # per-symbol diagnostics
 
 for sym in symbols_with_data:
     # Latest price
@@ -216,10 +217,7 @@ for sym in symbols_with_data:
 
     # Get price history and metric history for percentile computation
     prices = get_daily_prices(sym, date_from=pct_start)
-    _diag_prices_count = len(prices) if prices else 0
-    _diag_metric_keys: list[str] = []
-    _diag_hist_ratios_count = 0
-    _diag_hist_values_counts: dict[str, int] = {}
+    _sym_diag: dict = {"prices": len(prices) if prices else 0}
     if prices:
         metric_hist: dict[str, list[dict]] = {}
         for m_name in ("shares_outstanding", "stockholders_equity", "total_assets",
@@ -228,29 +226,24 @@ for sym in symbols_with_data:
             rows = get_stock_metrics(symbol=sym, metric_name=m_name)
             if rows:
                 metric_hist[m_name] = sorted(rows, key=lambda r: str(r.get("period_end", "")))
-        _diag_metric_keys = list(metric_hist.keys())
+        _sym_diag["metrics_present"] = list(metric_hist.keys())
+        _sym_diag["metrics_counts"] = {k: len(v) for k, v in metric_hist.items()}
 
         hist_ratios = compute_historical_ratios(metric_hist, prices)
-        _diag_hist_ratios_count = len(hist_ratios)
+        _sym_diag["hist_ratios"] = len(hist_ratios)
 
         for ratio_key in ("pe_ttm", "pb", "ps", "ev_ebitda"):
             hist_values = [r[ratio_key] for r in hist_ratios if r.get(ratio_key) is not None]
-            _diag_hist_values_counts[ratio_key] = len(hist_values)
+            _sym_diag[f"hist_{ratio_key}"] = len(hist_values)
             # Use the last historical observation as the canonical "current"
             # value so that ratios, percentiles, scores, and chart all agree.
             if hist_values:
                 ratios[ratio_key] = hist_values[-1]
             percentiles[ratio_key] = compute_percentile(ratios.get(ratio_key), hist_values)
 
-    # Warn when valuation percentiles are all None (debugging aid)
+    # Track diagnostic if valuation percentiles are all None
     if all(percentiles.get(k) is None for k in ("pe_ttm", "pb", "ps", "ev_ebitda")):
-        import logging as _log
-        _log.getLogger(__name__).warning(
-            "%s: all valuation percentiles None — prices=%d, metrics=%s, "
-            "hist_ratios=%d, hist_values=%s",
-            sym, _diag_prices_count, _diag_metric_keys,
-            _diag_hist_ratios_count, _diag_hist_values_counts,
-        )
+        _valuation_diag[sym] = _sym_diag
 
     all_percentiles[sym] = percentiles
 
@@ -268,34 +261,11 @@ if missing_prices:
     )
 
 # Show diagnostic for symbols with missing valuation percentiles
-_missing_val_syms = []
-for sym in [s for s in symbols_with_data if s in all_ratios]:
-    pcts = all_percentiles.get(sym, {})
-    if all(pcts.get(k) is None for k in ("pe_ttm", "pb", "ps", "ev_ebitda")):
-        _missing_val_syms.append(sym)
-if _missing_val_syms:
-    # Collect diagnostics per symbol
-    _diag_lines = []
-    for sym in _missing_val_syms:
-        # Check what data exists
-        _price_count = len(get_daily_prices(sym, date_from=pct_start) if pct_start else get_daily_prices(sym))
-        _so = get_stock_metrics(symbol=sym, metric_name="shares_outstanding")
-        _ni = get_stock_metrics(symbol=sym, metric_name="net_income")
-        _eps = get_stock_metrics(symbol=sym, metric_name="eps_diluted")
-        _rev = get_stock_metrics(symbol=sym, metric_name="revenue")
-        _eq = get_stock_metrics(symbol=sym, metric_name="stockholders_equity")
-        _diag_lines.append(
-            f"**{sym}**: prices={_price_count}, "
-            f"shares_outstanding={len(_so)}, "
-            f"net_income={len(_ni)}, eps_diluted={len(_eps)}, "
-            f"revenue={len(_rev)}, stockholders_equity={len(_eq)}"
-        )
-    with st.expander("⚠️ Valuation score missing — diagnostic info", expanded=True):
-        st.warning(
-            "These symbols have no valuation percentiles (all None). "
-            "This usually means `shares_outstanding` data is missing.\n\n"
-            + "\n\n".join(_diag_lines)
-        )
+if _valuation_diag:
+    with st.expander(f"⚠️ Valuation score missing for {', '.join(_valuation_diag.keys())}", expanded=True):
+        for _sym, _diag in _valuation_diag.items():
+            st.markdown(f"**{_sym}**:")
+            st.json(_diag)
 
 scored_symbols = [s for s in symbols_with_data if s in all_ratios]
 
