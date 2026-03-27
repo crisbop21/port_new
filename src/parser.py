@@ -308,6 +308,7 @@ def _extract_meta(rows: list[list[str]]) -> StatementMeta:
 
 POSITION_COL_MAP: dict[str, str] = {
     "symbol": "symbol",
+    "description": "symbol",  # continuation pages use "Description" header
     "quantity": "quantity",
     "cost basis": "cost_basis",
     "close price": "market_price",
@@ -317,6 +318,7 @@ POSITION_COL_MAP: dict[str, str] = {
 
 TRADE_COL_MAP: dict[str, str] = {
     "symbol": "symbol",
+    "description": "symbol",  # continuation pages use "Description" header
     "date/time": "trade_date",
     "quantity": "quantity",
     "t. price": "price",

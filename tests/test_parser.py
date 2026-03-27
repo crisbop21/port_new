@@ -277,6 +277,63 @@ class TestExtractPositions:
         positions, _ = _extract_positions(rows, date(2026, 3, 6))
         assert len(positions) == 3  # futures skipped
 
+    def test_description_column_header_on_continuation_page(self):
+        """IBKR PDFs use 'Description' instead of 'Symbol' on continuation pages.
+
+        If the parser doesn't map 'Description' → symbol, all positions on
+        that page are silently dropped because symbol="" → skipped.
+        """
+        rows = [
+            ["Open Positions", "", "", "", "", "", "", "", ""],
+            ["Symbol", "Quantity", "Mult", "Cost Price", "Cost Basis",
+             "Close Price", "Value", "Unrealized P/L", "Code"],
+            ["Stocks", "", "", "", "", "", "", "", ""],
+            ["USD", "", "", "", "", "", "", "", ""],
+            ["AAPL", "100", "1", "150.00", "15,000.00",
+             "175.50", "17,550.00", "2,550.00", ""],
+            ["Total", "", "", "", "15,000.00", "", "17,550.00", "2,550.00", ""],
+            # ── Page break: continuation uses "Description" header ──
+            ["Description", "Quantity", "Mult", "Cost Price", "Cost Basis",
+             "Close Price", "Value", "Unrealized P/L", "Code"],
+            ["Stocks", "", "", "", "", "", "", "", ""],
+            ["USD", "", "", "", "", "", "", "", ""],
+            ["SOFI", "200", "1", "10.00", "2,000.00",
+             "15.25", "3,050.00", "1,050.00", ""],
+            ["Total", "", "", "", "2,000.00", "", "3,050.00", "1,050.00", ""],
+        ]
+        positions, skipped = _extract_positions(rows, date(2026, 3, 6))
+        symbols = [p.symbol for p in positions]
+        assert "SOFI" in symbols, (
+            f"SOFI missing from parsed positions: {symbols}. "
+            "'Description' column header on continuation page causes symbol to not be mapped."
+        )
+        assert len(positions) == 2  # AAPL + SOFI
+
+    def test_description_header_without_asset_class_reemission(self):
+        """Continuation page with 'Description' header but NO asset-class
+        sub-header re-emission — current_asset_class should be retained."""
+        rows = [
+            ["Open Positions", "", "", "", "", "", "", "", ""],
+            ["Symbol", "Quantity", "Mult", "Cost Price", "Cost Basis",
+             "Close Price", "Value", "Unrealized P/L", "Code"],
+            ["Stocks", "", "", "", "", "", "", "", ""],
+            ["USD", "", "", "", "", "", "", "", ""],
+            ["AAPL", "100", "1", "150.00", "15,000.00",
+             "175.50", "17,550.00", "2,550.00", ""],
+            # ── Page break: Description header, NO Stocks/USD re-emission ──
+            ["Description", "Quantity", "Mult", "Cost Price", "Cost Basis",
+             "Close Price", "Value", "Unrealized P/L", "Code"],
+            ["SOFI", "200", "1", "10.00", "2,000.00",
+             "15.25", "3,050.00", "1,050.00", ""],
+        ]
+        positions, _ = _extract_positions(rows, date(2026, 3, 6))
+        symbols = [p.symbol for p in positions]
+        assert "SOFI" in symbols, (
+            f"SOFI missing: {symbols}. Continuation page without asset-class "
+            "re-emission should retain current_asset_class."
+        )
+        assert len(positions) == 2
+
 
 class TestExtractTrades:
     def test_buy_trade(self):
