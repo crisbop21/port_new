@@ -335,6 +335,79 @@ class TestExtractPositions:
         assert len(positions) == 2
 
 
+    def test_many_positions_across_continuation_pages(self):
+        """Simulate a real IBKR statement with 25+ stocks across pages.
+
+        Page 1: Open Positions header, Stocks, first batch of symbols.
+        Page 2: Continuation with "Description" header (no Stocks re-emission).
+        All positions — including SOFI on page 2 — must be parsed.
+        """
+        rows = [
+            ["Open Positions", "", "", "", "", "", "", "", ""],
+            # Page 1 column header
+            ["Symbol", "Quantity", "Mult", "Cost Price", "Cost Basis",
+             "Close Price", "Value", "Unrealized P/L", "Code"],
+            ["Stocks", "", "", "", "", "", "", "", ""],
+            ["USD", "", "", "", "", "", "", "", ""],
+            # First batch of stocks
+            ["AMZN", "35", "1", "226.30", "7,920.43",
+             "213.21", "7,462.35", "-458.08", ""],
+            ["GOOG", "20", "1", "313.80", "6,276.00",
+             "289.59", "5,791.80", "-484.20", ""],
+            ["META", "8", "1", "660.10", "5,280.80",
+             "504.89", "4,039.12", "-1,241.68", ""],
+            ["NFLX", "25", "1", "0.00", "0.00",
+             "92.28", "2,307.00", "2,307.00", ""],
+            ["PYPL", "20", "1", "58.38", "1,167.60",
+             "0.00", "0.00", "-1,167.60", ""],
+            ["RKLB", "10", "1", "69.76", "697.60",
+             "0.00", "0.00", "-697.60", ""],
+            ["Total", "", "", "", "21,342.43", "", "19,600.27", "-1,742.16", ""],
+            # ── Page break: continuation with Description header ──
+            ["Description", "Quantity", "Mult", "Cost Price", "Cost Basis",
+             "Close Price", "Value", "Unrealized P/L", "Code"],
+            # No "Stocks" re-emission — retains STK from page 1
+            ["SNDK", "0", "1", "0.00", "0.00",
+             "0.00", "0.00", "0.00", ""],
+            ["SOFI", "400", "1", "26.18", "10,472.00",
+             "16.56", "6,624.00", "-3,848.00", ""],
+            ["SPGI", "6", "1", "0.00", "0.00",
+             "408.48", "2,450.88", "2,450.88", ""],
+            ["VALE", "100", "1", "0.00", "0.00",
+             "15.14", "1,514.00", "1,514.00", ""],
+            ["XLE", "40", "1", "0.00", "0.00",
+             "60.57", "2,422.80", "2,422.80", ""],
+            ["Total", "", "", "", "10,472.00", "", "13,011.68", "2,539.68", ""],
+            ["Total in SGD", "", "", "", "", "", "30,000.00", "800.00", ""],
+            # Options follow
+            ["Symbol", "Quantity", "Mult", "Cost Price", "Cost Basis",
+             "Close Price", "Value", "Unrealized P/L", "Code"],
+            ["Equity and Index Options", "", "", "", "", "", "", "", ""],
+            ["USD", "", "", "", "", "", "", "", ""],
+            ["EEM 31MAR26 48 C", "6", "100", "7.42", "4,454.46",
+             "9.47", "5,680.92", "1,226.46", ""],
+            ["Total", "", "", "", "4,454.46", "", "5,680.92", "1,226.46", ""],
+        ]
+        positions, skipped = _extract_positions(rows, date(2026, 3, 25))
+        symbols = [p.symbol for p in positions]
+
+        # All positions must be present — especially SOFI
+        assert "SOFI" in symbols, (
+            f"SOFI missing from parsed positions: {symbols}"
+        )
+        assert "AMZN" in symbols
+        assert "VALE" in symbols
+        assert "XLE" in symbols
+        # 6 stocks page 1 + 5 stocks page 2 + 1 option = 12
+        assert len(positions) == 12
+        # SOFI values must match PDF
+        sofi = [p for p in positions if p.symbol == "SOFI"][0]
+        assert sofi.quantity == Decimal("400")
+        assert sofi.cost_basis == Decimal("10472.00")
+        assert sofi.market_value == Decimal("6624.00")
+        assert sofi.asset_class == "STK"
+
+
 class TestExtractTrades:
     def test_buy_trade(self):
         rows = _trade_rows()
