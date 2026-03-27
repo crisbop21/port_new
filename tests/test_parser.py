@@ -436,6 +436,83 @@ class TestExtractTrades:
         trades, _ = _extract_trades(rows)
         assert len(trades) == 2  # only data rows, not Total AAPL etc.
 
+    def test_option_sell_trades_parsed(self):
+        """Sell-to-open (write) option trades must be parsed correctly.
+
+        SOFI call sells have negative quantity → side=SLD, quantity=abs(qty).
+        The option symbol must parse into expiry/strike/right.
+        """
+        rows = [
+            ["Trades", "", "", "", "", "", "", "", "", "", "", "", ""],
+            ["Symbol", "Date/Time", "", "Quantity", "T. Price", "C. Price",
+             "Proceeds", "Comm/Fee", "Basis", "Realized P/L", "", "MTM P/L", "Code"],
+            ["Equity and Index Options", "", "", "", "", "", "", "", "", "", "", "", ""],
+            ["USD", "", "", "", "", "", "", "", "", "", "", "", ""],
+            ["SOFI 01MAY26 19 C", "2026-03-20,\n10:30:00", "", "-2", "1.50", "1.40",
+             "300.00", "-2.60", "0.00", "0.00", "", "-20.00", "O"],
+            ["Total SOFI 01MAY26 19 C", "", "", "-2", "", "", "300.00", "-2.60",
+             "0.00", "0.00", "", "-20.00", ""],
+            ["SOFI 18DEC26 20 C", "2026-03-20,\n11:00:00", "", "-2", "5.00", "4.80",
+             "1,000.00", "-2.60", "0.00", "0.00", "", "-40.00", "O"],
+            ["Total SOFI 18DEC26 20 C", "", "", "-2", "", "", "1,000.00", "-2.60",
+             "0.00", "0.00", "", "-40.00", ""],
+            ["Total", "", "", "", "", "", "1,300.00", "-5.20",
+             "0.00", "0.00", "", "-60.00", ""],
+        ]
+        trades, skipped = _extract_trades(rows)
+
+        assert len(skipped) == 0, f"Skipped rows: {skipped}"
+        assert len(trades) == 2
+
+        sofi_may = [t for t in trades if "01MAY26" in t.symbol][0]
+        assert sofi_may.side == "SLD"
+        assert sofi_may.quantity == Decimal("2")
+        assert sofi_may.price == Decimal("1.50")
+        assert sofi_may.asset_class == "OPT"
+        assert sofi_may.expiry == date(2026, 5, 1)
+        assert sofi_may.strike == Decimal("19")
+        assert sofi_may.right == "C"
+
+        sofi_dec = [t for t in trades if "18DEC26" in t.symbol][0]
+        assert sofi_dec.side == "SLD"
+        assert sofi_dec.quantity == Decimal("2")
+        assert sofi_dec.expiry == date(2026, 12, 18)
+        assert sofi_dec.strike == Decimal("20")
+
+    def test_option_trades_on_description_continuation_page(self):
+        """Option trades on a continuation page with Description header."""
+        rows = [
+            ["Trades", "", "", "", "", "", "", "", "", "", "", "", ""],
+            ["Symbol", "Date/Time", "", "Quantity", "T. Price", "C. Price",
+             "Proceeds", "Comm/Fee", "Basis", "Realized P/L", "", "MTM P/L", "Code"],
+            ["Stocks", "", "", "", "", "", "", "", "", "", "", "", ""],
+            ["USD", "", "", "", "", "", "", "", "", "", "", "", ""],
+            ["AAPL", "2026-01-15,\n10:30:00", "", "50", "175.00", "176.00",
+             "-8,750.00", "-1.09", "8,751.09", "0.00", "", "-50.00", "O"],
+            ["Total", "", "", "", "", "", "-8,750.00", "-1.09",
+             "8,751.09", "0.00", "", "-50.00", ""],
+            # ── Page break: continuation page with Description header ──
+            ["Description", "Date/Time", "", "Quantity", "T. Price", "C. Price",
+             "Proceeds", "Comm/Fee", "Basis", "Realized P/L", "", "MTM P/L", "Code"],
+            ["Equity and Index Options", "", "", "", "", "", "", "", "", "", "", "", ""],
+            ["USD", "", "", "", "", "", "", "", "", "", "", "", ""],
+            ["SOFI 01MAY26 19 C", "2026-03-20,\n10:30:00", "", "-2", "1.50", "1.40",
+             "300.00", "-2.60", "0.00", "0.00", "", "-20.00", "O"],
+            ["Total", "", "", "", "", "", "300.00", "-2.60",
+             "0.00", "0.00", "", "-20.00", ""],
+        ]
+        trades, skipped = _extract_trades(rows)
+
+        assert len(skipped) == 0, f"Skipped rows: {skipped}"
+        assert len(trades) == 2  # AAPL stock + SOFI option
+
+        sofi_trade = [t for t in trades if "SOFI" in t.symbol][0]
+        assert sofi_trade.side == "SLD"
+        assert sofi_trade.asset_class == "OPT"
+        assert sofi_trade.expiry == date(2026, 5, 1)
+        assert sofi_trade.strike == Decimal("19")
+        assert sofi_trade.right == "C"
+
 
 # ── End-to-end: parse_statement with mocked extraction ───────────────────────
 

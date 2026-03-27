@@ -738,6 +738,41 @@ class TestReconcilePair:
         assert len(result["gaps"]["missing_from_target"]) == 1
         assert result["gaps"]["missing_from_target"][0]["symbol"] == "TSLA"
 
+    @patch("src.db.get_trades_between")
+    @patch("src.db.get_positions_as_of")
+    def test_sold_call_option_reconciles(self, mock_pos, mock_trades):
+        """Selling-to-open (writing) a call results in negative qty.
+
+        Base: no SOFI options.
+        Trade: SLD 2 SOFI 01MAY26 19 C.
+        Target: SOFI 01MAY26 19 C qty = -2 (short position).
+        """
+        from src.db import reconcile_pair
+
+        def _positions(account_id, as_of_date):
+            if as_of_date == date(2026, 1, 31):
+                return []  # no options in base
+            # Target has short call position
+            return [{"symbol": "SOFI 01MAY26 19 C", "asset_class": "OPT",
+                     "quantity": "-2",
+                     "expiry": "2026-05-01", "strike": "19", "right": "C"}]
+
+        mock_pos.side_effect = _positions
+        mock_trades.return_value = [
+            {"symbol": "SOFI 01MAY26 19 C", "asset_class": "OPT",
+             "side": "SLD", "quantity": "2", "price": "1.50",
+             "trade_date": "2026-03-20T10:30:00",
+             "expiry": "2026-05-01", "strike": "19", "right": "C"},
+        ]
+
+        result = reconcile_pair("ACCT1", date(2026, 1, 31), date(2026, 3, 25))
+        sofi = result["holdings"]["SOFI 01MAY26 19 C"]
+        assert sofi["base_qty"] == "0"
+        assert sofi["reconstructed_qty"] == "-2"
+        assert sofi["expected_qty"] == "-2"
+        assert sofi["match"] is True
+        assert result["ok"] is True
+
 
 # ── reconcile_account tests ──────────────────────────────────────────────
 
