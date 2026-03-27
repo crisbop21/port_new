@@ -335,6 +335,58 @@ class TestExtractPositions:
         assert len(positions) == 2
 
 
+    def test_unknown_first_column_header_still_maps_symbol(self):
+        """If the continuation page header has an unknown first cell (not
+        'Symbol' or 'Description'), the parser should still map column 0
+        to symbol via force-mapping and detect the row as a header via
+        keyword matching (Quantity, Cost Basis, etc.)."""
+        rows = [
+            ["Open Positions", "", "", "", "", "", "", "", ""],
+            ["Symbol", "Quantity", "Mult", "Cost Price", "Cost Basis",
+             "Close Price", "Value", "Unrealized P/L", "Code"],
+            ["Stocks", "", "", "", "", "", "", "", ""],
+            ["USD", "", "", "", "", "", "", "", ""],
+            ["AAPL", "100", "1", "150.00", "15,000.00",
+             "175.50", "17,550.00", "2,550.00", ""],
+            ["Total", "", "", "", "15,000.00", "", "17,550.00", "2,550.00", ""],
+            # ── Continuation page with unexpected first column name ──
+            ["Financial Instrument", "Quantity", "Mult", "Cost Price", "Cost Basis",
+             "Close Price", "Value", "Unrealized P/L", "Code"],
+            ["SOFI", "400", "1", "26.18", "10,472.00",
+             "16.56", "6,624.00", "-3,848.00", ""],
+            ["Total", "", "", "", "10,472.00", "", "6,624.00", "-3,848.00", ""],
+        ]
+        positions, _ = _extract_positions(rows, date(2026, 3, 25))
+        symbols = [p.symbol for p in positions]
+        assert "SOFI" in symbols, (
+            f"SOFI missing: {symbols}. Unknown header label should still "
+            "map column 0 to symbol."
+        )
+        assert len(positions) == 2
+
+    def test_completely_unknown_header_force_maps_col0(self):
+        """Even if the first column header is something totally unexpected
+        like 'Ticker', the force-mapping ensures col 0 → symbol."""
+        rows = [
+            ["Open Positions", "", "", "", "", "", "", "", ""],
+            ["Symbol", "Quantity", "Mult", "Cost Price", "Cost Basis",
+             "Close Price", "Value", "Unrealized P/L", "Code"],
+            ["Stocks", "", "", "", "", "", "", "", ""],
+            ["USD", "", "", "", "", "", "", "", ""],
+            ["AAPL", "100", "1", "150.00", "15,000.00",
+             "175.50", "17,550.00", "2,550.00", ""],
+            # ── Continuation: "Ticker" not in any map, but "Quantity" etc. detected ──
+            ["Ticker", "Quantity", "Mult", "Cost Price", "Cost Basis",
+             "Close Price", "Value", "Unrealized P/L", "Code"],
+            ["SOFI", "400", "1", "26.18", "10,472.00",
+             "16.56", "6,624.00", "-3,848.00", ""],
+        ]
+        positions, _ = _extract_positions(rows, date(2026, 3, 25))
+        symbols = [p.symbol for p in positions]
+        assert "SOFI" in symbols, (
+            f"SOFI missing: {symbols}. 'Ticker' header should be force-mapped."
+        )
+
     def test_many_positions_across_continuation_pages(self):
         """Simulate a real IBKR statement with 25+ stocks across pages.
 

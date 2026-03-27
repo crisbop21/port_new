@@ -176,12 +176,31 @@ def _is_section_header(row: list[str]) -> str | None:
     return None
 
 
+# Column names that positively identify a header row (case-insensitive).
+_HEADER_FIRST_CELL: set[str] = {"Symbol", "Description", "Financial Instrument"}
+_HEADER_KEYWORDS: set[str] = {
+    "quantity", "cost basis", "close price", "value", "unrealized p/l",
+    "market price", "market value", "position", "cost price", "current price",
+    "unrealized p&l",
+}
+
+
 def _is_column_header(row: list[str]) -> bool:
-    """Detect column header rows (start with 'Symbol' or 'Description')."""
+    """Detect column header rows.
+
+    Matches if the first cell is a known header label ("Symbol", "Description",
+    etc.) OR if the row contains at least 2 known column keywords — handles
+    continuation pages where the first column has an unexpected name.
+    """
     if not row or not row[0]:
         return False
     first = row[0].strip()
-    return first in ("Symbol", "Description")
+    if first in _HEADER_FIRST_CELL:
+        return True
+    # Fallback: count known column names in the row
+    lower_cells = {(c or "").strip().lower() for c in row}
+    hits = lower_cells & _HEADER_KEYWORDS
+    return len(hits) >= 2
 
 
 def _is_asset_class(row: list[str]) -> str | None:
@@ -309,32 +328,55 @@ def _extract_meta(rows: list[list[str]]) -> StatementMeta:
 POSITION_COL_MAP: dict[str, str] = {
     "symbol": "symbol",
     "description": "symbol",  # continuation pages use "Description" header
+    "financial instrument": "symbol",  # another IBKR header variant
     "quantity": "quantity",
+    "position": "quantity",  # some IBKR formats use "Position"
     "cost basis": "cost_basis",
+    "cost price": "cost_basis",  # sometimes used instead of "Cost Basis"
     "close price": "market_price",
+    "market price": "market_price",
+    "current price": "market_price",
     "value": "market_value",
+    "market value": "market_value",
     "unrealized p/l": "unrealized_pnl",
+    "unrealized p&l": "unrealized_pnl",
 }
 
 TRADE_COL_MAP: dict[str, str] = {
     "symbol": "symbol",
     "description": "symbol",  # continuation pages use "Description" header
+    "financial instrument": "symbol",
     "date/time": "trade_date",
     "quantity": "quantity",
     "t. price": "price",
+    "trade price": "price",
     "proceeds": "proceeds",
     "comm/fee": "commission",
+    "comm in sgd": "commission",
     "realized p/l": "realized_pnl",
+    "realized p&l": "realized_pnl",
 }
 
 
 def _map_columns(header_row: list[str], col_map: dict[str, str]) -> dict[int, str]:
-    """Map column indices to model field names."""
+    """Map column indices to model field names.
+
+    In IBKR PDFs the first column is always the symbol/description, so if the
+    first cell doesn't match any known key we still force-map it to "symbol".
+    """
     mapping: dict[int, str] = {}
     for i, col in enumerate(header_row):
         key = (col or "").strip().lower()
         if key in col_map:
             mapping[i] = col_map[key]
+    # Guarantee the first column maps to "symbol" — IBKR always puts the
+    # symbol/description in column 0 regardless of header label.
+    if 0 not in mapping and mapping:
+        mapping[0] = "symbol"
+        logger.info(
+            "Column 0 (%r) not in col_map — force-mapped to 'symbol'",
+            (header_row[0] or "").strip(),
+        )
     return mapping
 
 
