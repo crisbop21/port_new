@@ -355,8 +355,8 @@ def _extract_positions(
         section = _is_section_header(row)
         if section == "Open Positions":
             in_section = True
-            current_asset_class = None
-            col_mapping = {}
+            # Don't reset asset class/mapping — positions span multiple pages
+            # and the section header repeats without column headers
             continue
         elif section is not None and in_section:
             # Different section started → leave Open Positions
