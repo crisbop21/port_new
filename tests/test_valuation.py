@@ -158,6 +158,44 @@ class TestComputeHistoricalRatiosTTM:
                 f"P/S near FY2023 = {fy_result[0]['ps']} is too high (quarterly revenue bug?)"
 
 
+    def test_derives_shares_from_net_income_eps_when_missing(self):
+        """When shares_outstanding is absent, derive from net_income / eps_diluted."""
+        # No shares_outstanding provided — only net_income and eps_diluted
+        eps_rows = [
+            _make_metric_row("2023-03-31", 3.00, "Q1", 2023, duration_days=90),
+            _make_metric_row("2023-06-30", 3.00, "Q2", 2023, duration_days=90),
+            _make_metric_row("2023-09-30", 3.00, "Q3", 2023, duration_days=90),
+            _make_metric_row("2023-12-31", 12.00, "FY", 2023),
+        ]
+
+        net_income_rows = [
+            _make_metric_row("2023-03-31", 3_000, "Q1", 2023, duration_days=90),
+            _make_metric_row("2023-06-30", 3_000, "Q2", 2023, duration_days=90),
+            _make_metric_row("2023-09-30", 3_000, "Q3", 2023, duration_days=90),
+            _make_metric_row("2023-12-31", 12_000, "FY", 2023),
+        ]
+        # Derived shares = net_income / eps = 12_000 / 12 = 1_000
+
+        prices = [
+            _make_price_row("2024-01-02", 120.0),
+        ]
+
+        metric_hist = {
+            # NO "shares_outstanding" key
+            "eps_diluted": sorted(eps_rows, key=lambda r: r["period_end"]),
+            "net_income": sorted(net_income_rows, key=lambda r: r["period_end"]),
+        }
+
+        results = compute_historical_ratios(metric_hist, prices)
+
+        # Should produce results using derived shares (1_000)
+        assert len(results) > 0, "Should derive shares from net_income/eps and produce ratios"
+        # P/E = 120 / 12 = 10
+        pe_results = [r for r in results if r.get("pe_ttm") is not None]
+        assert len(pe_results) == 1
+        assert abs(pe_results[0]["pe_ttm"] - 10.0) < 0.01
+
+
 class TestComputePercentile:
     """Sanity checks for compute_percentile."""
 
