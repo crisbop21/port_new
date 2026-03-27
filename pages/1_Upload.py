@@ -29,15 +29,28 @@ if uploaded is not None:
     # Parse only once per file — store in session_state so the result
     # survives the rerun triggered by the "Save" button click.
     file_key = f"parsed_{uploaded.name}_{uploaded.size}"
-    if file_key not in st.session_state:
+    reparse_key = f"reparse_{uploaded.name}_{uploaded.size}"
+
+    if file_key not in st.session_state or st.session_state.get(reparse_key):
+        st.session_state.pop(reparse_key, None)
         with st.spinner("Parsing PDF..."):
             try:
+                uploaded.seek(0)
                 st.session_state[file_key] = parse_statement(uploaded)
             except Exception as e:
                 st.error(f"Failed to parse PDF: {e}")
                 st.stop()
 
     statements = st.session_state.get(file_key)
+
+    if st.button("🔄 Re-parse PDF"):
+        st.session_state[reparse_key] = True
+        # Also clear diagnostic cache so it re-runs
+        diag_k = f"diag_{uploaded.name}_{uploaded.size}"
+        st.session_state.pop(diag_k, None)
+        dup_k = f"dup_analysis_{uploaded.name}_{uploaded.size}"
+        st.session_state.pop(dup_k, None)
+        st.rerun()
 
     if not statements:
         st.warning("No accounts found in the PDF.")

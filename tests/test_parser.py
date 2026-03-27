@@ -416,6 +416,8 @@ class TestExtractPositions:
         positions, _ = _extract_positions(rows, date(2026, 3, 6))
         assert len(positions) == 3  # 2 stocks + 1 option
 
+    def test_multipage_positions_not_lost(self):
+        """When Open Positions spans pages, the header repeats — positions must not be lost."""
     def test_reentry_open_positions_retains_asset_class(self):
         """When 'Open Positions' appears again (page running header on
         continuation page), the parser must NOT reset current_asset_class.
@@ -463,19 +465,19 @@ class TestExtractPositions:
             ["USD", "", "", "", "", "", "", "", ""],
             ["AAPL", "100", "1", "150.00", "15,000.00",
              "175.50", "17,550.00", "2,550.00", ""],
-            ["Total", "", "", "", "15,000.00", "", "17,550.00", "2,550.00", ""],
-            # ── Page break ──
+            # Page break — header repeats
             ["Open Positions", "", "", "", "", "", "", "", ""],
-            ["Symbol", "Quantity", "Mult", "Cost Price", "Cost Basis",
-             "Close Price", "Value", "Unrealized P/L", "Code"],
-            ["USD", "", "", "", "", "", "", "", ""],
-            ["SOFI", "400", "1", "26.18", "10,472.00",
-             "16.56", "6,624.00", "-3,848.00", ""],
+            ["MSFT", "50", "1", "360.00", "18,000.00",
+             "400.00", "20,000.00", "2,000.00", ""],
+            ["NFLX", "60", "1", "85.98", "5,158.88",
+             "92.28", "5,536.80", "377.92", ""],
         ]
         positions, _ = _extract_positions(rows, date(2026, 3, 6))
         symbols = [p.symbol for p in positions]
-        assert "SOFI" in symbols
-        assert len(positions) == 2
+        assert "AAPL" in symbols
+        assert "MSFT" in symbols
+        assert "NFLX" in symbols
+        assert len(positions) == 3
 
     def test_unsupported_asset_class_skipped(self):
         extra = [

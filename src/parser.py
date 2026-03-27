@@ -494,6 +494,8 @@ def _extract_positions(
                 logger.debug("Skipping re-emitted Open Positions header")
                 continue
             in_section = True
+            # Don't reset asset class/mapping — positions span multiple pages
+            # and the section header repeats without column headers
             current_asset_class = None
             col_mapping = {}
             logger.debug("Entered Open Positions section")
