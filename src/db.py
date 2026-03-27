@@ -214,19 +214,10 @@ def check_duplicates(parsed: ParsedStatement) -> dict:
         else:
             new_trades += 1
 
-    # Position duplicates
-    existing_pos_fps = _get_existing_position_fingerprints(
-        meta.account_id, exclude_statement_id=existing_statement_id,
-    )
-    new_positions = 0
+    # Positions are always stored per-statement (no cross-statement dedup),
+    # so every position in the parsed statement is "new" for this statement.
+    new_positions = len(parsed.positions)
     dup_positions = 0
-    for p in parsed.positions:
-        row = _position_row(p, "dummy")
-        fp = _position_fingerprint(row)
-        if fp in existing_pos_fps:
-            dup_positions += 1
-        else:
-            new_positions += 1
 
     return {
         "new_trades": new_trades,
@@ -306,28 +297,19 @@ def upsert_statement(parsed: ParsedStatement) -> tuple[str, int]:
             "statement_id", statement_id
         ).execute()
 
-        # Insert positions — deduplicate against other statements
+        # Insert positions — each statement keeps its own complete snapshot.
+        # No cross-statement dedup: if another statement has the same position,
+        # we still store it here so that deleting/re-uploading another statement
+        # can never cause positions to vanish.
         positions_skipped = 0
         if parsed.positions:
-            existing_pos_fps = _get_existing_position_fingerprints(
-                meta.account_id, exclude_statement_id=statement_id,
-            )
-            pos_rows = []
-            for p in parsed.positions:
-                row = _position_row(p, statement_id)
-                fp = _position_fingerprint(row)
-                if fp in existing_pos_fps:
-                    positions_skipped += 1
-                    continue
-                pos_rows.append(row)
-
-            if pos_rows:
-                pos_result = client.table("positions").insert(pos_rows).execute()
-                if not pos_result.data:
-                    raise RuntimeError(
-                        f"Positions insert returned no data ({len(pos_rows)} rows sent). "
-                        "Check RLS policies on the 'positions' table."
-                    )
+            pos_rows = [_position_row(p, statement_id) for p in parsed.positions]
+            pos_result = client.table("positions").insert(pos_rows).execute()
+            if not pos_result.data:
+                raise RuntimeError(
+                    f"Positions insert returned no data ({len(pos_rows)} rows sent). "
+                    "Check RLS policies on the 'positions' table."
+                )
 
         # Insert trades — deduplicate against existing trades in other statements
         trades_skipped = 0

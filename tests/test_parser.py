@@ -16,10 +16,12 @@ from src.parser import (
     _extract_positions,
     _extract_trades,
     _is_total,
+    _merge_continuation_tables,
     _parse_datetime,
     _parse_option_symbol,
     _split_accounts,
     _to_decimal,
+    diagnose_positions,
     parse_statement,
 )
 
@@ -241,6 +243,153 @@ class TestSplitAccounts:
         assert len(groups) == 2
 
 
+# ── Continuation table merging ──────────────────────────────────────────────
+
+class TestMergeContinuationTables:
+    def test_headed_tables_unchanged(self):
+        """Tables that start with column headers are left as-is."""
+        tables = [
+            [
+                ["Symbol", "Quantity", "Value"],
+                ["AAPL", "100", "17550"],
+            ],
+            [
+                ["Symbol", "Quantity", "Value"],
+                ["MSFT", "50", "20000"],
+            ],
+        ]
+        merged = _merge_continuation_tables(tables)
+        assert len(merged) == 2
+
+    def test_headerless_continuation_merged(self):
+        """Table without column headers is merged into previous table."""
+        tables = [
+            [
+                ["Symbol", "Quantity", "Value"],
+                ["AAPL", "100", "17550"],
+            ],
+            [
+                # No "Symbol" header — this is a continuation
+                ["SOFI", "400", "6624"],
+                ["VALE", "100", "1514"],
+            ],
+        ]
+        merged = _merge_continuation_tables(tables)
+        assert len(merged) == 1
+        # header + AAPL from table 1, then SOFI + VALE appended
+        assert len(merged[0]) == 4
+
+    def test_continuation_columns_padded(self):
+        """Continuation table with fewer columns gets padded."""
+        tables = [
+            [
+                ["Symbol", "Quantity", "Mult", "Cost Price", "Value"],
+                ["AAPL", "100", "1", "150", "17550"],
+            ],
+            [
+                # Fewer columns — pdfplumber inferred different layout
+                ["SOFI", "400", "6624"],
+            ],
+        ]
+        merged = _merge_continuation_tables(tables)
+        assert len(merged) == 1
+        sofi_row = merged[0][-1]
+        assert len(sofi_row) == 5  # padded to match header table
+
+    def test_continuation_columns_trimmed(self):
+        """Continuation table with more columns gets trimmed."""
+        tables = [
+            [
+                ["Symbol", "Quantity", "Value"],
+                ["AAPL", "100", "17550"],
+            ],
+            [
+                ["SOFI", "400", "6624", "extra1", "extra2"],
+            ],
+        ]
+        merged = _merge_continuation_tables(tables)
+        assert len(merged) == 1
+        sofi_row = merged[0][-1]
+        assert len(sofi_row) == 3  # trimmed to match
+
+    def test_section_header_starts_new_table(self):
+        """A table starting with a section header is NOT a continuation."""
+        tables = [
+            [
+                ["Symbol", "Quantity", "Value"],
+                ["AAPL", "100", "17550"],
+            ],
+            [
+                ["Trades", "", ""],
+                ["Symbol", "Date/Time", "Quantity"],
+                ["AAPL", "2026-01-15", "50"],
+            ],
+        ]
+        merged = _merge_continuation_tables(tables)
+        assert len(merged) == 2  # separate tables
+
+    def test_asset_class_header_starts_new_group(self):
+        """A table starting with an asset class header is NOT a continuation."""
+        tables = [
+            [
+                ["Symbol", "Quantity", "Value"],
+                ["AAPL", "100", "17550"],
+            ],
+            [
+                ["Equity and Index Options", "", ""],
+                ["EEM 31MAR26 48 C", "6", "5806"],
+            ],
+        ]
+        merged = _merge_continuation_tables(tables)
+        assert len(merged) == 2
+
+    def test_open_positions_reemission_creates_separate_tables(self):
+        """'Open Positions' re-emitted on page break creates separate headed tables.
+
+        Both are section headers, so each starts its own table. The
+        _extract_positions function handles re-emitted headers by retaining
+        state (asset class, column mapping) across re-emissions.
+        """
+        tables = [
+            [
+                ["Open Positions", "", "", "", ""],
+                ["Symbol", "Quantity", "Mult", "Value", "Code"],
+                ["Stocks", "", "", "", ""],
+                ["AAPL", "100", "1", "17550", ""],
+            ],
+            [
+                # Page header re-emits Open Positions — new headed table
+                ["Open Positions", "", "", "", ""],
+                ["Symbol", "Quantity", "Mult", "Value", "Code"],
+                ["SOFI", "400", "1", "6624", ""],
+            ],
+        ]
+        merged = _merge_continuation_tables(tables)
+        # Each Open Positions starts a new headed table
+        assert len(merged) == 2
+        # But when flattened, _extract_positions handles both correctly
+        all_rows = [row for table in merged for row in table]
+        positions, _ = _extract_positions(all_rows, date(2026, 3, 6))
+        symbols = [p.symbol for p in positions]
+        assert "AAPL" in symbols
+        assert "SOFI" in symbols
+
+    def test_empty_table_ignored(self):
+        """Empty tables should be skipped."""
+        tables = [
+            [
+                ["Symbol", "Quantity"],
+                ["AAPL", "100"],
+            ],
+            [],
+            [
+                ["SOFI", "400"],
+            ],
+        ]
+        merged = _merge_continuation_tables(tables)
+        assert len(merged) == 1
+
+
 # ── Position extraction ──────────────────────────────────────────────────────
 
 class TestExtractPositions:
@@ -269,6 +418,45 @@ class TestExtractPositions:
 
     def test_multipage_positions_not_lost(self):
         """When Open Positions spans pages, the header repeats — positions must not be lost."""
+    def test_reentry_open_positions_retains_asset_class(self):
+        """When 'Open Positions' appears again (page running header on
+        continuation page), the parser must NOT reset current_asset_class.
+
+        Real IBKR PDFs repeat the section header as a page running header
+        on every page. Without this fix, all positions on continuation
+        pages are silently dropped.
+        """
+        rows = [
+            ["Open Positions", "", "", "", "", "", "", "", ""],
+            ["Symbol", "Quantity", "Mult", "Cost Price", "Cost Basis",
+             "Close Price", "Value", "Unrealized P/L", "Code"],
+            ["Stocks", "", "", "", "", "", "", "", ""],
+            ["USD", "", "", "", "", "", "", "", ""],
+            ["AAPL", "100", "1", "150.00", "15,000.00",
+             "175.50", "17,550.00", "2,550.00", ""],
+            ["Total", "", "", "", "15,000.00", "", "17,550.00", "2,550.00", ""],
+            # ── Page break: running header re-emits "Open Positions" ──
+            ["Open Positions", "", "", "", "", "", "", "", ""],
+            ["Symbol", "Quantity", "Mult", "Cost Price", "Cost Basis",
+             "Close Price", "Value", "Unrealized P/L", "Code"],
+            # No "Stocks" re-emission — asset class must carry forward
+            ["SOFI", "400", "1", "26.18", "10,472.00",
+             "16.56", "6,624.00", "-3,848.00", ""],
+            ["Total", "", "", "", "10,472.00", "", "6,624.00", "-3,848.00", ""],
+        ]
+        positions, skipped = _extract_positions(rows, date(2026, 3, 6))
+        symbols = [p.symbol for p in positions]
+        assert "SOFI" in symbols, (
+            f"SOFI missing: {symbols}. Re-entering Open Positions reset "
+            "current_asset_class, dropping continuation page positions."
+        )
+        assert len(positions) == 2
+        sofi = [p for p in positions if p.symbol == "SOFI"][0]
+        assert sofi.asset_class == "STK"
+        assert sofi.quantity == Decimal("400")
+
+    def test_reentry_open_positions_with_currency_no_asset_class(self):
+        """Continuation page with Open Positions + currency but no asset class."""
         rows = [
             ["Open Positions", "", "", "", "", "", "", "", ""],
             ["Symbol", "Quantity", "Mult", "Cost Price", "Cost Basis",
@@ -290,6 +478,19 @@ class TestExtractPositions:
         assert "MSFT" in symbols
         assert "NFLX" in symbols
         assert len(positions) == 3
+            ["Total", "", "", "", "15,000.00", "", "17,550.00", "2,550.00", ""],
+            # ── Page break ──
+            ["Open Positions", "", "", "", "", "", "", "", ""],
+            ["Symbol", "Quantity", "Mult", "Cost Price", "Cost Basis",
+             "Close Price", "Value", "Unrealized P/L", "Code"],
+            ["USD", "", "", "", "", "", "", "", ""],
+            ["SOFI", "400", "1", "26.18", "10,472.00",
+             "16.56", "6,624.00", "-3,848.00", ""],
+        ]
+        positions, _ = _extract_positions(rows, date(2026, 3, 6))
+        symbols = [p.symbol for p in positions]
+        assert "SOFI" in symbols
+        assert len(positions) == 2
 
     def test_unsupported_asset_class_skipped(self):
         extra = [
@@ -300,6 +501,213 @@ class TestExtractPositions:
         rows = _position_rows() + extra
         positions, _ = _extract_positions(rows, date(2026, 3, 6))
         assert len(positions) == 3  # futures skipped
+
+    def test_description_column_header_on_continuation_page(self):
+        """IBKR PDFs use 'Description' instead of 'Symbol' on continuation pages.
+
+        If the parser doesn't map 'Description' → symbol, all positions on
+        that page are silently dropped because symbol="" → skipped.
+        """
+        rows = [
+            ["Open Positions", "", "", "", "", "", "", "", ""],
+            ["Symbol", "Quantity", "Mult", "Cost Price", "Cost Basis",
+             "Close Price", "Value", "Unrealized P/L", "Code"],
+            ["Stocks", "", "", "", "", "", "", "", ""],
+            ["USD", "", "", "", "", "", "", "", ""],
+            ["AAPL", "100", "1", "150.00", "15,000.00",
+             "175.50", "17,550.00", "2,550.00", ""],
+            ["Total", "", "", "", "15,000.00", "", "17,550.00", "2,550.00", ""],
+            # ── Page break: continuation uses "Description" header ──
+            ["Description", "Quantity", "Mult", "Cost Price", "Cost Basis",
+             "Close Price", "Value", "Unrealized P/L", "Code"],
+            ["Stocks", "", "", "", "", "", "", "", ""],
+            ["USD", "", "", "", "", "", "", "", ""],
+            ["SOFI", "200", "1", "10.00", "2,000.00",
+             "15.25", "3,050.00", "1,050.00", ""],
+            ["Total", "", "", "", "2,000.00", "", "3,050.00", "1,050.00", ""],
+        ]
+        positions, skipped = _extract_positions(rows, date(2026, 3, 6))
+        symbols = [p.symbol for p in positions]
+        assert "SOFI" in symbols, (
+            f"SOFI missing from parsed positions: {symbols}. "
+            "'Description' column header on continuation page causes symbol to not be mapped."
+        )
+        assert len(positions) == 2  # AAPL + SOFI
+
+    def test_description_header_without_asset_class_reemission(self):
+        """Continuation page with 'Description' header but NO asset-class
+        sub-header re-emission — current_asset_class should be retained."""
+        rows = [
+            ["Open Positions", "", "", "", "", "", "", "", ""],
+            ["Symbol", "Quantity", "Mult", "Cost Price", "Cost Basis",
+             "Close Price", "Value", "Unrealized P/L", "Code"],
+            ["Stocks", "", "", "", "", "", "", "", ""],
+            ["USD", "", "", "", "", "", "", "", ""],
+            ["AAPL", "100", "1", "150.00", "15,000.00",
+             "175.50", "17,550.00", "2,550.00", ""],
+            # ── Page break: Description header, NO Stocks/USD re-emission ──
+            ["Description", "Quantity", "Mult", "Cost Price", "Cost Basis",
+             "Close Price", "Value", "Unrealized P/L", "Code"],
+            ["SOFI", "200", "1", "10.00", "2,000.00",
+             "15.25", "3,050.00", "1,050.00", ""],
+        ]
+        positions, _ = _extract_positions(rows, date(2026, 3, 6))
+        symbols = [p.symbol for p in positions]
+        assert "SOFI" in symbols, (
+            f"SOFI missing: {symbols}. Continuation page without asset-class "
+            "re-emission should retain current_asset_class."
+        )
+        assert len(positions) == 2
+
+
+    def test_many_positions_across_continuation_pages(self):
+        """Simulate a real IBKR statement with 25+ stocks across pages.
+
+        Page 1: Open Positions header, Stocks, first batch of symbols.
+        Page 2: Continuation with "Description" header (no Stocks re-emission).
+        All positions — including SOFI on page 2 — must be parsed.
+        """
+        rows = [
+            ["Open Positions", "", "", "", "", "", "", "", ""],
+            # Page 1 column header
+            ["Symbol", "Quantity", "Mult", "Cost Price", "Cost Basis",
+             "Close Price", "Value", "Unrealized P/L", "Code"],
+            ["Stocks", "", "", "", "", "", "", "", ""],
+            ["USD", "", "", "", "", "", "", "", ""],
+            # First batch of stocks
+            ["AMZN", "35", "1", "226.30", "7,920.43",
+             "213.21", "7,462.35", "-458.08", ""],
+            ["GOOG", "20", "1", "313.80", "6,276.00",
+             "289.59", "5,791.80", "-484.20", ""],
+            ["META", "8", "1", "660.10", "5,280.80",
+             "504.89", "4,039.12", "-1,241.68", ""],
+            ["NFLX", "25", "1", "0.00", "0.00",
+             "92.28", "2,307.00", "2,307.00", ""],
+            ["PYPL", "20", "1", "58.38", "1,167.60",
+             "0.00", "0.00", "-1,167.60", ""],
+            ["RKLB", "10", "1", "69.76", "697.60",
+             "0.00", "0.00", "-697.60", ""],
+            ["Total", "", "", "", "21,342.43", "", "19,600.27", "-1,742.16", ""],
+            # ── Page break: continuation with Description header ──
+            ["Description", "Quantity", "Mult", "Cost Price", "Cost Basis",
+             "Close Price", "Value", "Unrealized P/L", "Code"],
+            # No "Stocks" re-emission — retains STK from page 1
+            ["SNDK", "0", "1", "0.00", "0.00",
+             "0.00", "0.00", "0.00", ""],
+            ["SOFI", "400", "1", "26.18", "10,472.00",
+             "16.56", "6,624.00", "-3,848.00", ""],
+            ["SPGI", "6", "1", "0.00", "0.00",
+             "408.48", "2,450.88", "2,450.88", ""],
+            ["VALE", "100", "1", "0.00", "0.00",
+             "15.14", "1,514.00", "1,514.00", ""],
+            ["XLE", "40", "1", "0.00", "0.00",
+             "60.57", "2,422.80", "2,422.80", ""],
+            ["Total", "", "", "", "10,472.00", "", "13,011.68", "2,539.68", ""],
+            ["Total in SGD", "", "", "", "", "", "30,000.00", "800.00", ""],
+            # Options follow
+            ["Symbol", "Quantity", "Mult", "Cost Price", "Cost Basis",
+             "Close Price", "Value", "Unrealized P/L", "Code"],
+            ["Equity and Index Options", "", "", "", "", "", "", "", ""],
+            ["USD", "", "", "", "", "", "", "", ""],
+            ["EEM 31MAR26 48 C", "6", "100", "7.42", "4,454.46",
+             "9.47", "5,680.92", "1,226.46", ""],
+            ["Total", "", "", "", "4,454.46", "", "5,680.92", "1,226.46", ""],
+        ]
+        positions, skipped = _extract_positions(rows, date(2026, 3, 25))
+        symbols = [p.symbol for p in positions]
+
+        # All positions must be present — especially SOFI
+        assert "SOFI" in symbols, (
+            f"SOFI missing from parsed positions: {symbols}"
+        )
+        assert "AMZN" in symbols
+        assert "VALE" in symbols
+        assert "XLE" in symbols
+        # 6 stocks page 1 + 5 stocks page 2 + 1 option = 12
+        assert len(positions) == 12
+        # SOFI values must match PDF
+        sofi = [p for p in positions if p.symbol == "SOFI"][0]
+        assert sofi.quantity == Decimal("400")
+        assert sofi.cost_basis == Decimal("10472.00")
+        assert sofi.market_value == Decimal("6624.00")
+        assert sofi.asset_class == "STK"
+
+
+    def test_continuation_page_no_headers_no_asset_class(self):
+        """Real IBKR PDF scenario: page 25 re-emits 'Open Positions' but has
+        NO column headers and NO 'Stocks' label before the data rows.
+
+        Page 24: Open Positions → Symbol headers → Stocks → AMZN..MSFT
+        Page 25: Open Positions (re-emitted) → NFLX, SOFI, SPGI (bare data)
+                 → Totals → Symbol headers → Equity and Index Options → options
+        """
+        rows = [
+            # ── Page 24 ──
+            ["Open Positions", "", "", "", "", "", "", "", ""],
+            ["Symbol", "Quantity", "Mult", "Cost Price", "Cost Basis",
+             "Close Price", "Value", "Unrealized P/L", "Code"],
+            ["Stocks", "", "", "", "", "", "", "", ""],
+            ["USD", "", "", "", "", "", "", "", ""],
+            ["AMZN", "140", "1", "221.58", "31,021.40",
+             "211.71", "29,639.40", "-1,382.00", ""],
+            ["MSFT", "35", "1", "413.96", "14,488.48",
+             "371.04", "12,986.40", "-1,502.08", ""],
+            # ── Page 25: re-emitted header, NO column headers, NO Stocks ──
+            ["Open Positions", "", "", "", "", "", "", "", ""],
+            # Data rows directly — no Symbol header, no Stocks label
+            ["NFLX", "60", "1", "85.98", "5,158.88",
+             "92.28", "5,536.80", "377.92", ""],
+            ["SOFI", "750", "1", "22.82", "17,117.06",
+             "16.56", "12,420.00", "-4,697.06", ""],
+            ["SPGI", "55", "1", "493.74", "27,155.56",
+             "408.48", "22,466.40", "-4,689.16", ""],
+            ["XLE", "200", "1", "50.53", "10,105.18",
+             "60.57", "12,114.00", "2,008.82", ""],
+            ["XLU", "300", "1", "42.88", "12,863.18",
+             "45.25", "13,575.00", "711.82", ""],
+            ["Total", "", "", "", "236,408.12", "",
+             "223,556.59", "-12,851.53", ""],
+            ["Total in SGD", "", "", "", "302,933.36", "",
+             "286,465.41", "-16,467.95", ""],
+            # Column headers re-emitted for options
+            ["Symbol", "Quantity", "Mult", "Cost Price", "Cost Basis",
+             "Close Price", "Value", "Unrealized P/L", "Code"],
+            ["Equity and Index Options", "", "", "", "", "", "", "", ""],
+            ["USD", "", "", "", "", "", "", "", ""],
+            ["QQQ 15MAY26 530 P", "-5", "100", "6.34", "-3,171.18",
+             "6.7154", "-3,357.70", "-186.52", ""],
+            ["SOFI 01MAY26 19 C", "-6", "100", "0.70", "-421.41",
+             "0.5650", "-339.00", "82.41", ""],
+            ["Total", "", "", "", "1,584.09", "",
+             "1,866.42", "282.33", ""],
+        ]
+        positions, skipped = _extract_positions(rows, date(2026, 3, 25))
+        symbols = [p.symbol for p in positions]
+
+        # All page-24 stocks must be parsed
+        assert "AMZN" in symbols
+        assert "MSFT" in symbols
+
+        # All page-25 stocks must be parsed (the bug was these were dropped)
+        assert "NFLX" in symbols, f"NFLX missing: {symbols}"
+        assert "SOFI" in symbols, f"SOFI missing: {symbols}"
+        assert "SPGI" in symbols, f"SPGI missing: {symbols}"
+        assert "XLE" in symbols, f"XLE missing: {symbols}"
+        assert "XLU" in symbols, f"XLU missing: {symbols}"
+
+        # Options must be parsed
+        opts = [p for p in positions if p.asset_class == "OPT"]
+        assert len(opts) == 2
+
+        # 7 stocks + 2 options = 9 total
+        assert len(positions) == 9
+
+        # Verify SOFI has correct data
+        sofi = [p for p in positions if p.symbol == "SOFI"
+                and p.asset_class == "STK"][0]
+        assert sofi.quantity == Decimal("750")
+        assert sofi.market_value == Decimal("12420.00")
+        assert sofi.unrealized_pnl == Decimal("-4697.06")
 
 
 class TestExtractTrades:
@@ -329,6 +737,83 @@ class TestExtractTrades:
         rows = _trade_rows()
         trades, _ = _extract_trades(rows)
         assert len(trades) == 2  # only data rows, not Total AAPL etc.
+
+    def test_option_sell_trades_parsed(self):
+        """Sell-to-open (write) option trades must be parsed correctly.
+
+        SOFI call sells have negative quantity → side=SLD, quantity=abs(qty).
+        The option symbol must parse into expiry/strike/right.
+        """
+        rows = [
+            ["Trades", "", "", "", "", "", "", "", "", "", "", "", ""],
+            ["Symbol", "Date/Time", "", "Quantity", "T. Price", "C. Price",
+             "Proceeds", "Comm/Fee", "Basis", "Realized P/L", "", "MTM P/L", "Code"],
+            ["Equity and Index Options", "", "", "", "", "", "", "", "", "", "", "", ""],
+            ["USD", "", "", "", "", "", "", "", "", "", "", "", ""],
+            ["SOFI 01MAY26 19 C", "2026-03-20,\n10:30:00", "", "-2", "1.50", "1.40",
+             "300.00", "-2.60", "0.00", "0.00", "", "-20.00", "O"],
+            ["Total SOFI 01MAY26 19 C", "", "", "-2", "", "", "300.00", "-2.60",
+             "0.00", "0.00", "", "-20.00", ""],
+            ["SOFI 18DEC26 20 C", "2026-03-20,\n11:00:00", "", "-2", "5.00", "4.80",
+             "1,000.00", "-2.60", "0.00", "0.00", "", "-40.00", "O"],
+            ["Total SOFI 18DEC26 20 C", "", "", "-2", "", "", "1,000.00", "-2.60",
+             "0.00", "0.00", "", "-40.00", ""],
+            ["Total", "", "", "", "", "", "1,300.00", "-5.20",
+             "0.00", "0.00", "", "-60.00", ""],
+        ]
+        trades, skipped = _extract_trades(rows)
+
+        assert len(skipped) == 0, f"Skipped rows: {skipped}"
+        assert len(trades) == 2
+
+        sofi_may = [t for t in trades if "01MAY26" in t.symbol][0]
+        assert sofi_may.side == "SLD"
+        assert sofi_may.quantity == Decimal("2")
+        assert sofi_may.price == Decimal("1.50")
+        assert sofi_may.asset_class == "OPT"
+        assert sofi_may.expiry == date(2026, 5, 1)
+        assert sofi_may.strike == Decimal("19")
+        assert sofi_may.right == "C"
+
+        sofi_dec = [t for t in trades if "18DEC26" in t.symbol][0]
+        assert sofi_dec.side == "SLD"
+        assert sofi_dec.quantity == Decimal("2")
+        assert sofi_dec.expiry == date(2026, 12, 18)
+        assert sofi_dec.strike == Decimal("20")
+
+    def test_option_trades_on_description_continuation_page(self):
+        """Option trades on a continuation page with Description header."""
+        rows = [
+            ["Trades", "", "", "", "", "", "", "", "", "", "", "", ""],
+            ["Symbol", "Date/Time", "", "Quantity", "T. Price", "C. Price",
+             "Proceeds", "Comm/Fee", "Basis", "Realized P/L", "", "MTM P/L", "Code"],
+            ["Stocks", "", "", "", "", "", "", "", "", "", "", "", ""],
+            ["USD", "", "", "", "", "", "", "", "", "", "", "", ""],
+            ["AAPL", "2026-01-15,\n10:30:00", "", "50", "175.00", "176.00",
+             "-8,750.00", "-1.09", "8,751.09", "0.00", "", "-50.00", "O"],
+            ["Total", "", "", "", "", "", "-8,750.00", "-1.09",
+             "8,751.09", "0.00", "", "-50.00", ""],
+            # ── Page break: continuation page with Description header ──
+            ["Description", "Date/Time", "", "Quantity", "T. Price", "C. Price",
+             "Proceeds", "Comm/Fee", "Basis", "Realized P/L", "", "MTM P/L", "Code"],
+            ["Equity and Index Options", "", "", "", "", "", "", "", "", "", "", "", ""],
+            ["USD", "", "", "", "", "", "", "", "", "", "", "", ""],
+            ["SOFI 01MAY26 19 C", "2026-03-20,\n10:30:00", "", "-2", "1.50", "1.40",
+             "300.00", "-2.60", "0.00", "0.00", "", "-20.00", "O"],
+            ["Total", "", "", "", "", "", "300.00", "-2.60",
+             "0.00", "0.00", "", "-20.00", ""],
+        ]
+        trades, skipped = _extract_trades(rows)
+
+        assert len(skipped) == 0, f"Skipped rows: {skipped}"
+        assert len(trades) == 2  # AAPL stock + SOFI option
+
+        sofi_trade = [t for t in trades if "SOFI" in t.symbol][0]
+        assert sofi_trade.side == "SLD"
+        assert sofi_trade.asset_class == "OPT"
+        assert sofi_trade.expiry == date(2026, 5, 1)
+        assert sofi_trade.strike == Decimal("19")
+        assert sofi_trade.right == "C"
 
 
 # ── End-to-end: parse_statement with mocked extraction ───────────────────────
@@ -372,7 +857,7 @@ class TestParseStatement:
 
 # ── Integration test with real PDF ───────────────────────────────────────────
 
-FIXTURE_PATH = "tests/fixtures/MULTI_20260101_20260306.pdf"
+FIXTURE_PATH = "tests/fixtures/MULTI_20260101_20260325.pdf"
 
 
 @pytest.fixture
@@ -401,45 +886,49 @@ class TestRealPDF:
         real_pdf.close()
         for r in results:
             assert r.meta.period_start == date(2026, 1, 1)
-            assert r.meta.period_end == date(2026, 3, 6)
+            assert r.meta.period_end == date(2026, 3, 25)
 
     def test_account1_positions(self, real_pdf):
         results = parse_statement(real_pdf)
         real_pdf.close()
         acct1 = [r for r in results if r.meta.account_id == "U10278751"][0]
-        assert len(acct1.positions) == 14  # 13 stocks + 1 option
+        assert len(acct1.positions) == 18  # 13 stocks + 5 options
         stocks = [p for p in acct1.positions if p.asset_class == "STK"]
         opts = [p for p in acct1.positions if p.asset_class == "OPT"]
         assert len(stocks) == 13
-        assert len(opts) == 1
-        assert opts[0].symbol == "EEM 31MAR26 48 C"
-        assert opts[0].expiry == date(2026, 3, 31)
-        assert opts[0].strike == Decimal("48")
+        assert len(opts) == 5
+        eem_opt = [o for o in opts if "EEM" in o.symbol][0]
+        assert eem_opt.symbol == "EEM 31MAR26 48 C"
+        assert eem_opt.expiry == date(2026, 3, 31)
+        assert eem_opt.strike == Decimal("48")
 
     def test_account1_trades(self, real_pdf):
         results = parse_statement(real_pdf)
         real_pdf.close()
         acct1 = [r for r in results if r.meta.account_id == "U10278751"][0]
-        assert len(acct1.trades) == 35
+        assert len(acct1.trades) == 39
         stk_trades = [t for t in acct1.trades if t.asset_class == "STK"]
         opt_trades = [t for t in acct1.trades if t.asset_class == "OPT"]
         assert len(stk_trades) == 29
-        assert len(opt_trades) == 6
+        assert len(opt_trades) == 10
 
     def test_account2_positions(self, real_pdf):
         results = parse_statement(real_pdf)
         real_pdf.close()
         acct2 = [r for r in results if r.meta.account_id == "U12890661"][0]
-        assert len(acct2.positions) == 13  # all stocks, no options
-        assert all(p.asset_class == "STK" for p in acct2.positions)
+        assert len(acct2.positions) == 17  # 13 stocks + 4 options
+        stocks = [p for p in acct2.positions if p.asset_class == "STK"]
+        opts = [p for p in acct2.positions if p.asset_class == "OPT"]
+        assert len(stocks) == 13
+        assert len(opts) == 4
 
     def test_account2_trades(self, real_pdf):
         results = parse_statement(real_pdf)
         real_pdf.close()
         acct2 = [r for r in results if r.meta.account_id == "U12890661"][0]
-        assert len(acct2.trades) == 50
+        assert len(acct2.trades) == 54
         opt_trades = [t for t in acct2.trades if t.asset_class == "OPT"]
-        assert len(opt_trades) == 4
+        assert len(opt_trades) == 8
 
     def test_no_skipped_rows(self, real_pdf):
         results = parse_statement(real_pdf)
@@ -452,12 +941,12 @@ class TestRealPDF:
         results = parse_statement(real_pdf)
         real_pdf.close()
         acct1 = [r for r in results if r.meta.account_id == "U10278751"][0]
-        aapl = [p for p in acct1.positions if p.symbol == "AMZN"][0]
-        assert aapl.quantity == Decimal("35")
-        assert aapl.cost_basis == Decimal("7920.43")
-        assert aapl.market_price == Decimal("213.2100")
-        assert aapl.market_value == Decimal("7462.35")
-        assert aapl.unrealized_pnl == Decimal("-458.08")
+        amzn = [p for p in acct1.positions if p.symbol == "AMZN"][0]
+        assert amzn.quantity == Decimal("35")
+        assert amzn.cost_basis == Decimal("7920.43")
+        assert amzn.market_price == Decimal("211.7100")
+        assert amzn.market_value == Decimal("7409.85")
+        assert amzn.unrealized_pnl == Decimal("-510.58")
 
     def test_specific_trade_values(self, real_pdf):
         """Verify exact trade values from PDF."""
@@ -472,3 +961,185 @@ class TestRealPDF:
         assert ewy_sell.price == Decimal("130.0400")
         assert ewy_sell.realized_pnl == Decimal("380.91")
         assert ewy_sell.commission == Decimal("-1.10")
+
+    def test_account2_specific_positions(self, real_pdf):
+        """Verify account 2 positions match screenshots exactly."""
+        results = parse_statement(real_pdf)
+        real_pdf.close()
+        acct2 = [r for r in results if r.meta.account_id == "U12890661"][0]
+        # Verify key positions from screenshot
+        amzn = [p for p in acct2.positions if p.symbol == "AMZN"][0]
+        assert amzn.quantity == Decimal("140")
+        assert amzn.market_value == Decimal("29639.40")
+        sofi = [p for p in acct2.positions if p.symbol == "SOFI"][0]
+        assert sofi.quantity == Decimal("750")
+        assert sofi.market_value == Decimal("12420.00")
+        xlu = [p for p in acct2.positions if p.symbol == "XLU"][0]
+        assert xlu.quantity == Decimal("300")
+        # Options
+        qqq_put = [p for p in acct2.positions
+                   if "QQQ" in p.symbol and "530" in p.symbol][0]
+        assert qqq_put.quantity == Decimal("-5")
+        assert qqq_put.asset_class == "OPT"
+
+
+# ── Diagnostic function tests ─────────────────────────────────────────────
+
+
+class TestDiagnosePositions:
+    def test_returns_list_of_dicts(self):
+        rows = _position_rows()
+        result = diagnose_positions(rows)
+        assert isinstance(result, list)
+        assert all(isinstance(r, dict) for r in result)
+
+    def test_each_row_has_required_keys(self):
+        rows = _position_rows()
+        result = diagnose_positions(rows)
+        required_keys = {"row_num", "raw_row", "classification", "asset_class", "detail"}
+        for entry in result:
+            assert required_keys.issubset(entry.keys()), (
+                f"Missing keys in {entry}"
+            )
+
+    def test_classifies_section_header(self):
+        rows = _position_rows()
+        result = diagnose_positions(rows)
+        headers = [r for r in result if r["classification"] == "section_header"]
+        assert len(headers) >= 1
+        assert headers[0]["detail"] == "Open Positions"
+
+    def test_classifies_asset_class(self):
+        rows = _position_rows()
+        result = diagnose_positions(rows)
+        ac_rows = [r for r in result if r["classification"] == "asset_class"]
+        labels = [r["detail"] for r in ac_rows]
+        assert "Stocks → STK" in labels
+
+    def test_classifies_data_rows(self):
+        rows = _position_rows()
+        result = diagnose_positions(rows)
+        parsed = [r for r in result if r["classification"] == "parsed"]
+        symbols = [r["detail"] for r in parsed]
+        assert "AAPL" in symbols
+        assert "MSFT" in symbols
+
+    def test_classifies_total_rows(self):
+        rows = _position_rows()
+        result = diagnose_positions(rows)
+        totals = [r for r in result if r["classification"] == "total"]
+        assert len(totals) >= 1
+
+    def test_classifies_currency_rows(self):
+        rows = _position_rows()
+        result = diagnose_positions(rows)
+        currencies = [r for r in result if r["classification"] == "currency"]
+        assert len(currencies) >= 1
+
+    def test_classifies_column_header(self):
+        rows = _position_rows()
+        result = diagnose_positions(rows)
+        col_headers = [r for r in result if r["classification"] == "column_header"]
+        assert len(col_headers) >= 1
+
+    def test_skipped_asset_class_rows_classified(self):
+        """Rows under an unsupported asset class should be classified as skipped."""
+        rows = _position_rows() + [
+            ["Futures", "", "", "", "", "", "", "", ""],
+            ["USD", "", "", "", "", "", "", "", ""],
+            ["ESH4", "1", "1", "4800", "4800", "4850", "4850", "50", ""],
+        ]
+        result = diagnose_positions(rows)
+        skipped_ac = [r for r in result if r["classification"] == "asset_class_skipped"]
+        assert len(skipped_ac) >= 1
+        assert "Futures" in skipped_ac[0]["detail"]
+
+    def test_skipped_no_asset_class_rows(self):
+        """Data rows before any asset class header should be skipped."""
+        rows = [
+            ["Open Positions", "", "", "", "", "", "", "", ""],
+            ["Symbol", "Quantity", "Mult", "Cost Price", "Cost Basis",
+             "Close Price", "Value", "Unrealized P/L", "Code"],
+            # Data row with no asset class set
+            ["AAPL", "100", "1", "150.00", "15,000.00",
+             "175.50", "17,550.00", "2,550.00", ""],
+        ]
+        result = diagnose_positions(rows)
+        skipped = [r for r in result if r["classification"] == "skipped_no_asset_class"]
+        assert len(skipped) == 1
+
+    def test_validation_error_classified(self):
+        """Rows that fail Pydantic validation should be classified as error."""
+        rows = [
+            ["Open Positions", "", "", "", "", "", "", "", ""],
+            ["Symbol", "Quantity", "Mult", "Cost Price", "Cost Basis",
+             "Close Price", "Value", "Unrealized P/L", "Code"],
+            ["Equity and Index Options", "", "", "", "", "", "", "", ""],
+            ["USD", "", "", "", "", "", "", "", ""],
+            # Malformed option symbol → will fail OPT validation (no expiry/strike/right)
+            ["WEIRD", "10", "100", "1.00", "1000.00",
+             "2.00", "2000.00", "1000.00", ""],
+        ]
+        result = diagnose_positions(rows)
+        errors = [r for r in result if r["classification"] == "error"]
+        assert len(errors) == 1
+        assert "WEIRD" in str(errors[0]["detail"])
+
+    def test_outside_section_classified(self):
+        """Rows before Open Positions should be classified as outside_section."""
+        rows = [
+            ["Account Information", ""],
+            ["Name", "TEST USER"],
+        ] + _position_rows()
+        result = diagnose_positions(rows)
+        outside = [r for r in result if r["classification"] == "outside_section"]
+        assert len(outside) >= 1
+
+    def test_empty_symbol_classified(self):
+        """Row with empty symbol should be classified as skipped_empty_symbol."""
+        rows = [
+            ["Open Positions", "", "", "", "", "", "", "", ""],
+            ["Symbol", "Quantity", "Mult", "Cost Price", "Cost Basis",
+             "Close Price", "Value", "Unrealized P/L", "Code"],
+            ["Stocks", "", "", "", "", "", "", "", ""],
+            ["USD", "", "", "", "", "", "", "", ""],
+            ["", "100", "1", "150.00", "15,000.00",
+             "175.50", "17,550.00", "2,550.00", ""],
+        ]
+        result = diagnose_positions(rows)
+        empty_sym = [r for r in result if r["classification"] == "skipped_empty_symbol"]
+        assert len(empty_sym) == 1
+
+    def test_continuation_no_headers_diagnosed_as_parsed(self):
+        """Diagnose must show continuation-page stocks as 'parsed', not skipped.
+
+        Matches real IBKR PDF: page 25 re-emits 'Open Positions' but has
+        NO column headers and NO 'Stocks' before data rows.
+        """
+        rows = [
+            ["Open Positions", "", "", "", "", "", "", "", ""],
+            ["Symbol", "Quantity", "Mult", "Cost Price", "Cost Basis",
+             "Close Price", "Value", "Unrealized P/L", "Code"],
+            ["Stocks", "", "", "", "", "", "", "", ""],
+            ["USD", "", "", "", "", "", "", "", ""],
+            ["AMZN", "140", "1", "221.58", "31,021.40",
+             "211.71", "29,639.40", "-1,382.00", ""],
+            # ── Page 25: re-emitted header, bare data ──
+            ["Open Positions", "", "", "", "", "", "", "", ""],
+            ["SOFI", "750", "1", "22.82", "17,117.06",
+             "16.56", "12,420.00", "-4,697.06", ""],
+            ["Total", "", "", "", "236,408.12", "",
+             "223,556.59", "-12,851.53", ""],
+        ]
+        result = diagnose_positions(rows)
+        parsed = [r for r in result if r["classification"] == "parsed"]
+        parsed_symbols = [r["detail"] for r in parsed]
+
+        assert "AMZN" in parsed_symbols
+        assert "SOFI" in parsed_symbols, (
+            f"SOFI diagnosed as skipped, not parsed. "
+            f"Classifications: {[(r['detail'], r['classification']) for r in result]}"
+        )
+        # SOFI must be under STK
+        sofi_row = [r for r in result if r["detail"] == "SOFI"][0]
+        assert sofi_row["asset_class"] == "STK"

@@ -167,12 +167,23 @@ def _is_all_empty(cells: list[str], start: int = 1) -> bool:
 
 
 def _is_section_header(row: list[str]) -> str | None:
-    """If row is a section header, return the section name; else None."""
+    """If row is a section header, return the section name; else None.
+
+    Handles pdfplumber truncation by prefix matching.
+    """
     if not row or not row[0]:
         return None
     first = row[0].strip()
-    if first in SECTION_NAMES and _is_all_empty(row, 1):
+    if not _is_all_empty(row, 1):
+        return None
+    # Exact match first
+    if first in SECTION_NAMES:
         return first
+    # Prefix match for truncated labels (min 10 chars to avoid false positives)
+    if len(first) >= 10:
+        for name in SECTION_NAMES:
+            if name.startswith(first):
+                return name
     return None
 
 
@@ -185,12 +196,24 @@ def _is_column_header(row: list[str]) -> bool:
 
 
 def _is_asset_class(row: list[str]) -> str | None:
-    """If row is an asset class sub-header, return the label; else None."""
+    """If row is an asset class sub-header, return the label; else None.
+
+    Handles pdfplumber truncation (e.g. 'Equity and Index Opt' for
+    'Equity and Index Options') by prefix matching.
+    """
     if not row or not row[0]:
         return None
     first = row[0].strip()
-    if first in ALL_ASSET_LABELS and _is_all_empty(row, 1):
+    if not _is_all_empty(row, 1):
+        return None
+    # Exact match first
+    if first in ALL_ASSET_LABELS:
         return first
+    # Prefix match for truncated labels (min 6 chars to avoid false positives)
+    if len(first) >= 6:
+        for label in ALL_ASSET_LABELS:
+            if label.startswith(first):
+                return label
     return None
 
 
@@ -210,17 +233,125 @@ def _is_total(row: list[str]) -> bool:
 
 # ── Table extraction ─────────────────────────────────────────────────────────
 
+def _is_headed_table(table: list[list[str]]) -> bool:
+    """Check if a table starts with a recognized structural row.
+
+    A 'headed' table starts with a column header (Symbol/Description),
+    a section header, or an asset class sub-header — indicating it's
+    a new logical table, not a continuation of the previous one.
+
+    Tables that start with "Open Positions" followed by a column header
+    are treated as continuations (page running header re-emission).
+    """
+    if not table:
+        return False
+    first_row = table[0]
+    if not first_row or not first_row[0]:
+        return False
+    first_cell = first_row[0].strip()
+
+    # Column header → new headed table
+    if first_cell in ("Symbol", "Description"):
+        return True
+
+    # Section header — starts a new logical table
+    if first_cell in SECTION_NAMES and _is_all_empty(first_row, 1):
+        return True
+    # Also match truncated section names (pdfplumber truncates long labels)
+    if _is_all_empty(first_row, 1):
+        for name in SECTION_NAMES:
+            if len(first_cell) >= 10 and name.startswith(first_cell):
+                return True
+
+    # Asset class sub-header → new logical group
+    if _is_all_empty(first_row, 1):
+        if first_cell in ALL_ASSET_LABELS:
+            return True
+        # Prefix match for truncated labels
+        if len(first_cell) >= 6:
+            for label in ALL_ASSET_LABELS:
+                if label.startswith(first_cell):
+                    return True
+
+    return False
+
+
+def _merge_continuation_tables(
+    tables: list[list[list[str]]],
+) -> list[list[list[str]]]:
+    """Merge headerless continuation tables into the previous headed table.
+
+    IBKR PDFs break long tables across pages. pdfplumber extracts each
+    page fragment as a separate table. Continuation fragments often lack
+    column headers and may have different column counts.
+
+    This function:
+    1. Detects tables without column headers (continuations)
+    2. Appends their rows to the previous headed table
+    3. Pads or trims rows to match the headed table's column count
+    """
+    if not tables:
+        return []
+
+    merged: list[list[list[str]]] = []
+
+    for table in tables:
+        if not table:
+            continue
+
+        if _is_headed_table(table):
+            # New logical table
+            merged.append(list(table))
+        elif not merged:
+            # First table has no header — start a new group anyway
+            merged.append(list(table))
+        else:
+            # Continuation — merge into previous table
+            prev_table = merged[-1]
+            # Determine target column count from the previous table
+            target_cols = max(len(row) for row in prev_table) if prev_table else 0
+
+            for row in table:
+                # Skip re-emitted "Open Positions" page running headers
+                first_cell = (row[0] or "").strip() if row else ""
+                if first_cell == "Open Positions" and _is_all_empty(row, 1):
+                    continue
+
+                if len(row) < target_cols:
+                    # Pad with empty strings
+                    row = row + [""] * (target_cols - len(row))
+                elif len(row) > target_cols and target_cols > 0:
+                    # Trim to match
+                    row = row[:target_cols]
+                prev_table.append(row)
+
+    return merged
+
+
 def _extract_tables(pdf_file: BinaryIO) -> list[list[str]]:
-    """Return all table rows across all pages as lists of strings."""
+    """Return all table rows across all pages as lists of strings.
+
+    Merges continuation tables (headerless page fragments) into their
+    parent tables to ensure consistent column counts.
+    """
     import pdfplumber  # lazy import — heavy dep only needed at parse time
 
-    all_rows: list[list[str]] = []
+    raw_tables: list[list[list[str]]] = []
     with pdfplumber.open(pdf_file) as pdf:
         for page in pdf.pages:
             tables = page.extract_tables()
             for table in tables:
-                for row in table:
-                    all_rows.append([cell if cell is not None else "" for cell in row])
+                normalized = [
+                    [cell if cell is not None else "" for cell in row]
+                    for row in table
+                ]
+                raw_tables.append(normalized)
+
+    merged_tables = _merge_continuation_tables(raw_tables)
+
+    all_rows: list[list[str]] = []
+    for table in merged_tables:
+        all_rows.extend(table)
     return all_rows
 
 
@@ -308,6 +439,7 @@ def _extract_meta(rows: list[list[str]]) -> StatementMeta:
 
 POSITION_COL_MAP: dict[str, str] = {
     "symbol": "symbol",
+    "description": "symbol",  # continuation pages use "Description" header
     "quantity": "quantity",
     "cost basis": "cost_basis",
     "close price": "market_price",
@@ -317,6 +449,7 @@ POSITION_COL_MAP: dict[str, str] = {
 
 TRADE_COL_MAP: dict[str, str] = {
     "symbol": "symbol",
+    "description": "symbol",  # continuation pages use "Description" header
     "date/time": "trade_date",
     "quantity": "quantity",
     "t. price": "price",
@@ -346,6 +479,7 @@ def _extract_positions(
     skipped: list[dict] = []
     in_section = False
     current_asset_class: str | None = None
+    current_currency: str = "USD"
     col_mapping: dict[int, str] = {}
 
     for row in rows:
@@ -354,12 +488,21 @@ def _extract_positions(
 
         section = _is_section_header(row)
         if section == "Open Positions":
+            if in_section:
+                # Re-encountered "Open Positions" — page running header
+                # on continuation page.  Do NOT reset state.
+                logger.debug("Skipping re-emitted Open Positions header")
+                continue
             in_section = True
             # Don't reset asset class/mapping — positions span multiple pages
             # and the section header repeats without column headers
+            current_asset_class = None
+            col_mapping = {}
+            logger.debug("Entered Open Positions section")
             continue
         elif section is not None and in_section:
             # Different section started → leave Open Positions
+            logger.debug("Left Open Positions at section: %s", section)
             break
 
         if not in_section:
@@ -368,6 +511,7 @@ def _extract_positions(
         # Column header row
         if _is_column_header(row):
             col_mapping = _map_columns(row, POSITION_COL_MAP)
+            logger.debug("Column header mapped: %s", col_mapping)
             continue
 
         # Asset class sub-header
@@ -375,6 +519,7 @@ def _extract_positions(
         if ac_label is not None:
             if ac_label in ASSET_CLASS_MAP:
                 current_asset_class = ASSET_CLASS_MAP[ac_label]
+                logger.debug("Asset class: %s → %s", ac_label, current_asset_class)
             else:
                 current_asset_class = None
                 logger.warning("Skipping unsupported asset class: %s", ac_label)
@@ -382,6 +527,7 @@ def _extract_positions(
 
         # Currency sub-header
         if _is_currency(row):
+            current_currency = row[0].strip()
             continue
 
         # Total rows
@@ -390,9 +536,11 @@ def _extract_positions(
 
         # In a skipped or unknown asset class
         if current_asset_class is None:
+            logger.debug("Skipping row (no asset class): %s", row[:2])
             continue
 
         if not col_mapping:
+            logger.debug("Skipping row (no col mapping): %s", row[:2])
             continue
 
         # Map columns to fields
@@ -403,6 +551,7 @@ def _extract_positions(
 
         symbol = fields.get("symbol", "").strip()
         if not symbol:
+            logger.debug("Skipping row (empty symbol): %s", row[:3])
             continue
 
         try:
@@ -418,7 +567,7 @@ def _extract_positions(
                 market_price=_to_decimal(fields.get("market_price")),
                 market_value=_to_decimal(fields.get("market_value")),
                 unrealized_pnl=_to_decimal(fields.get("unrealized_pnl")),
-                currency="USD",
+                currency=current_currency,
                 statement_date=period_end,
                 **opt_fields,
             )
@@ -430,6 +579,179 @@ def _extract_positions(
     return positions, skipped
 
 
+# ── Position diagnostic ──────────────────────────────────────────────────────
+
+def diagnose_positions(rows: list[list[str]]) -> list[dict]:
+    """Classify every row for diagnostic display.
+
+    Returns a list of dicts, one per row, with keys:
+        row_num: 1-based index
+        raw_row: the original row (list of strings)
+        classification: one of section_header, column_header, asset_class,
+            asset_class_skipped, currency, total, parsed, error,
+            skipped_no_asset_class, skipped_no_mapping, skipped_empty_symbol,
+            outside_section
+        asset_class: current asset class at this row (or None)
+        detail: human-readable explanation
+    """
+    result: list[dict] = []
+    in_section = False
+    current_asset_class: str | None = None
+    col_mapping: dict[int, str] = {}
+
+    for i, row in enumerate(rows):
+        entry: dict = {
+            "row_num": i + 1,
+            "raw_row": row,
+            "classification": "",
+            "asset_class": current_asset_class,
+            "detail": "",
+        }
+
+        if not row:
+            entry["classification"] = "empty"
+            entry["detail"] = "Empty row"
+            result.append(entry)
+            continue
+
+        section = _is_section_header(row)
+        if section == "Open Positions":
+            if in_section:
+                # Re-emitted page running header — skip without reset
+                entry["classification"] = "section_header"
+                entry["detail"] = "Open Positions (re-emitted, state retained)"
+                entry["asset_class"] = current_asset_class
+                result.append(entry)
+                continue
+            in_section = True
+            current_asset_class = None
+            col_mapping = {}
+            entry["classification"] = "section_header"
+            entry["detail"] = "Open Positions"
+            entry["asset_class"] = None
+            result.append(entry)
+            continue
+        elif section is not None and in_section:
+            entry["classification"] = "section_header"
+            entry["detail"] = f"{section} (exits Open Positions)"
+            entry["asset_class"] = current_asset_class
+            result.append(entry)
+            break
+        elif section is not None:
+            entry["classification"] = "outside_section"
+            entry["detail"] = f"Section: {section}"
+            result.append(entry)
+            continue
+
+        if not in_section:
+            entry["classification"] = "outside_section"
+            first_cell = (row[0] or "")[:40] if row else ""
+            entry["detail"] = f"Before Open Positions: {first_cell}"
+            result.append(entry)
+            continue
+
+        # Column header
+        if _is_column_header(row):
+            col_mapping = _map_columns(row, POSITION_COL_MAP)
+            entry["classification"] = "column_header"
+            entry["detail"] = f"Mapped {len(col_mapping)} columns"
+            entry["asset_class"] = current_asset_class
+            result.append(entry)
+            continue
+
+        # Asset class sub-header
+        ac_label = _is_asset_class(row)
+        if ac_label is not None:
+            if ac_label in ASSET_CLASS_MAP:
+                current_asset_class = ASSET_CLASS_MAP[ac_label]
+                entry["classification"] = "asset_class"
+                entry["detail"] = f"{ac_label} → {current_asset_class}"
+            else:
+                current_asset_class = None
+                entry["classification"] = "asset_class_skipped"
+                entry["detail"] = f"{ac_label} (unsupported — rows below will be skipped)"
+            entry["asset_class"] = current_asset_class
+            result.append(entry)
+            continue
+
+        # Currency
+        if _is_currency(row):
+            entry["classification"] = "currency"
+            entry["detail"] = (row[0] or "").strip()
+            entry["asset_class"] = current_asset_class
+            result.append(entry)
+            continue
+
+        # Total
+        if _is_total(row):
+            entry["classification"] = "total"
+            entry["detail"] = (row[0] or "").strip()
+            entry["asset_class"] = current_asset_class
+            result.append(entry)
+            continue
+
+        # No asset class set
+        if current_asset_class is None:
+            entry["classification"] = "skipped_no_asset_class"
+            first_cell = (row[0] or "").strip()[:40]
+            entry["detail"] = f"No active asset class: {first_cell}"
+            entry["asset_class"] = None
+            result.append(entry)
+            continue
+
+        # No column mapping
+        if not col_mapping:
+            entry["classification"] = "skipped_no_mapping"
+            first_cell = (row[0] or "").strip()[:40]
+            entry["detail"] = f"No column mapping: {first_cell}"
+            entry["asset_class"] = current_asset_class
+            result.append(entry)
+            continue
+
+        # Map columns to fields
+        fields: dict = {}
+        for idx, field_name in col_mapping.items():
+            if idx < len(row):
+                fields[field_name] = (row[idx] or "").strip()
+
+        symbol = fields.get("symbol", "").strip()
+        if not symbol:
+            entry["classification"] = "skipped_empty_symbol"
+            entry["detail"] = f"Empty symbol in row: {row[:3]}"
+            entry["asset_class"] = current_asset_class
+            result.append(entry)
+            continue
+
+        # Try to build a Position
+        try:
+            opt_fields: dict = {}
+            if current_asset_class == "OPT":
+                opt_fields = _parse_option_symbol(symbol)
+
+            Position(
+                symbol=symbol,
+                asset_class=current_asset_class,
+                quantity=_to_decimal(fields.get("quantity")),
+                cost_basis=_to_decimal(fields.get("cost_basis")),
+                market_price=_to_decimal(fields.get("market_price")),
+                market_value=_to_decimal(fields.get("market_value")),
+                unrealized_pnl=_to_decimal(fields.get("unrealized_pnl")),
+                currency="USD",
+                statement_date=date.today(),
+                **opt_fields,
+            )
+            entry["classification"] = "parsed"
+            entry["detail"] = symbol
+        except Exception as e:
+            entry["classification"] = "error"
+            entry["detail"] = f"{symbol}: {e}"
+
+        entry["asset_class"] = current_asset_class
+        result.append(entry)
+
+    return result
+
+
 # ── Trade extraction ─────────────────────────────────────────────────────────
 
 def _extract_trades(rows: list[list[str]]) -> tuple[list[Trade], list[dict]]:
@@ -438,6 +760,7 @@ def _extract_trades(rows: list[list[str]]) -> tuple[list[Trade], list[dict]]:
     skipped: list[dict] = []
     in_section = False
     current_asset_class: str | None = None
+    current_currency: str = "USD"
     col_mapping: dict[int, str] = {}
 
     for row in rows:
@@ -470,6 +793,7 @@ def _extract_trades(rows: list[list[str]]) -> tuple[list[Trade], list[dict]]:
             continue
 
         if _is_currency(row):
+            current_currency = row[0].strip()
             continue
 
         if _is_total(row):
@@ -513,7 +837,7 @@ def _extract_trades(rows: list[list[str]]) -> tuple[list[Trade], list[dict]]:
                 proceeds=_to_decimal(fields.get("proceeds")),
                 commission=_to_decimal(fields.get("commission")),
                 realized_pnl=_to_decimal(fields.get("realized_pnl")),
-                currency="USD",
+                currency=current_currency,
                 **opt_fields,
             )
             trades.append(trade)
