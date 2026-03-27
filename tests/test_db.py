@@ -812,6 +812,161 @@ class TestCheckDuplicates:
         assert result["dup_positions"] == 0
 
 
+# ── Position dedup bug tests ─────────────────────────────────────────────────
+
+
+class TestUpsertPositionsNotDedupedAcrossStatements:
+    """Positions must always be stored per-statement, never skipped by
+    cross-statement fingerprint dedup.
+
+    Bug scenario:
+    1. Statement A stores [AAPL, MSFT, GOOG] with statement_date=Mar 6
+    2. Statement B (different period_start, same period_end) has [AAPL, MSFT, TSLA]
+       - Old code: AAPL & MSFT fingerprints match Statement A → SKIPPED
+       - Only TSLA is stored for Statement B
+    3. Re-upload Statement A with corrected PDF [MSFT, GOOG]:
+       - Deletes Statement A positions → AAPL gone from A
+       - AAPL was never stored in B → AAPL LOST FOREVER
+    """
+
+    def _make_tracking_client(self, existing_stmt_ids=None):
+        """Build a mock client that tracks inserted rows per table."""
+        client = MagicMock()
+        inserted = {"positions": [], "trades": []}
+
+        def _mock_table(name):
+            table = MagicMock()
+            # upsert chain (for statements)
+            table.upsert.return_value.execute.return_value = MagicMock(
+                data=[{"id": "stmt-uuid-001"}]
+            )
+            # delete chain
+            table.delete.return_value.eq.return_value.execute.return_value = MagicMock(data=[])
+            # insert chain — capture what's inserted
+            def _capture_insert(rows):
+                inserted[name].extend(rows)
+                result_mock = MagicMock()
+                result_mock.execute.return_value = MagicMock(data=[{"id": f"row-{i}"} for i in range(len(rows))])
+                return result_mock
+            table.insert.side_effect = _capture_insert
+            # select chain (for fingerprint queries — return no existing data)
+            select = table.select.return_value
+            select.eq.return_value = select
+            select.execute.return_value = MagicMock(data=existing_stmt_ids or [])
+            return table
+
+        client.table.side_effect = _mock_table
+        return client, inserted
+
+    @patch("src.db.get_client")
+    def test_all_positions_inserted_even_with_matching_fingerprints(
+        self, mock_get_client, sample_meta,
+    ):
+        """Every position from the PDF must be stored, regardless of whether
+        another statement already has a position with the same fingerprint."""
+        from src.db import upsert_statement
+
+        client, inserted = self._make_tracking_client()
+        mock_get_client.return_value = client
+
+        # Two positions: AAPL and MSFT
+        positions = [
+            Position(
+                symbol="AAPL", asset_class="STK", quantity=Decimal("100"),
+                cost_basis=Decimal("15000"), market_price=Decimal("175"),
+                market_value=Decimal("17500"), unrealized_pnl=Decimal("2500"),
+                currency="USD", statement_date=date(2026, 3, 6),
+            ),
+            Position(
+                symbol="MSFT", asset_class="STK", quantity=Decimal("50"),
+                cost_basis=Decimal("20000"), market_price=Decimal("420"),
+                market_value=Decimal("21000"), unrealized_pnl=Decimal("1000"),
+                currency="USD", statement_date=date(2026, 3, 6),
+            ),
+        ]
+        parsed = ParsedStatement(meta=sample_meta, positions=positions, trades=[])
+
+        stmt_id, trades_skipped, positions_skipped = upsert_statement(parsed)
+
+        # ALL positions must be inserted — none should be skipped
+        assert positions_skipped == 0, (
+            f"Expected 0 positions skipped, got {positions_skipped}. "
+            "Cross-statement dedup must not skip positions."
+        )
+        assert len(inserted["positions"]) == 2, (
+            f"Expected 2 positions inserted, got {len(inserted['positions'])}."
+        )
+        symbols_inserted = {r["symbol"] for r in inserted["positions"]}
+        assert symbols_inserted == {"AAPL", "MSFT"}
+
+    @patch("src.db._get_existing_position_fingerprints")
+    @patch("src.db.get_client")
+    def test_positions_not_skipped_when_fingerprint_exists_elsewhere(
+        self, mock_get_client, mock_get_fps, sample_meta,
+    ):
+        """Even if _get_existing_position_fingerprints returns matching
+        fingerprints from other statements, positions must still be inserted."""
+        from src.db import upsert_statement
+
+        client, inserted = self._make_tracking_client()
+        mock_get_client.return_value = client
+
+        # Simulate: another statement already has AAPL with same fingerprint
+        mock_get_fps.return_value = {
+            ("AAPL", "STK", "2026-03-06", None, None, None),
+        }
+
+        positions = [
+            Position(
+                symbol="AAPL", asset_class="STK", quantity=Decimal("100"),
+                cost_basis=Decimal("15000"), market_price=Decimal("175"),
+                market_value=Decimal("17500"), unrealized_pnl=Decimal("2500"),
+                currency="USD", statement_date=date(2026, 3, 6),
+            ),
+            Position(
+                symbol="GOOG", asset_class="STK", quantity=Decimal("25"),
+                cost_basis=Decimal("5000"), market_price=Decimal("180"),
+                market_value=Decimal("4500"), unrealized_pnl=Decimal("-500"),
+                currency="USD", statement_date=date(2026, 3, 6),
+            ),
+        ]
+        parsed = ParsedStatement(meta=sample_meta, positions=positions, trades=[])
+
+        stmt_id, trades_skipped, positions_skipped = upsert_statement(parsed)
+
+        # AAPL must NOT be skipped even though it exists in another statement
+        assert positions_skipped == 0
+        assert len(inserted["positions"]) == 2
+        symbols_inserted = {r["symbol"] for r in inserted["positions"]}
+        assert "AAPL" in symbols_inserted, (
+            "AAPL was skipped due to cross-statement dedup — this causes holdings loss"
+        )
+
+    @patch("src.db.get_client")
+    def test_upsert_return_value_positions_skipped_always_zero(
+        self, mock_get_client, sample_meta,
+    ):
+        """positions_skipped in return value should always be 0 since we don't
+        deduplicate positions across statements."""
+        from src.db import upsert_statement
+
+        client, _ = self._make_tracking_client()
+        mock_get_client.return_value = client
+
+        positions = [
+            Position(
+                symbol="AAPL", asset_class="STK", quantity=Decimal("100"),
+                cost_basis=Decimal("15000"), market_price=Decimal("175"),
+                market_value=Decimal("17500"), unrealized_pnl=Decimal("2500"),
+                currency="USD", statement_date=date(2026, 3, 6),
+            ),
+        ]
+        parsed = ParsedStatement(meta=sample_meta, positions=positions, trades=[])
+
+        _, _, positions_skipped = upsert_statement(parsed)
+        assert positions_skipped == 0
+
+
 # ── Stock metric helpers ─────────────────────────────────────────────────────
 
 
