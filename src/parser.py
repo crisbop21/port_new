@@ -359,9 +359,11 @@ def _extract_positions(
             in_section = True
             current_asset_class = None
             col_mapping = {}
+            logger.debug("Entered Open Positions section")
             continue
         elif section is not None and in_section:
             # Different section started → leave Open Positions
+            logger.debug("Left Open Positions at section: %s", section)
             break
 
         if not in_section:
@@ -370,6 +372,7 @@ def _extract_positions(
         # Column header row
         if _is_column_header(row):
             col_mapping = _map_columns(row, POSITION_COL_MAP)
+            logger.debug("Column header mapped: %s", col_mapping)
             continue
 
         # Asset class sub-header
@@ -377,6 +380,7 @@ def _extract_positions(
         if ac_label is not None:
             if ac_label in ASSET_CLASS_MAP:
                 current_asset_class = ASSET_CLASS_MAP[ac_label]
+                logger.debug("Asset class: %s → %s", ac_label, current_asset_class)
             else:
                 current_asset_class = None
                 logger.warning("Skipping unsupported asset class: %s", ac_label)
@@ -392,9 +396,11 @@ def _extract_positions(
 
         # In a skipped or unknown asset class
         if current_asset_class is None:
+            logger.debug("Skipping row (no asset class): %s", row[:2])
             continue
 
         if not col_mapping:
+            logger.debug("Skipping row (no col mapping): %s", row[:2])
             continue
 
         # Map columns to fields
@@ -405,6 +411,7 @@ def _extract_positions(
 
         symbol = fields.get("symbol", "").strip()
         if not symbol:
+            logger.debug("Skipping row (empty symbol): %s", row[:3])
             continue
 
         try:
