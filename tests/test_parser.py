@@ -343,8 +343,13 @@ class TestMergeContinuationTables:
         merged = _merge_continuation_tables(tables)
         assert len(merged) == 2
 
-    def test_open_positions_reemission_is_continuation(self):
-        """'Open Positions' re-emitted as page running header is a continuation."""
+    def test_open_positions_reemission_creates_separate_tables(self):
+        """'Open Positions' re-emitted on page break creates separate headed tables.
+
+        Both are section headers, so each starts its own table. The
+        _extract_positions function handles re-emitted headers by retaining
+        state (asset class, column mapping) across re-emissions.
+        """
         tables = [
             [
                 ["Open Positions", "", "", "", ""],
@@ -353,17 +358,19 @@ class TestMergeContinuationTables:
                 ["AAPL", "100", "1", "17550", ""],
             ],
             [
-                # Page header re-emits Open Positions — this is NOT a new section
+                # Page header re-emits Open Positions — new headed table
                 ["Open Positions", "", "", "", ""],
                 ["Symbol", "Quantity", "Mult", "Value", "Code"],
                 ["SOFI", "400", "1", "6624", ""],
             ],
         ]
         merged = _merge_continuation_tables(tables)
-        # The re-emitted "Open Positions" + header should be merged
-        assert len(merged) == 1
-        symbols = [row[0] for row in merged[0] if row[0] not in
-                   ("Open Positions", "Symbol", "Stocks", "")]
+        # Each Open Positions starts a new headed table
+        assert len(merged) == 2
+        # But when flattened, _extract_positions handles both correctly
+        all_rows = [row for table in merged for row in table]
+        positions, _ = _extract_positions(all_rows, date(2026, 3, 6))
+        symbols = [p.symbol for p in positions]
         assert "AAPL" in symbols
         assert "SOFI" in symbols
 
@@ -835,7 +842,7 @@ class TestParseStatement:
 
 # ── Integration test with real PDF ───────────────────────────────────────────
 
-FIXTURE_PATH = "tests/fixtures/MULTI_20260101_20260306.pdf"
+FIXTURE_PATH = "tests/fixtures/MULTI_20260101_20260325.pdf"
 
 
 @pytest.fixture
@@ -864,45 +871,49 @@ class TestRealPDF:
         real_pdf.close()
         for r in results:
             assert r.meta.period_start == date(2026, 1, 1)
-            assert r.meta.period_end == date(2026, 3, 6)
+            assert r.meta.period_end == date(2026, 3, 25)
 
     def test_account1_positions(self, real_pdf):
         results = parse_statement(real_pdf)
         real_pdf.close()
         acct1 = [r for r in results if r.meta.account_id == "U10278751"][0]
-        assert len(acct1.positions) == 14  # 13 stocks + 1 option
+        assert len(acct1.positions) == 18  # 13 stocks + 5 options
         stocks = [p for p in acct1.positions if p.asset_class == "STK"]
         opts = [p for p in acct1.positions if p.asset_class == "OPT"]
         assert len(stocks) == 13
-        assert len(opts) == 1
-        assert opts[0].symbol == "EEM 31MAR26 48 C"
-        assert opts[0].expiry == date(2026, 3, 31)
-        assert opts[0].strike == Decimal("48")
+        assert len(opts) == 5
+        eem_opt = [o for o in opts if "EEM" in o.symbol][0]
+        assert eem_opt.symbol == "EEM 31MAR26 48 C"
+        assert eem_opt.expiry == date(2026, 3, 31)
+        assert eem_opt.strike == Decimal("48")
 
     def test_account1_trades(self, real_pdf):
         results = parse_statement(real_pdf)
         real_pdf.close()
         acct1 = [r for r in results if r.meta.account_id == "U10278751"][0]
-        assert len(acct1.trades) == 35
+        assert len(acct1.trades) == 39
         stk_trades = [t for t in acct1.trades if t.asset_class == "STK"]
         opt_trades = [t for t in acct1.trades if t.asset_class == "OPT"]
         assert len(stk_trades) == 29
-        assert len(opt_trades) == 6
+        assert len(opt_trades) == 10
 
     def test_account2_positions(self, real_pdf):
         results = parse_statement(real_pdf)
         real_pdf.close()
         acct2 = [r for r in results if r.meta.account_id == "U12890661"][0]
-        assert len(acct2.positions) == 13  # all stocks, no options
-        assert all(p.asset_class == "STK" for p in acct2.positions)
+        assert len(acct2.positions) == 17  # 13 stocks + 4 options
+        stocks = [p for p in acct2.positions if p.asset_class == "STK"]
+        opts = [p for p in acct2.positions if p.asset_class == "OPT"]
+        assert len(stocks) == 13
+        assert len(opts) == 4
 
     def test_account2_trades(self, real_pdf):
         results = parse_statement(real_pdf)
         real_pdf.close()
         acct2 = [r for r in results if r.meta.account_id == "U12890661"][0]
-        assert len(acct2.trades) == 50
+        assert len(acct2.trades) == 54
         opt_trades = [t for t in acct2.trades if t.asset_class == "OPT"]
-        assert len(opt_trades) == 4
+        assert len(opt_trades) == 8
 
     def test_no_skipped_rows(self, real_pdf):
         results = parse_statement(real_pdf)
@@ -915,12 +926,12 @@ class TestRealPDF:
         results = parse_statement(real_pdf)
         real_pdf.close()
         acct1 = [r for r in results if r.meta.account_id == "U10278751"][0]
-        aapl = [p for p in acct1.positions if p.symbol == "AMZN"][0]
-        assert aapl.quantity == Decimal("35")
-        assert aapl.cost_basis == Decimal("7920.43")
-        assert aapl.market_price == Decimal("213.2100")
-        assert aapl.market_value == Decimal("7462.35")
-        assert aapl.unrealized_pnl == Decimal("-458.08")
+        amzn = [p for p in acct1.positions if p.symbol == "AMZN"][0]
+        assert amzn.quantity == Decimal("35")
+        assert amzn.cost_basis == Decimal("7920.43")
+        assert amzn.market_price == Decimal("211.7100")
+        assert amzn.market_value == Decimal("7409.85")
+        assert amzn.unrealized_pnl == Decimal("-510.58")
 
     def test_specific_trade_values(self, real_pdf):
         """Verify exact trade values from PDF."""
@@ -935,6 +946,26 @@ class TestRealPDF:
         assert ewy_sell.price == Decimal("130.0400")
         assert ewy_sell.realized_pnl == Decimal("380.91")
         assert ewy_sell.commission == Decimal("-1.10")
+
+    def test_account2_specific_positions(self, real_pdf):
+        """Verify account 2 positions match screenshots exactly."""
+        results = parse_statement(real_pdf)
+        real_pdf.close()
+        acct2 = [r for r in results if r.meta.account_id == "U12890661"][0]
+        # Verify key positions from screenshot
+        amzn = [p for p in acct2.positions if p.symbol == "AMZN"][0]
+        assert amzn.quantity == Decimal("140")
+        assert amzn.market_value == Decimal("29639.40")
+        sofi = [p for p in acct2.positions if p.symbol == "SOFI"][0]
+        assert sofi.quantity == Decimal("750")
+        assert sofi.market_value == Decimal("12420.00")
+        xlu = [p for p in acct2.positions if p.symbol == "XLU"][0]
+        assert xlu.quantity == Decimal("300")
+        # Options
+        qqq_put = [p for p in acct2.positions
+                   if "QQQ" in p.symbol and "530" in p.symbol][0]
+        assert qqq_put.quantity == Decimal("-5")
+        assert qqq_put.asset_class == "OPT"
 
 
 # ── Diagnostic function tests ─────────────────────────────────────────────

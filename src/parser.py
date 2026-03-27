@@ -167,12 +167,23 @@ def _is_all_empty(cells: list[str], start: int = 1) -> bool:
 
 
 def _is_section_header(row: list[str]) -> str | None:
-    """If row is a section header, return the section name; else None."""
+    """If row is a section header, return the section name; else None.
+
+    Handles pdfplumber truncation by prefix matching.
+    """
     if not row or not row[0]:
         return None
     first = row[0].strip()
-    if first in SECTION_NAMES and _is_all_empty(row, 1):
+    if not _is_all_empty(row, 1):
+        return None
+    # Exact match first
+    if first in SECTION_NAMES:
         return first
+    # Prefix match for truncated labels (min 10 chars to avoid false positives)
+    if len(first) >= 10:
+        for name in SECTION_NAMES:
+            if name.startswith(first):
+                return name
     return None
 
 
@@ -185,12 +196,24 @@ def _is_column_header(row: list[str]) -> bool:
 
 
 def _is_asset_class(row: list[str]) -> str | None:
-    """If row is an asset class sub-header, return the label; else None."""
+    """If row is an asset class sub-header, return the label; else None.
+
+    Handles pdfplumber truncation (e.g. 'Equity and Index Opt' for
+    'Equity and Index Options') by prefix matching.
+    """
     if not row or not row[0]:
         return None
     first = row[0].strip()
-    if first in ALL_ASSET_LABELS and _is_all_empty(row, 1):
+    if not _is_all_empty(row, 1):
+        return None
+    # Exact match first
+    if first in ALL_ASSET_LABELS:
         return first
+    # Prefix match for truncated labels (min 6 chars to avoid false positives)
+    if len(first) >= 6:
+        for label in ALL_ASSET_LABELS:
+            if label.startswith(first):
+                return label
     return None
 
 
@@ -231,14 +254,24 @@ def _is_headed_table(table: list[list[str]]) -> bool:
     if first_cell in ("Symbol", "Description"):
         return True
 
-    # Section header (but NOT "Open Positions" — that's a page running header)
-    if first_cell in SECTION_NAMES and first_cell != "Open Positions":
-        if _is_all_empty(first_row, 1):
-            return True
+    # Section header — starts a new logical table
+    if first_cell in SECTION_NAMES and _is_all_empty(first_row, 1):
+        return True
+    # Also match truncated section names (pdfplumber truncates long labels)
+    if _is_all_empty(first_row, 1):
+        for name in SECTION_NAMES:
+            if len(first_cell) >= 10 and name.startswith(first_cell):
+                return True
 
     # Asset class sub-header → new logical group
-    if first_cell in ALL_ASSET_LABELS and _is_all_empty(first_row, 1):
-        return True
+    if _is_all_empty(first_row, 1):
+        if first_cell in ALL_ASSET_LABELS:
+            return True
+        # Prefix match for truncated labels
+        if len(first_cell) >= 6:
+            for label in ALL_ASSET_LABELS:
+                if label.startswith(first_cell):
+                    return True
 
     return False
 
@@ -446,6 +479,7 @@ def _extract_positions(
     skipped: list[dict] = []
     in_section = False
     current_asset_class: str | None = None
+    current_currency: str = "USD"
     col_mapping: dict[int, str] = {}
 
     for row in rows:
@@ -491,6 +525,7 @@ def _extract_positions(
 
         # Currency sub-header
         if _is_currency(row):
+            current_currency = row[0].strip()
             continue
 
         # Total rows
@@ -530,7 +565,7 @@ def _extract_positions(
                 market_price=_to_decimal(fields.get("market_price")),
                 market_value=_to_decimal(fields.get("market_value")),
                 unrealized_pnl=_to_decimal(fields.get("unrealized_pnl")),
-                currency="USD",
+                currency=current_currency,
                 statement_date=period_end,
                 **opt_fields,
             )
@@ -723,6 +758,7 @@ def _extract_trades(rows: list[list[str]]) -> tuple[list[Trade], list[dict]]:
     skipped: list[dict] = []
     in_section = False
     current_asset_class: str | None = None
+    current_currency: str = "USD"
     col_mapping: dict[int, str] = {}
 
     for row in rows:
@@ -755,6 +791,7 @@ def _extract_trades(rows: list[list[str]]) -> tuple[list[Trade], list[dict]]:
             continue
 
         if _is_currency(row):
+            current_currency = row[0].strip()
             continue
 
         if _is_total(row):
@@ -798,7 +835,7 @@ def _extract_trades(rows: list[list[str]]) -> tuple[list[Trade], list[dict]]:
                 proceeds=_to_decimal(fields.get("proceeds")),
                 commission=_to_decimal(fields.get("commission")),
                 realized_pnl=_to_decimal(fields.get("realized_pnl")),
-                currency="USD",
+                currency=current_currency,
                 **opt_fields,
             )
             trades.append(trade)
