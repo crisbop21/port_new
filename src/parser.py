@@ -210,17 +210,115 @@ def _is_total(row: list[str]) -> bool:
 
 # ── Table extraction ─────────────────────────────────────────────────────────
 
+def _is_headed_table(table: list[list[str]]) -> bool:
+    """Check if a table starts with a recognized structural row.
+
+    A 'headed' table starts with a column header (Symbol/Description),
+    a section header, or an asset class sub-header — indicating it's
+    a new logical table, not a continuation of the previous one.
+
+    Tables that start with "Open Positions" followed by a column header
+    are treated as continuations (page running header re-emission).
+    """
+    if not table:
+        return False
+    first_row = table[0]
+    if not first_row or not first_row[0]:
+        return False
+    first_cell = first_row[0].strip()
+
+    # Column header → new headed table
+    if first_cell in ("Symbol", "Description"):
+        return True
+
+    # Section header (but NOT "Open Positions" — that's a page running header)
+    if first_cell in SECTION_NAMES and first_cell != "Open Positions":
+        if _is_all_empty(first_row, 1):
+            return True
+
+    # Asset class sub-header → new logical group
+    if first_cell in ALL_ASSET_LABELS and _is_all_empty(first_row, 1):
+        return True
+
+    return False
+
+
+def _merge_continuation_tables(
+    tables: list[list[list[str]]],
+) -> list[list[list[str]]]:
+    """Merge headerless continuation tables into the previous headed table.
+
+    IBKR PDFs break long tables across pages. pdfplumber extracts each
+    page fragment as a separate table. Continuation fragments often lack
+    column headers and may have different column counts.
+
+    This function:
+    1. Detects tables without column headers (continuations)
+    2. Appends their rows to the previous headed table
+    3. Pads or trims rows to match the headed table's column count
+    """
+    if not tables:
+        return []
+
+    merged: list[list[list[str]]] = []
+
+    for table in tables:
+        if not table:
+            continue
+
+        if _is_headed_table(table):
+            # New logical table
+            merged.append(list(table))
+        elif not merged:
+            # First table has no header — start a new group anyway
+            merged.append(list(table))
+        else:
+            # Continuation — merge into previous table
+            prev_table = merged[-1]
+            # Determine target column count from the previous table
+            target_cols = max(len(row) for row in prev_table) if prev_table else 0
+
+            for row in table:
+                # Skip re-emitted "Open Positions" page running headers
+                first_cell = (row[0] or "").strip() if row else ""
+                if first_cell == "Open Positions" and _is_all_empty(row, 1):
+                    continue
+
+                if len(row) < target_cols:
+                    # Pad with empty strings
+                    row = row + [""] * (target_cols - len(row))
+                elif len(row) > target_cols and target_cols > 0:
+                    # Trim to match
+                    row = row[:target_cols]
+                prev_table.append(row)
+
+    return merged
+
+
 def _extract_tables(pdf_file: BinaryIO) -> list[list[str]]:
-    """Return all table rows across all pages as lists of strings."""
+    """Return all table rows across all pages as lists of strings.
+
+    Merges continuation tables (headerless page fragments) into their
+    parent tables to ensure consistent column counts.
+    """
     import pdfplumber  # lazy import — heavy dep only needed at parse time
 
-    all_rows: list[list[str]] = []
+    raw_tables: list[list[list[str]]] = []
     with pdfplumber.open(pdf_file) as pdf:
         for page in pdf.pages:
             tables = page.extract_tables()
             for table in tables:
-                for row in table:
-                    all_rows.append([cell if cell is not None else "" for cell in row])
+                normalized = [
+                    [cell if cell is not None else "" for cell in row]
+                    for row in table
+                ]
+                raw_tables.append(normalized)
+
+    merged_tables = _merge_continuation_tables(raw_tables)
+
+    all_rows: list[list[str]] = []
+    for table in merged_tables:
+        all_rows.extend(table)
     return all_rows
 
 
@@ -356,6 +454,11 @@ def _extract_positions(
 
         section = _is_section_header(row)
         if section == "Open Positions":
+            if in_section:
+                # Re-encountered "Open Positions" — page running header
+                # on continuation page.  Do NOT reset state.
+                logger.debug("Skipping re-emitted Open Positions header")
+                continue
             in_section = True
             current_asset_class = None
             col_mapping = {}
@@ -476,6 +579,13 @@ def diagnose_positions(rows: list[list[str]]) -> list[dict]:
 
         section = _is_section_header(row)
         if section == "Open Positions":
+            if in_section:
+                # Re-emitted page running header — skip without reset
+                entry["classification"] = "section_header"
+                entry["detail"] = "Open Positions (re-emitted, state retained)"
+                entry["asset_class"] = current_asset_class
+                result.append(entry)
+                continue
             in_section = True
             current_asset_class = None
             col_mapping = {}

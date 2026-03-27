@@ -16,6 +16,7 @@ from src.parser import (
     _extract_positions,
     _extract_trades,
     _is_total,
+    _merge_continuation_tables,
     _parse_datetime,
     _parse_option_symbol,
     _split_accounts,
@@ -242,6 +243,146 @@ class TestSplitAccounts:
         assert len(groups) == 2
 
 
+# ── Continuation table merging ──────────────────────────────────────────────
+
+class TestMergeContinuationTables:
+    def test_headed_tables_unchanged(self):
+        """Tables that start with column headers are left as-is."""
+        tables = [
+            [
+                ["Symbol", "Quantity", "Value"],
+                ["AAPL", "100", "17550"],
+            ],
+            [
+                ["Symbol", "Quantity", "Value"],
+                ["MSFT", "50", "20000"],
+            ],
+        ]
+        merged = _merge_continuation_tables(tables)
+        assert len(merged) == 2
+
+    def test_headerless_continuation_merged(self):
+        """Table without column headers is merged into previous table."""
+        tables = [
+            [
+                ["Symbol", "Quantity", "Value"],
+                ["AAPL", "100", "17550"],
+            ],
+            [
+                # No "Symbol" header — this is a continuation
+                ["SOFI", "400", "6624"],
+                ["VALE", "100", "1514"],
+            ],
+        ]
+        merged = _merge_continuation_tables(tables)
+        assert len(merged) == 1
+        # header + AAPL from table 1, then SOFI + VALE appended
+        assert len(merged[0]) == 4
+
+    def test_continuation_columns_padded(self):
+        """Continuation table with fewer columns gets padded."""
+        tables = [
+            [
+                ["Symbol", "Quantity", "Mult", "Cost Price", "Value"],
+                ["AAPL", "100", "1", "150", "17550"],
+            ],
+            [
+                # Fewer columns — pdfplumber inferred different layout
+                ["SOFI", "400", "6624"],
+            ],
+        ]
+        merged = _merge_continuation_tables(tables)
+        assert len(merged) == 1
+        sofi_row = merged[0][-1]
+        assert len(sofi_row) == 5  # padded to match header table
+
+    def test_continuation_columns_trimmed(self):
+        """Continuation table with more columns gets trimmed."""
+        tables = [
+            [
+                ["Symbol", "Quantity", "Value"],
+                ["AAPL", "100", "17550"],
+            ],
+            [
+                ["SOFI", "400", "6624", "extra1", "extra2"],
+            ],
+        ]
+        merged = _merge_continuation_tables(tables)
+        assert len(merged) == 1
+        sofi_row = merged[0][-1]
+        assert len(sofi_row) == 3  # trimmed to match
+
+    def test_section_header_starts_new_table(self):
+        """A table starting with a section header is NOT a continuation."""
+        tables = [
+            [
+                ["Symbol", "Quantity", "Value"],
+                ["AAPL", "100", "17550"],
+            ],
+            [
+                ["Trades", "", ""],
+                ["Symbol", "Date/Time", "Quantity"],
+                ["AAPL", "2026-01-15", "50"],
+            ],
+        ]
+        merged = _merge_continuation_tables(tables)
+        assert len(merged) == 2  # separate tables
+
+    def test_asset_class_header_starts_new_group(self):
+        """A table starting with an asset class header is NOT a continuation."""
+        tables = [
+            [
+                ["Symbol", "Quantity", "Value"],
+                ["AAPL", "100", "17550"],
+            ],
+            [
+                ["Equity and Index Options", "", ""],
+                ["EEM 31MAR26 48 C", "6", "5806"],
+            ],
+        ]
+        merged = _merge_continuation_tables(tables)
+        assert len(merged) == 2
+
+    def test_open_positions_reemission_is_continuation(self):
+        """'Open Positions' re-emitted as page running header is a continuation."""
+        tables = [
+            [
+                ["Open Positions", "", "", "", ""],
+                ["Symbol", "Quantity", "Mult", "Value", "Code"],
+                ["Stocks", "", "", "", ""],
+                ["AAPL", "100", "1", "17550", ""],
+            ],
+            [
+                # Page header re-emits Open Positions — this is NOT a new section
+                ["Open Positions", "", "", "", ""],
+                ["Symbol", "Quantity", "Mult", "Value", "Code"],
+                ["SOFI", "400", "1", "6624", ""],
+            ],
+        ]
+        merged = _merge_continuation_tables(tables)
+        # The re-emitted "Open Positions" + header should be merged
+        assert len(merged) == 1
+        symbols = [row[0] for row in merged[0] if row[0] not in
+                   ("Open Positions", "Symbol", "Stocks", "")]
+        assert "AAPL" in symbols
+        assert "SOFI" in symbols
+
+    def test_empty_table_ignored(self):
+        """Empty tables should be skipped."""
+        tables = [
+            [
+                ["Symbol", "Quantity"],
+                ["AAPL", "100"],
+            ],
+            [],
+            [
+                ["SOFI", "400"],
+            ],
+        ]
+        merged = _merge_continuation_tables(tables)
+        assert len(merged) == 1
+
+
 # ── Position extraction ──────────────────────────────────────────────────────
 
 class TestExtractPositions:
@@ -267,6 +408,67 @@ class TestExtractPositions:
         rows = _position_rows()
         positions, _ = _extract_positions(rows, date(2026, 3, 6))
         assert len(positions) == 3  # 2 stocks + 1 option
+
+    def test_reentry_open_positions_retains_asset_class(self):
+        """When 'Open Positions' appears again (page running header on
+        continuation page), the parser must NOT reset current_asset_class.
+
+        Real IBKR PDFs repeat the section header as a page running header
+        on every page. Without this fix, all positions on continuation
+        pages are silently dropped.
+        """
+        rows = [
+            ["Open Positions", "", "", "", "", "", "", "", ""],
+            ["Symbol", "Quantity", "Mult", "Cost Price", "Cost Basis",
+             "Close Price", "Value", "Unrealized P/L", "Code"],
+            ["Stocks", "", "", "", "", "", "", "", ""],
+            ["USD", "", "", "", "", "", "", "", ""],
+            ["AAPL", "100", "1", "150.00", "15,000.00",
+             "175.50", "17,550.00", "2,550.00", ""],
+            ["Total", "", "", "", "15,000.00", "", "17,550.00", "2,550.00", ""],
+            # ── Page break: running header re-emits "Open Positions" ──
+            ["Open Positions", "", "", "", "", "", "", "", ""],
+            ["Symbol", "Quantity", "Mult", "Cost Price", "Cost Basis",
+             "Close Price", "Value", "Unrealized P/L", "Code"],
+            # No "Stocks" re-emission — asset class must carry forward
+            ["SOFI", "400", "1", "26.18", "10,472.00",
+             "16.56", "6,624.00", "-3,848.00", ""],
+            ["Total", "", "", "", "10,472.00", "", "6,624.00", "-3,848.00", ""],
+        ]
+        positions, skipped = _extract_positions(rows, date(2026, 3, 6))
+        symbols = [p.symbol for p in positions]
+        assert "SOFI" in symbols, (
+            f"SOFI missing: {symbols}. Re-entering Open Positions reset "
+            "current_asset_class, dropping continuation page positions."
+        )
+        assert len(positions) == 2
+        sofi = [p for p in positions if p.symbol == "SOFI"][0]
+        assert sofi.asset_class == "STK"
+        assert sofi.quantity == Decimal("400")
+
+    def test_reentry_open_positions_with_currency_no_asset_class(self):
+        """Continuation page with Open Positions + currency but no asset class."""
+        rows = [
+            ["Open Positions", "", "", "", "", "", "", "", ""],
+            ["Symbol", "Quantity", "Mult", "Cost Price", "Cost Basis",
+             "Close Price", "Value", "Unrealized P/L", "Code"],
+            ["Stocks", "", "", "", "", "", "", "", ""],
+            ["USD", "", "", "", "", "", "", "", ""],
+            ["AAPL", "100", "1", "150.00", "15,000.00",
+             "175.50", "17,550.00", "2,550.00", ""],
+            ["Total", "", "", "", "15,000.00", "", "17,550.00", "2,550.00", ""],
+            # ── Page break ──
+            ["Open Positions", "", "", "", "", "", "", "", ""],
+            ["Symbol", "Quantity", "Mult", "Cost Price", "Cost Basis",
+             "Close Price", "Value", "Unrealized P/L", "Code"],
+            ["USD", "", "", "", "", "", "", "", ""],
+            ["SOFI", "400", "1", "26.18", "10,472.00",
+             "16.56", "6,624.00", "-3,848.00", ""],
+        ]
+        positions, _ = _extract_positions(rows, date(2026, 3, 6))
+        symbols = [p.symbol for p in positions]
+        assert "SOFI" in symbols
+        assert len(positions) == 2
 
     def test_unsupported_asset_class_skipped(self):
         extra = [

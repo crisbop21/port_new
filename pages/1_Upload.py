@@ -166,15 +166,35 @@ if uploaded is not None:
                         df["Detail"].str.lower().str.contains(search_lower, na=False)
                         | df["First Cell"].str.lower().str.contains(search_lower, na=False)
                     )
-                    df_filtered = df[mask]
-                    if df_filtered.empty:
+                    match_indices = df.index[mask].tolist()
+                    if not match_indices:
                         st.warning(
                             f"Symbol **{search}** not found in any row. "
                             "This means pdfplumber did not extract it from the PDF at all. "
                             "The issue is at the PDF extraction level, not the parser."
                         )
                     else:
-                        st.dataframe(df_filtered, use_container_width=True, hide_index=True)
+                        st.dataframe(df.loc[mask], use_container_width=True, hide_index=True)
+
+                        # Show context around problem matches
+                        problem_matches = [
+                            idx for idx in match_indices
+                            if df.loc[idx, "Classification"] in {
+                                "skipped_no_asset_class", "skipped_no_mapping",
+                                "skipped_empty_symbol", "error",
+                            }
+                        ]
+                        if problem_matches:
+                            st.markdown("**Context around skipped/errored rows** "
+                                        "(5 rows before & after):")
+                            context_indices: set[int] = set()
+                            for idx in problem_matches:
+                                for offset in range(-5, 6):
+                                    ctx = idx + offset
+                                    if 0 <= ctx < len(df):
+                                        context_indices.add(ctx)
+                            ctx_df = df.loc[sorted(context_indices)]
+                            st.dataframe(ctx_df, use_container_width=True, hide_index=True)
                 else:
                     # Color-code: show problem rows prominently
                     problem_classifications = {
