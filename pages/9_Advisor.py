@@ -35,12 +35,14 @@ if not api_key:
 
 account_ids = get_account_ids()
 if not account_ids:
-    st.info("No statements uploaded yet. Go to **Upload** to import a PDF.")
+    st.info("No statements uploaded yet.")
+    st.page_link("pages/1_Upload.py", label="Go to Upload", icon="📤")
     st.stop()
 
-account_options = ["All Accounts"] + account_ids
-selected_account = st.selectbox("Account", account_options, key="advisor_account")
-account_filter = None if selected_account == "All Accounts" else selected_account
+with st.sidebar:
+    account_options = ["All Accounts"] + account_ids
+    selected_account = st.selectbox("Account", account_options, key="advisor_account")
+    account_filter = None if selected_account == "All Accounts" else selected_account
 
 # ── Volatility overrides ────────────────────────────────────────────────────
 
@@ -130,6 +132,8 @@ if st.session_state.get("advisor_context_str"):
         st.markdown(st.session_state.advisor_context_str)
 elif st.session_state.get("advisor_context") is None:
     st.warning("No positions found. Upload statements and fetch prices first.")
+    st.page_link("pages/1_Upload.py", label="Go to Upload", icon="📤")
+    st.page_link("pages/6_Prices.py", label="Fetch prices", icon="📈")
     st.stop()
 
 # ── Chat interface ──────────────────────────────────────────────────────────

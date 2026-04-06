@@ -26,16 +26,19 @@ st.title("Technical Analysis")
 
 account_ids = get_account_ids()
 if not account_ids:
-    st.info("No statements uploaded yet. Go to **Upload** to import a PDF.")
+    st.info("No statements uploaded yet.")
+    st.page_link("pages/1_Upload.py", label="Go to Upload", icon="📤")
     st.stop()
 
-account_options = ["All Accounts"] + account_ids
-selected_account = st.selectbox("Account", account_options)
-account_filter = None if selected_account == "All Accounts" else selected_account
+with st.sidebar:
+    account_options = ["All Accounts"] + account_ids
+    selected_account = st.selectbox("Account", account_options)
+    account_filter = None if selected_account == "All Accounts" else selected_account
 
 symbols = get_portfolio_symbols(account_id=account_filter)
 if not symbols:
-    st.info("No stock/ETF positions found. Upload a statement with holdings first.")
+    st.info("No stock/ETF positions found.")
+    st.page_link("pages/1_Upload.py", label="Upload a statement with holdings", icon="📤")
     st.stop()
 
 # ── Controls ─────────────────────────────────────────────────────────────────
@@ -104,13 +107,12 @@ for sym in symbols:
         missing_symbols.append(sym)
 
 if missing_symbols:
-    st.warning(
-        f"No price data for: {', '.join(missing_symbols)}. "
-        f"Fetch prices on the **Prices** page first."
-    )
+    st.warning(f"No price data for: {', '.join(missing_symbols)}.")
+    st.page_link("pages/6_Prices.py", label="Fetch prices", icon="📈")
 
 if not price_data:
-    st.info("No price data available. Go to **Prices** to fetch daily prices first.")
+    st.info("No price data available. Fetch daily prices first.")
+    st.page_link("pages/6_Prices.py", label="Go to Prices", icon="📈")
     st.stop()
 
 # ── Compute rankings ─────────────────────────────────────────────────────────

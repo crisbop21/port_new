@@ -9,7 +9,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import pandas as pd
 import streamlit as st
 
-from src.db import get_account_ids, get_positions, get_statements, get_trades
+from src.db import (
+    get_account_ids,
+    get_daily_prices,
+    get_latest_price,
+    get_metrics_for_symbols,
+    get_portfolio_symbols,
+    get_positions,
+    get_statements,
+    get_trades,
+    get_latest_valuation_snapshots,
+)
 
 st.title("Dashboard")
 
@@ -17,11 +27,106 @@ st.title("Dashboard")
 
 account_ids = get_account_ids()
 if not account_ids:
-    st.info("No statements uploaded yet. Go to **Upload** to import a PDF.")
+    st.info("No statements uploaded yet.")
+    st.page_link("pages/1_Upload.py", label="Go to Upload", icon="📤")
     st.stop()
 
-account_options = ["All Accounts"] + account_ids
-selected_account = st.selectbox("Account", account_options)
+with st.sidebar:
+    account_options = ["All Accounts"] + account_ids
+    selected_account = st.selectbox("Account", account_options)
+
+# ── Setup Progress Tracker ─────────────────────────────────────────────────
+
+account_filter = None if selected_account == "All Accounts" else selected_account
+
+
+def _check_data_readiness(acct_filter):
+    """Check which data sources are populated and return a status dict."""
+    status = {}
+
+    # 1. Statements & positions
+    stmts = get_statements()
+    acct_stmts = [s for s in stmts if not acct_filter or s["account_id"] == acct_filter]
+    status["statements"] = len(acct_stmts)
+
+    pos_count = 0
+    for s in acct_stmts[:1]:  # check latest only
+        pos_count = len(get_positions(s["id"])) if acct_stmts else 0
+    status["positions"] = pos_count
+
+    # 2. Trades
+    trades = get_trades(account_id=acct_filter)
+    status["trades"] = len(trades)
+
+    # 3. Symbols
+    symbols = get_portfolio_symbols(account_id=acct_filter)
+    status["symbols"] = symbols
+
+    # 4. Daily prices
+    prices_ok = 0
+    for sym in symbols[:5]:  # sample check
+        p = get_latest_price(sym)
+        if p:
+            prices_ok += 1
+    status["has_prices"] = prices_ok > 0 if symbols else False
+
+    # 5. Fundamentals
+    if symbols:
+        metrics = get_metrics_for_symbols(symbols)
+        status["has_metrics"] = len(metrics) > 0
+    else:
+        status["has_metrics"] = False
+
+    # 6. Valuation snapshots
+    if symbols:
+        snaps = get_latest_valuation_snapshots(symbols[:3])
+        status["has_valuation"] = len(snaps) > 0
+    else:
+        status["has_valuation"] = False
+
+    return status
+
+
+with st.expander("Data Setup Progress", expanded=False):
+    readiness = _check_data_readiness(account_filter)
+
+    def _status_icon(ok):
+        return "✅" if ok else "⬜"
+
+    steps = [
+        (_status_icon(readiness["statements"] > 0),
+         f"Statements uploaded ({readiness['statements']})",
+         None),
+        (_status_icon(readiness["positions"] > 0),
+         f"Holdings loaded ({readiness['positions']} positions)",
+         None),
+        (_status_icon(readiness["trades"] > 0),
+         f"Trades imported ({readiness['trades']} trades)",
+         None),
+        (_status_icon(readiness["has_prices"]),
+         "Daily prices fetched",
+         "pages/6_Prices.py" if not readiness["has_prices"] else None),
+        (_status_icon(readiness["has_metrics"]),
+         "SEC fundamentals loaded",
+         "pages/5_Metrics.py" if not readiness["has_metrics"] else None),
+        (_status_icon(readiness["has_valuation"]),
+         "Valuation scores computed",
+         "pages/8_Valuation.py" if not readiness["has_valuation"] else None),
+    ]
+
+    for icon, label, link in steps:
+        if link:
+            col_icon, col_label, col_link = st.columns([0.5, 6, 2])
+            col_icon.markdown(icon)
+            col_label.markdown(label)
+            col_link.page_link(link, label="Set up →")
+        else:
+            col_icon, col_label = st.columns([0.5, 8])
+            col_icon.markdown(icon)
+            col_label.markdown(label)
+
+    done = sum(1 for i, l, _ in steps if i == "✅")
+    st.progress(done / len(steps), text=f"{done}/{len(steps)} complete")
 
 # ── Load data ────────────────────────────────────────────────────────────────
 
@@ -29,7 +134,8 @@ with st.spinner("Loading portfolio data..."):
     statements = get_statements()
 
     if not statements:
-        st.info("No statements uploaded yet. Go to **Upload** to import a PDF.")
+        st.info("No statements uploaded yet.")
+        st.page_link("pages/1_Upload.py", label="Go to Upload", icon="📤")
         st.stop()
 
     if selected_account == "All Accounts":
@@ -51,7 +157,6 @@ with st.spinner("Loading portfolio data..."):
         latest = acct_statements[0]
         positions = get_positions(latest["id"])
 
-    account_filter = None if selected_account == "All Accounts" else selected_account
     trades = get_trades(
         account_id=account_filter,
         date_from=date.today() - timedelta(days=365),
