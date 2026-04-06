@@ -206,7 +206,8 @@ else:
                 if len(bench_prices) < 60:
                     st.error(
                         f"Not enough price data for **{benchmark}** ({len(bench_prices)} rows, "
-                        f"need at least 60). Go to **Prices** page to fetch {benchmark} prices first."
+                        f"need at least 60). Go to **Prices** page and click "
+                        f"**Fetch All Portfolio Prices** — it now includes {benchmark} automatically."
                     )
                 else:
                     # Fetch prices for each symbol
