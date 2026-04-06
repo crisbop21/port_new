@@ -14,17 +14,17 @@ logger = logging.getLogger(__name__)
 
 from src.db import (
     get_account_ids,
-    get_daily_prices,
     get_positions_as_of,
     get_snapshot_dates,
     reconcile_account,
     reconcile_pair,
-    upsert_daily_prices,
 )
 
-# Beta imports — guarded so the rest of the page still works if something is off
+# Beta imports — ALL beta-related imports guarded so the page still works
 _BETA_AVAILABLE = False
+_beta_import_err_msg = ""
 try:
+    from src.db import get_daily_prices, upsert_daily_prices
     from src.beta import compute_portfolio_beta, BENCHMARKS
     from src.price_fetcher import fetch_daily_prices
     _BETA_AVAILABLE = True
