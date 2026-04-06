@@ -132,12 +132,16 @@ st.divider()
 
 st.subheader("Portfolio Beta")
 
-benchmark = st.selectbox(
-    "Benchmark",
-    options=sorted(BENCHMARKS),
-    index=0,  # QQQ first alphabetically
-    help="Select the benchmark index to compute beta against.",
-)
+beta_col1, beta_col2 = st.columns([1, 1])
+with beta_col1:
+    benchmark = st.selectbox(
+        "Benchmark",
+        options=sorted(BENCHMARKS),
+        index=0,  # QQQ first alphabetically
+        help="Select the benchmark index to compute beta against.",
+    )
+with beta_col2:
+    calculate_beta = st.button("Calculate Beta", type="primary")
 
 # Collect unique stock/ETF symbols for beta (use underlying for options)
 beta_symbols: set[str] = set()
@@ -149,72 +153,76 @@ for _, row in df.iterrows():
     else:
         beta_symbols.add(sym)
 
-# Fetch benchmark + symbol prices (auto-fetch if missing)
-lookback_start = as_of - timedelta(days=400)  # extra buffer for 252 trading days
+# Store beta results in session state so they persist across reruns
+if "beta_result" not in st.session_state:
+    st.session_state.beta_result = None
+    st.session_state.beta_benchmark = None
 
+if calculate_beta:
+    lookback_start = as_of - timedelta(days=400)  # buffer for 252 trading days
 
-@st.cache_data(ttl=300, show_spinner=False)
-def _load_beta_data(
-    symbols: tuple[str, ...], bench: str, start: date, end: date
-):
-    """Load prices and compute betas for all symbols vs benchmark."""
-    # Ensure benchmark prices exist
-    bench_prices = get_daily_prices(bench, date_from=start, date_to=end)
-    if len(bench_prices) < 60:
-        fetched, _ = fetch_daily_prices(bench, start=start, end=end)
-        if fetched:
-            upsert_daily_prices(fetched)
-            bench_prices = get_daily_prices(bench, date_from=start, date_to=end)
+    with st.spinner(f"Fetching prices and computing beta vs {benchmark}..."):
+        try:
+            # Fetch benchmark prices (auto-fetch if missing)
+            bench_prices = get_daily_prices(benchmark, date_from=lookback_start, date_to=as_of)
+            if len(bench_prices) < 60:
+                fetched, errs = fetch_daily_prices(benchmark, start=lookback_start, end=as_of)
+                if fetched:
+                    upsert_daily_prices(fetched)
+                    bench_prices = get_daily_prices(benchmark, date_from=lookback_start, date_to=as_of)
 
-    holdings_for_beta: dict[str, dict] = {}
-    for sym in symbols:
-        sym_prices = get_daily_prices(sym, date_from=start, date_to=end)
-        if len(sym_prices) < 60:
-            fetched, _ = fetch_daily_prices(sym, start=start, end=end)
-            if fetched:
-                upsert_daily_prices(fetched)
-                sym_prices = get_daily_prices(sym, date_from=start, date_to=end)
-        holdings_for_beta[sym] = {"market_value": 0.0, "prices": sym_prices}
+            if len(bench_prices) < 60:
+                st.error(
+                    f"Not enough price data for {benchmark} ({len(bench_prices)} rows, "
+                    f"need at least 60). Go to **Prices** page to fetch {benchmark} prices."
+                )
+            else:
+                # Fetch prices for each symbol
+                holdings_for_beta: dict[str, dict] = {}
+                for sym in sorted(beta_symbols):
+                    sym_prices = get_daily_prices(sym, date_from=lookback_start, date_to=as_of)
+                    if len(sym_prices) < 60:
+                        fetched, _ = fetch_daily_prices(sym, start=lookback_start, end=as_of)
+                        if fetched:
+                            upsert_daily_prices(fetched)
+                            sym_prices = get_daily_prices(sym, date_from=lookback_start, date_to=as_of)
+                    # Compute market value for this underlying
+                    mv = 0.0
+                    for _, r in df.iterrows():
+                        underlying = r["symbol"].split(" ")[0] if r["asset_class"] == "OPT" and " " in r["symbol"] else r["symbol"]
+                        if underlying == sym:
+                            mv += abs(float(r.get("market_value", 0) or 0))
+                    holdings_for_beta[sym] = {"market_value": mv, "prices": sym_prices}
 
-    return bench_prices, holdings_for_beta
+                result = compute_portfolio_beta(holdings_for_beta, bench_prices)
+                st.session_state.beta_result = result
+                st.session_state.beta_benchmark = benchmark
 
+        except Exception as e:
+            st.error(f"Beta calculation error: {e}")
 
-bench_prices, holdings_for_beta = _load_beta_data(
-    tuple(sorted(beta_symbols)), benchmark, lookback_start, as_of,
-)
+# Display beta results if available
+beta_result = st.session_state.get("beta_result")
+beta_benchmark = st.session_state.get("beta_benchmark")
 
-# Attach market values from consolidated data (computed later, but we need it now)
-# First compute per-symbol market values
-_sym_mv: dict[str, float] = {}
-for _, row in df.iterrows():
-    sym = row["symbol"]
-    ac = row["asset_class"]
-    underlying = sym.split(" ")[0] if ac == "OPT" and " " in sym else sym
-    mv = abs(float(row.get("market_value", 0) or 0))
-    _sym_mv[underlying] = _sym_mv.get(underlying, 0.0) + mv
-
-for sym in holdings_for_beta:
-    holdings_for_beta[sym]["market_value"] = _sym_mv.get(sym, 0.0)
-
-beta_result = compute_portfolio_beta(holdings_for_beta, bench_prices)
-
-# Display portfolio-level beta metrics
-if beta_result["portfolio_beta"] is not None:
-    bc1, bc2, bc3 = st.columns(3)
-    bc1.metric(f"Portfolio Beta vs {benchmark}", f"{beta_result['portfolio_beta']:.2f}")
-    bc2.metric(
-        f"Dollar Beta vs {benchmark}",
-        f"${beta_result['portfolio_dollar_beta']:,.0f}",
-        help="For every 1% move in the benchmark, portfolio moves by approx this dollar amount / 100.",
-    )
-    # Count how many symbols have valid beta
-    valid_count = sum(1 for b in beta_result["betas"].values() if b is not None)
-    bc3.metric("Symbols with Beta", f"{valid_count}/{len(beta_result['betas'])}")
+if beta_result is not None and beta_benchmark is not None:
+    if beta_result["portfolio_beta"] is not None:
+        bc1, bc2, bc3 = st.columns(3)
+        bc1.metric(f"Portfolio Beta vs {beta_benchmark}", f"{beta_result['portfolio_beta']:.2f}")
+        bc2.metric(
+            f"Dollar Beta vs {beta_benchmark}",
+            f"${beta_result['portfolio_dollar_beta']:,.0f}",
+            help="For every 1% move in the benchmark, portfolio moves by approx this dollar amount / 100.",
+        )
+        valid_count = sum(1 for b in beta_result["betas"].values() if b is not None)
+        bc3.metric("Symbols with Beta", f"{valid_count}/{len(beta_result['betas'])}")
+    else:
+        st.warning(
+            f"Could not compute portfolio beta. Ensure daily prices are fetched "
+            f"for your holdings and {beta_benchmark} (go to **Prices** page)."
+        )
 else:
-    st.warning(
-        f"Could not compute portfolio beta. Ensure daily prices are fetched "
-        f"for your holdings and {benchmark} (go to **Prices** page)."
-    )
+    st.caption("Click **Calculate Beta** to compute portfolio beta vs the selected benchmark.")
 
 st.divider()
 
@@ -279,33 +287,43 @@ consol_df["pct_of_account"] = (
 )
 consol_df = consol_df.sort_values("market_value", ascending=False).reset_index(drop=True)
 
-# Add beta and dollar beta columns from beta_result
-consol_df["beta"] = consol_df["symbol"].map(
-    lambda s: beta_result["betas"].get(s)
-)
-consol_df["dollar_beta"] = consol_df["symbol"].map(
-    lambda s: beta_result["dollar_betas"].get(s)
-)
+# Add beta and dollar beta columns if beta has been calculated
+if beta_result is not None:
+    consol_df["beta"] = consol_df["symbol"].map(
+        lambda s: beta_result["betas"].get(s)
+    )
+    consol_df["dollar_beta"] = consol_df["symbol"].map(
+        lambda s: beta_result["dollar_betas"].get(s)
+    )
 
 col_table, col_chart = st.columns([1, 1])
 
 with col_table:
-    display_mv = consol_df[["symbol", "quantity", "breakeven", "market_value", "pct_of_account", "beta", "dollar_beta"]].copy()
+    base_cols = ["symbol", "quantity", "breakeven", "market_value", "pct_of_account"]
+    if beta_result is not None:
+        base_cols += ["beta", "dollar_beta"]
+
+    display_mv = consol_df[base_cols].copy()
     display_mv["quantity"] = display_mv["quantity"].map(lambda v: f"{v:,.2f}")
     display_mv["breakeven"] = display_mv["breakeven"].map(lambda v: f"${v:,.2f}")
     display_mv["market_value"] = display_mv["market_value"].map(lambda v: f"${v:,.2f}")
     display_mv["pct_of_account"] = display_mv["pct_of_account"].map(lambda v: f"{v:.1f}%")
-    display_mv["beta"] = display_mv["beta"].map(lambda v: f"{v:.2f}" if v is not None else "N/A")
-    display_mv["dollar_beta"] = display_mv["dollar_beta"].map(lambda v: f"${v:,.0f}" if v is not None else "N/A")
-    display_mv = display_mv.rename(columns={
+
+    rename_map = {
         "symbol": "Symbol",
         "quantity": "Total Qty",
         "breakeven": "Avg Breakeven",
         "market_value": "Market Value ($)",
         "pct_of_account": "% of Account",
-        "beta": f"Beta ({benchmark})",
-        "dollar_beta": "Dollar Beta",
-    })
+    }
+
+    if beta_result is not None:
+        display_mv["beta"] = display_mv["beta"].map(lambda v: f"{v:.2f}" if v is not None else "N/A")
+        display_mv["dollar_beta"] = display_mv["dollar_beta"].map(lambda v: f"${v:,.0f}" if v is not None else "N/A")
+        rename_map["beta"] = f"Beta ({beta_benchmark})"
+        rename_map["dollar_beta"] = "Dollar Beta"
+
+    display_mv = display_mv.rename(columns=rename_map)
     st.dataframe(display_mv, use_container_width=True, hide_index=True)
 
 with col_chart:
