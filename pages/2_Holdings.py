@@ -25,7 +25,10 @@ _BETA_AVAILABLE = False
 _beta_import_err_msg = ""
 try:
     from src.db import get_daily_prices, upsert_daily_prices
-    from src.beta import compute_portfolio_beta, BENCHMARKS
+    from src.beta import (
+        compute_portfolio_beta, compute_option_delta, compute_option_beta,
+        BENCHMARKS, DEFAULT_RISK_FREE_RATE,
+    )
     from src.price_fetcher import fetch_daily_prices
     _BETA_AVAILABLE = True
     logger.info("Beta module loaded successfully")
@@ -439,16 +442,122 @@ for asset_class, group in df.groupby("asset_class", sort=True):
 
     show_cols = [c for c in display_cols if c in group.columns]
     detail_df = group[show_cols].sort_values("symbol").reset_index(drop=True).copy()
+
+    # Compute delta and option beta for options positions
+    if asset_class == "OPT" and _BETA_AVAILABLE and _beta_result_for_table is not None:
+        deltas = []
+        opt_betas = []
+        opt_dollar_betas = []
+        for _, orow in detail_df.iterrows():
+            sym = orow["symbol"]
+            underlying = sym.split(" ")[0] if " " in sym else sym
+            strike_val = float(orow.get("strike", 0) or 0)
+            right_val = orow.get("right")
+            expiry_val = orow.get("expiry")
+            mkt_price = float(orow.get("market_price", 0) or 0)
+            qty = float(orow.get("quantity", 0) or 0)
+            mkt_value = float(orow.get("market_value", 0) or 0)
+
+            # Get underlying price from market_price of the underlying
+            # Look up from the latest price in the underlying's beta data
+            underlying_beta = _beta_result_for_table["betas"].get(underlying)
+            underlying_price = None
+            # Get underlying price from any STK/ETF row with same symbol
+            for _, urow in df.iterrows():
+                if urow["symbol"] == underlying and urow["asset_class"] in ("STK", "ETF"):
+                    underlying_price = float(urow.get("market_price", 0) or 0)
+                    break
+
+            # Compute DTE in years
+            dte_years = None
+            if expiry_val:
+                try:
+                    from datetime import date as _date
+                    exp_date = _date.fromisoformat(str(expiry_val)) if isinstance(expiry_val, str) else expiry_val
+                    dte_days = (exp_date - as_of).days
+                    dte_years = max(dte_days, 0) / 365.0
+                except (ValueError, TypeError):
+                    pass
+
+            # Use realized vol from context or a default
+            sigma = 0.30  # default fallback
+            if _BETA_AVAILABLE and underlying_price and underlying_price > 0:
+                lookback_start_vol = as_of - timedelta(days=60)
+                vol_prices = get_daily_prices(underlying, date_from=lookback_start_vol, date_to=as_of)
+                if len(vol_prices) >= 21:
+                    vol_df = pd.DataFrame(vol_prices)
+                    vol_df["adj_close"] = pd.to_numeric(vol_df["adj_close"], errors="coerce")
+                    vol_df = vol_df.sort_values("price_date")
+                    log_ret = np.log(vol_df["adj_close"] / vol_df["adj_close"].shift(1))
+                    computed_vol = log_ret.rolling(20).std().iloc[-1] * np.sqrt(252)
+                    if pd.notna(computed_vol) and computed_vol > 0:
+                        sigma = float(computed_vol)
+
+            # Option price per share
+            option_price_per_share = abs(mkt_price) if mkt_price else 0
+
+            if (underlying_price and underlying_price > 0 and strike_val > 0
+                    and dte_years and dte_years > 0 and right_val and sigma > 0):
+                delta = compute_option_delta(
+                    underlying_price=underlying_price,
+                    strike=strike_val,
+                    dte_years=dte_years,
+                    sigma=sigma,
+                    right=right_val,
+                )
+                ob = compute_option_beta(
+                    underlying_beta=underlying_beta,
+                    underlying_price=underlying_price,
+                    option_price=option_price_per_share if option_price_per_share > 0 else 0.01,
+                    strike=strike_val,
+                    dte_years=dte_years,
+                    sigma=sigma,
+                    right=right_val,
+                )
+            else:
+                delta = None
+                ob = None
+
+            deltas.append(delta)
+            opt_betas.append(ob)
+            # Dollar beta = option_beta * market_value (already accounts for quantity sign via market_value)
+            if ob is not None and mkt_value != 0:
+                opt_dollar_betas.append(ob * abs(mkt_value))
+            else:
+                opt_dollar_betas.append(None)
+
+        detail_df["delta"] = deltas
+        detail_df["opt_beta"] = opt_betas
+        detail_df["opt_dollar_beta"] = opt_dollar_betas
+        show_cols = show_cols + ["delta", "opt_beta", "opt_dollar_beta"]
+
     dollar_cols = ["cost_value", "market_value", "cost_basis", "market_price", "unrealized_pnl", "strike"]
     for col in dollar_cols:
         if col in detail_df.columns:
             detail_df[col] = detail_df[col].map(lambda v: f"${v:,.2f}")
     if "multiplier" in detail_df.columns:
         detail_df["multiplier"] = detail_df["multiplier"].astype(int)
+
+    # Format delta and option beta columns
+    if "delta" in detail_df.columns:
+        detail_df["delta"] = detail_df["delta"].map(
+            lambda v: f"{v:.3f}" if v is not None else "N/A"
+        )
+    if "opt_beta" in detail_df.columns:
+        detail_df["opt_beta"] = detail_df["opt_beta"].map(
+            lambda v: f"{v:.2f}" if v is not None else "N/A"
+        )
+    if "opt_dollar_beta" in detail_df.columns:
+        detail_df["opt_dollar_beta"] = detail_df["opt_dollar_beta"].map(
+            lambda v: f"${v:,.0f}" if v is not None else "N/A"
+        )
+
     col_labels = {
         "cost_value": "Cost Value", "market_value": "Market Value",
         "cost_basis": "Cost Basis", "market_price": "Market Price",
         "unrealized_pnl": "Unrealized P&L", "multiplier": "Mult",
+        "delta": "Delta", "opt_beta": f"Option Beta",
+        "opt_dollar_beta": "Dollar Beta",
     }
     detail_df = detail_df.rename(columns={k: v for k, v in col_labels.items() if k in detail_df.columns})
     st.dataframe(detail_df, use_container_width=True)
