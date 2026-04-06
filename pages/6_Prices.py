@@ -24,16 +24,19 @@ st.title("Daily Prices")
 
 account_ids = get_account_ids()
 if not account_ids:
-    st.info("No statements uploaded yet. Go to **Upload** to import a PDF.")
+    st.info("No statements uploaded yet.")
+    st.page_link("pages/1_Upload.py", label="Go to Upload", icon="📤")
     st.stop()
 
-account_options = ["All Accounts"] + account_ids
-selected_account = st.selectbox("Account", account_options)
-account_filter = None if selected_account == "All Accounts" else selected_account
+with st.sidebar:
+    account_options = ["All Accounts"] + account_ids
+    selected_account = st.selectbox("Account", account_options)
+    account_filter = None if selected_account == "All Accounts" else selected_account
 
 symbols = get_portfolio_symbols(account_filter)
 if not symbols:
-    st.info("No stock/ETF positions found. Upload a statement with holdings first.")
+    st.info("No stock/ETF positions found.")
+    st.page_link("pages/1_Upload.py", label="Upload a statement with holdings", icon="📤")
     st.stop()
 
 # Always include benchmark symbols for beta calculation

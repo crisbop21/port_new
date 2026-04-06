@@ -51,26 +51,27 @@ st.title("Company Valuation & Fundamentals")
 
 account_ids = get_account_ids()
 if not account_ids:
-    st.info("No statements uploaded yet. Go to **Upload** to import a PDF.")
+    st.info("No statements uploaded yet.")
+    st.page_link("pages/1_Upload.py", label="Go to Upload", icon="📤")
     st.stop()
 
-account_options = ["All Accounts"] + account_ids
-selected_account = st.selectbox("Account", account_options)
-account_filter = None if selected_account == "All Accounts" else selected_account
+with st.sidebar:
+    account_options = ["All Accounts"] + account_ids
+    selected_account = st.selectbox("Account", account_options)
+    account_filter = None if selected_account == "All Accounts" else selected_account
 
 symbols = get_portfolio_symbols(account_id=account_filter)
 if not symbols:
-    st.info("No stock/ETF positions found. Upload a statement with holdings first.")
+    st.info("No stock/ETF positions found.")
+    st.page_link("pages/1_Upload.py", label="Upload a statement with holdings", icon="📤")
     st.stop()
 
 # ── Check for required data ──────────────────────────────────────────────────
 
 metrics_data = get_metrics_for_symbols(symbols)
 if not metrics_data:
-    st.warning(
-        "No fundamental metrics in database. "
-        "Go to **Metrics** page and fetch SEC EDGAR data first."
-    )
+    st.warning("No fundamental metrics in database. Fetch SEC EDGAR data first.")
+    st.page_link("pages/5_Metrics.py", label="Go to Metrics", icon="📊")
     st.stop()
 
 symbols_with_data = sorted(metrics_data.keys())
@@ -255,10 +256,8 @@ for sym in symbols_with_data:
     all_scores[sym] = (score, cat_scores)
 
 if missing_prices:
-    st.warning(
-        f"No price data for: {', '.join(missing_prices)}. "
-        f"Fetch prices on the **Prices** page first."
-    )
+    st.warning(f"No price data for: {', '.join(missing_prices)}.")
+    st.page_link("pages/6_Prices.py", label="Fetch prices", icon="📈")
 
 # Show diagnostic for symbols with missing valuation percentiles
 if _valuation_diag:
@@ -376,9 +375,13 @@ if save_clicked:
     else:
         st.warning("No snapshots to save.")
 
-# ── Comparison Table ─────────────────────────────────────────────────────────
+# ── Tabs ────────────────────────────────────────────────────────────────────
 
-st.subheader("Comparison Table")
+val_tab_comp, val_tab_scores, val_tab_pct, val_tab_deep, val_tab_port = st.tabs(
+    ["Comparison", "Scores", "Percentiles", "Deep Dive", "Portfolio"]
+)
+
+# ── Tab: Comparison Table ───────────────────────────────────────────────────
 
 RATIO_DISPLAY = [
     # (key, label, format, higher_is_better)
@@ -428,15 +431,14 @@ for sym in scored_symbols:
     comp_rows.append(row)
 
 comp_df = pd.DataFrame(comp_rows)
-st.dataframe(comp_df, use_container_width=True, hide_index=True)
 
-growth_label = f"{'YoY' if growth_period == 1 else f'{growth_period}yr CAGR'}"
-st.caption(f"Growth period: {growth_label} · Valuation ratios use TTM earnings where available")
+with val_tab_comp:
+    st.subheader("Comparison Table")
+    st.dataframe(comp_df, use_container_width=True, hide_index=True)
+    growth_label = f"{'YoY' if growth_period == 1 else f'{growth_period}yr CAGR'}"
+    st.caption(f"Growth period: {growth_label} · Valuation ratios use TTM earnings where available")
 
 # ── Fundamental Score Ranking ────────────────────────────────────────────────
-
-st.divider()
-st.subheader("Fundamental Score")
 
 
 def _color_score(val):
@@ -476,31 +478,25 @@ score_df.insert(0, "Rank", range(1, len(score_df) + 1))
 score_cols = ["Composite", "Valuation", "Profitability", "Health", "Growth"]
 styled = score_df.style.map(_color_score, subset=score_cols)
 
-st.dataframe(
-    styled,
-    use_container_width=True,
-    hide_index=True,
-    column_config={
-        "Rank": st.column_config.NumberColumn("Rank", width="small"),
-        "Composite": st.column_config.NumberColumn("Composite", format="%.1f"),
-    },
-)
-
-st.caption(
-    f"Preset: **{preset}** · "
-    f"Valuation scored by inverted percentile vs {pct_lookback.lower()} history "
-    f"(cheaper = higher score) · "
-    f"Scores: 0-100 (higher = more favorable)"
-)
+with val_tab_scores:
+    st.subheader("Fundamental Score")
+    st.dataframe(
+        styled,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Rank": st.column_config.NumberColumn("Rank", width="small"),
+            "Composite": st.column_config.NumberColumn("Composite", format="%.1f"),
+        },
+    )
+    st.caption(
+        f"Preset: **{preset}** · "
+        f"Valuation scored by inverted percentile vs {pct_lookback.lower()} history "
+        f"(cheaper = higher score) · "
+        f"Scores: 0-100 (higher = more favorable)"
+    )
 
 # ── Valuation Percentiles ────────────────────────────────────────────────────
-
-st.divider()
-st.subheader("Valuation Percentiles")
-st.caption(
-    "Where each stock's current valuation sits within its own history. "
-    "Low percentile = cheap relative to its past. High = expensive."
-)
 
 pct_rows = []
 for sym in scored_symbols:
@@ -521,268 +517,261 @@ for sym in scored_symbols:
             row[f"{label} %ile"] = "—"
     pct_rows.append(row)
 
-if pct_rows:
-    pct_df = pd.DataFrame(pct_rows)
-    st.dataframe(pct_df, use_container_width=True, hide_index=True)
+with val_tab_pct:
+    st.subheader("Valuation Percentiles")
+    st.caption(
+        "Where each stock's current valuation sits within its own history. "
+        "Low percentile = cheap relative to its past. High = expensive."
+    )
+    if pct_rows:
+        pct_df = pd.DataFrame(pct_rows)
+        st.dataframe(pct_df, use_container_width=True, hide_index=True)
 
 # ── Single-Symbol Deep Dive ──────────────────────────────────────────────────
 
-st.divider()
-st.subheader("Symbol Deep Dive")
+with val_tab_deep:
+    st.subheader("Symbol Deep Dive")
 
-detail_symbol = st.selectbox(
-    "Select symbol",
-    options=scored_symbols,
-    key="val_detail",
-)
-
-if detail_symbol and detail_symbol in all_ratios:
-    ratios = all_ratios[detail_symbol]
-    growth = all_growth.get(detail_symbol, {})
-    percentiles = all_percentiles.get(detail_symbol, {})
-    score, cat_scores = all_scores.get(detail_symbol, (None, {}))
-
-    # Pre-compute historical ratios so the valuation cards and chart
-    # use the same last-observation values (avoids price-source mismatch).
-    if pct_lookback == "3 Years":
-        _dd_hist_start = date.today() - timedelta(days=3 * 365)
-    elif pct_lookback == "5 Years":
-        _dd_hist_start = date.today() - timedelta(days=5 * 365)
-    else:
-        _dd_hist_start = None
-
-    _dd_prices = get_daily_prices(detail_symbol, date_from=_dd_hist_start)
-    _dd_metric_hist: dict[str, list[dict]] = {}
-    if _dd_prices:
-        for _m_name in ("shares_outstanding", "stockholders_equity", "total_assets",
-                        "total_liabilities", "cash_and_equivalents", "revenue",
-                        "net_income", "operating_income", "eps_diluted", "eps_basic"):
-            _m_rows = get_stock_metrics(symbol=detail_symbol, metric_name=_m_name)
-            if _m_rows:
-                _dd_metric_hist[_m_name] = sorted(_m_rows, key=lambda r: str(r.get("period_end", "")))
-
-    _dd_hist_data = compute_historical_ratios(_dd_metric_hist, _dd_prices) if _dd_prices else []
-
-    # Score overview
-    cols = st.columns(5)
-    score_items = [
-        ("Composite", score),
-        ("Valuation", cat_scores.get("valuation")),
-        ("Profitability", cat_scores.get("profitability")),
-        ("Health", cat_scores.get("health")),
-        ("Growth", cat_scores.get("growth")),
-    ]
-    for col, (label, val) in zip(cols, score_items):
-        col.metric(label, f"{val:.1f}" if val is not None else "—")
-
-    # Key ratios in cards
-    st.markdown("**Valuation**")
-    val_cols = st.columns(5)
-    val_items = [
-        ("P/E", ratios.get("pe_ttm"), "{:.1f}", percentiles.get("pe_ttm")),
-        ("P/B", ratios.get("pb"), "{:.2f}", percentiles.get("pb")),
-        ("P/S", ratios.get("ps"), "{:.2f}", percentiles.get("ps")),
-        ("EV/EBITDA", ratios.get("ev_ebitda"), "{:.1f}", percentiles.get("ev_ebitda")),
-        ("PEG", ratios.get("peg"), "{:.2f}", None),
-    ]
-    for col, (label, val, fmt, pct) in zip(val_cols, val_items):
-        if val is not None and not math.isnan(val) and not math.isinf(val):
-            display = fmt.format(val)
-            delta = f"{pct:.0f}th %ile" if pct is not None else None
-        else:
-            display = "—"
-            delta = None
-        col.metric(label, display, delta=delta, delta_color="off")
-
-    st.markdown("**Profitability**")
-    prof_cols = st.columns(5)
-    prof_items = [
-        ("Gross Margin", ratios.get("gross_margin"), "{:.1%}"),
-        ("Op Margin", ratios.get("operating_margin"), "{:.1%}"),
-        ("Net Margin", ratios.get("net_margin"), "{:.1%}"),
-        ("ROE", ratios.get("roe"), "{:.1%}"),
-        ("ROA", ratios.get("roa"), "{:.1%}"),
-    ]
-    for col, (label, val, fmt) in zip(prof_cols, prof_items):
-        if val is not None and not math.isnan(val) and not math.isinf(val):
-            col.metric(label, fmt.format(val))
-        else:
-            col.metric(label, "—")
-
-    st.markdown("**Financial Health**")
-    health_cols = st.columns(5)
-    health_items = [
-        ("D/E", ratios.get("debt_to_equity"), "{:.2f}"),
-        ("Current Ratio", ratios.get("current_ratio"), "{:.2f}"),
-        ("Interest Cov", ratios.get("interest_coverage"), "{:.1f}"),
-        ("Cash/Assets", ratios.get("cash_to_assets"), "{:.1%}"),
-        ("Div Yield", ratios.get("dividend_yield"), "{:.2%}"),
-    ]
-    for col, (label, val, fmt) in zip(health_cols, health_items):
-        if val is not None and not math.isnan(val) and not math.isinf(val):
-            col.metric(label, fmt.format(val))
-        else:
-            col.metric(label, "—")
-
-    st.markdown("**Growth**")
-    growth_cols = st.columns(3)
-    growth_items = [
-        ("Revenue Growth", growth.get("revenue_growth"), "{:.1%}"),
-        ("EPS Growth", growth.get("eps_growth"), "{:.1%}"),
-        ("Net Income Growth", growth.get("net_income_growth"), "{:.1%}"),
-    ]
-    for col, (label, val, fmt) in zip(growth_cols, growth_items):
-        if val is not None:
-            col.metric(label, fmt.format(val))
-        else:
-            col.metric(label, "—")
-
-    # Historical valuation chart
-    st.divider()
-    st.markdown("**Historical Valuation Ratios**")
-
-    hist_ratio_choice = st.selectbox(
-        "Ratio to chart",
-        options=["pe_ttm", "pb", "ps", "ev_ebitda"],
-        format_func=lambda x: {"pe_ttm": "P/E", "pb": "P/B", "ps": "P/S", "ev_ebitda": "EV/EBITDA"}[x],
-        key="hist_ratio",
+    detail_symbol = st.selectbox(
+        "Select symbol",
+        options=scored_symbols,
+        key="val_detail",
     )
 
-    # Reuse the pre-computed historical data (avoids duplicate DB queries).
-    if _dd_hist_data:
-        chart_df = pd.DataFrame(_dd_hist_data)
-        chart_df["period_end"] = pd.to_datetime(chart_df["period_end"])
-        chart_df = chart_df.dropna(subset=[hist_ratio_choice])
-        chart_df = chart_df.sort_values("period_end")
+    if detail_symbol and detail_symbol in all_ratios:
+        ratios = all_ratios[detail_symbol]
+        growth = all_growth.get(detail_symbol, {})
+        percentiles = all_percentiles.get(detail_symbol, {})
+        score, cat_scores = all_scores.get(detail_symbol, (None, {}))
 
-        if not chart_df.empty:
-            st.line_chart(chart_df, x="period_end", y=hist_ratio_choice)
-
-            # Show percentile context
-            # Use the last observation from the chart so metrics match
-            # the visible chart endpoint (not compute_ratios which may
-            # use a different latest price).
-            values = chart_df[hist_ratio_choice].tolist()
-            current = values[-1] if values else None
-            if current is not None and len(values) >= 4:
-                mn, mx, avg = min(values), max(values), sum(values) / len(values)
-                pct = compute_percentile(current, values)
-                range_cols = st.columns(4)
-                range_cols[0].metric("Current", f"{current:.2f}")
-                range_cols[1].metric("Avg", f"{avg:.2f}")
-                range_cols[2].metric("Range", f"{mn:.1f} — {mx:.1f}")
-                range_cols[3].metric("Percentile", f"{pct:.0f}%" if pct is not None else "—")
-
-            # Diagnostic details
-            with st.expander("Percentile diagnostics"):
-                st.markdown(
-                    f"**{hist_ratio_choice}** — {len(values)} ratio data points "
-                    f"from {len(_dd_prices)} daily prices"
-                )
-                diag_df = chart_df[["period_end", "price", hist_ratio_choice]].copy()
-                diag_df = diag_df.rename(columns={hist_ratio_choice: "ratio_value"})
-                st.dataframe(diag_df, use_container_width=True, hide_index=True)
-                if current is not None:
-                    count_below = sum(1 for v in values if v < current)
-                    st.markdown(
-                        f"Current value: **{current:.2f}** · "
-                        f"Values below current: **{count_below}/{len(values)}** · "
-                        f"Percentile: **{(count_below / len(values)) * 100:.1f}%**"
-                    )
+        if pct_lookback == "3 Years":
+            _dd_hist_start = date.today() - timedelta(days=3 * 365)
+        elif pct_lookback == "5 Years":
+            _dd_hist_start = date.today() - timedelta(days=5 * 365)
         else:
-            st.info("Not enough historical data points to chart this ratio.")
-    else:
-        st.info("No price history available. Fetch prices first.")
+            _dd_hist_start = None
 
-    # ── Score History (from saved snapshots) ─────────────────────────────
-    st.divider()
-    st.markdown("**Score History**")
+        _dd_prices = get_daily_prices(detail_symbol, date_from=_dd_hist_start)
+        _dd_metric_hist: dict[str, list[dict]] = {}
+        if _dd_prices:
+            for _m_name in ("shares_outstanding", "stockholders_equity", "total_assets",
+                            "total_liabilities", "cash_and_equivalents", "revenue",
+                            "net_income", "operating_income", "eps_diluted", "eps_basic"):
+                _m_rows = get_stock_metrics(symbol=detail_symbol, metric_name=_m_name)
+                if _m_rows:
+                    _dd_metric_hist[_m_name] = sorted(_m_rows, key=lambda r: str(r.get("period_end", "")))
 
-    hist_snapshots = get_valuation_snapshots(detail_symbol, preset=preset)
-    if hist_snapshots and len(hist_snapshots) >= 2:
-        snap_df = pd.DataFrame(hist_snapshots)
-        snap_df["snapshot_date"] = pd.to_datetime(snap_df["snapshot_date"])
-        for col_name in ("score_composite", "score_valuation", "score_profitability",
-                         "score_health", "score_growth", "price_used"):
-            snap_df[col_name] = pd.to_numeric(snap_df[col_name], errors="coerce")
-        snap_df = snap_df.sort_values("snapshot_date")
+        _dd_hist_data = compute_historical_ratios(_dd_metric_hist, _dd_prices) if _dd_prices else []
 
-        score_chart_cols = ["score_composite", "score_valuation", "score_profitability",
-                            "score_health", "score_growth"]
-        chart_data = snap_df[["snapshot_date"] + score_chart_cols].set_index("snapshot_date")
-        chart_data.columns = ["Composite", "Valuation", "Profitability", "Health", "Growth"]
-        st.line_chart(chart_data)
-        st.caption(f"{len(hist_snapshots)} snapshots saved for {detail_symbol} ({preset} preset)")
-    elif hist_snapshots and len(hist_snapshots) == 1:
-        st.info("Only 1 snapshot saved. Save snapshots on multiple days to see score trends.")
-    else:
-        st.info("No saved snapshots yet. Click **Save Snapshot** to start tracking score history.")
-
-
-# ── Portfolio-Level Stats ────────────────────────────────────────────────────
-
-st.divider()
-st.subheader("Portfolio-Level Stats")
-
-# Get latest positions for weighting
-statements = get_statements()
-if statements:
-    if account_filter:
-        statements = [s for s in statements if s["account_id"] == account_filter]
-
-    # Get latest statement's positions
-    latest_stmt = statements[0] if statements else None
-    positions = get_positions(latest_stmt["id"]) if latest_stmt else []
-
-    port_stats = compute_portfolio_stats(positions, all_ratios)
-
-    if port_stats:
-        # Weighted averages
-        st.markdown("**Weighted Averages** (by market value)")
-        wa_cols = st.columns(5)
-        wa_items = [
-            ("Wtd P/E", port_stats.get("weighted_pe_ttm"), "{:.1f}"),
-            ("Wtd P/B", port_stats.get("weighted_pb"), "{:.2f}"),
-            ("Wtd P/S", port_stats.get("weighted_ps"), "{:.2f}"),
-            ("Wtd Earn Yield", port_stats.get("weighted_earnings_yield"), "{:.2%}"),
-            ("Wtd Div Yield", port_stats.get("weighted_dividend_yield"), "{:.2%}"),
+        # Score overview
+        cols = st.columns(5)
+        score_items = [
+            ("Composite", score),
+            ("Valuation", cat_scores.get("valuation")),
+            ("Profitability", cat_scores.get("profitability")),
+            ("Health", cat_scores.get("health")),
+            ("Growth", cat_scores.get("growth")),
         ]
-        for col, (label, val, fmt) in zip(wa_cols, wa_items):
+        for col, (label, val) in zip(cols, score_items):
+            col.metric(label, f"{val:.1f}" if val is not None else "—")
+
+        # Key ratios in cards
+        st.markdown("**Valuation**")
+        val_cols = st.columns(5)
+        val_items = [
+            ("P/E", ratios.get("pe_ttm"), "{:.1f}", percentiles.get("pe_ttm")),
+            ("P/B", ratios.get("pb"), "{:.2f}", percentiles.get("pb")),
+            ("P/S", ratios.get("ps"), "{:.2f}", percentiles.get("ps")),
+            ("EV/EBITDA", ratios.get("ev_ebitda"), "{:.1f}", percentiles.get("ev_ebitda")),
+            ("PEG", ratios.get("peg"), "{:.2f}", None),
+        ]
+        for col, (label, val, fmt, pct) in zip(val_cols, val_items):
+            if val is not None and not math.isnan(val) and not math.isinf(val):
+                display = fmt.format(val)
+                delta = f"{pct:.0f}th %ile" if pct is not None else None
+            else:
+                display = "—"
+                delta = None
+            col.metric(label, display, delta=delta, delta_color="off")
+
+        st.markdown("**Profitability**")
+        prof_cols = st.columns(5)
+        prof_items = [
+            ("Gross Margin", ratios.get("gross_margin"), "{:.1%}"),
+            ("Op Margin", ratios.get("operating_margin"), "{:.1%}"),
+            ("Net Margin", ratios.get("net_margin"), "{:.1%}"),
+            ("ROE", ratios.get("roe"), "{:.1%}"),
+            ("ROA", ratios.get("roa"), "{:.1%}"),
+        ]
+        for col, (label, val, fmt) in zip(prof_cols, prof_items):
             if val is not None and not math.isnan(val) and not math.isinf(val):
                 col.metric(label, fmt.format(val))
             else:
                 col.metric(label, "—")
 
-        # Concentration
-        st.markdown("**Concentration**")
-        conc_cols = st.columns(3)
-        hhi = port_stats.get("herfindahl")
-        top_pct = port_stats.get("top_holding_pct")
-        n_hold = port_stats.get("num_holdings")
-
-        conc_cols[0].metric(
-            "Holdings",
-            f"{n_hold:.0f}" if n_hold else "—",
-        )
-        conc_cols[1].metric(
-            "Top Holding",
-            f"{top_pct:.1f}%" if top_pct is not None else "—",
-        )
-        if hhi is not None:
-            if hhi < 1500:
-                hhi_label = "Diversified"
-            elif hhi < 2500:
-                hhi_label = "Moderate"
+        st.markdown("**Financial Health**")
+        health_cols = st.columns(5)
+        health_items = [
+            ("D/E", ratios.get("debt_to_equity"), "{:.2f}"),
+            ("Current Ratio", ratios.get("current_ratio"), "{:.2f}"),
+            ("Interest Cov", ratios.get("interest_coverage"), "{:.1f}"),
+            ("Cash/Assets", ratios.get("cash_to_assets"), "{:.1%}"),
+            ("Div Yield", ratios.get("dividend_yield"), "{:.2%}"),
+        ]
+        for col, (label, val, fmt) in zip(health_cols, health_items):
+            if val is not None and not math.isnan(val) and not math.isinf(val):
+                col.metric(label, fmt.format(val))
             else:
-                hhi_label = "Concentrated"
-            conc_cols[2].metric("HHI", f"{hhi:.0f}", delta=hhi_label, delta_color="off")
-        else:
-            conc_cols[2].metric("HHI", "—")
+                col.metric(label, "—")
 
-        ey_cost = port_stats.get("earnings_yield_on_cost")
-        if ey_cost is not None:
-            st.metric("Earnings Yield on Cost", f"{ey_cost:.2%}")
+        st.markdown("**Growth**")
+        growth_cols = st.columns(3)
+        growth_items = [
+            ("Revenue Growth", growth.get("revenue_growth"), "{:.1%}"),
+            ("EPS Growth", growth.get("eps_growth"), "{:.1%}"),
+            ("Net Income Growth", growth.get("net_income_growth"), "{:.1%}"),
+        ]
+        for col, (label, val, fmt) in zip(growth_cols, growth_items):
+            if val is not None:
+                col.metric(label, fmt.format(val))
+            else:
+                col.metric(label, "—")
+
+        # Historical valuation chart
+        st.divider()
+        st.markdown("**Historical Valuation Ratios**")
+
+        hist_ratio_choice = st.selectbox(
+            "Ratio to chart",
+            options=["pe_ttm", "pb", "ps", "ev_ebitda"],
+            format_func=lambda x: {"pe_ttm": "P/E", "pb": "P/B", "ps": "P/S", "ev_ebitda": "EV/EBITDA"}[x],
+            key="hist_ratio",
+        )
+
+        if _dd_hist_data:
+            chart_df = pd.DataFrame(_dd_hist_data)
+            chart_df["period_end"] = pd.to_datetime(chart_df["period_end"])
+            chart_df = chart_df.dropna(subset=[hist_ratio_choice])
+            chart_df = chart_df.sort_values("period_end")
+
+            if not chart_df.empty:
+                st.line_chart(chart_df, x="period_end", y=hist_ratio_choice)
+
+                values = chart_df[hist_ratio_choice].tolist()
+                current = values[-1] if values else None
+                if current is not None and len(values) >= 4:
+                    mn, mx, avg = min(values), max(values), sum(values) / len(values)
+                    pct = compute_percentile(current, values)
+                    range_cols = st.columns(4)
+                    range_cols[0].metric("Current", f"{current:.2f}")
+                    range_cols[1].metric("Avg", f"{avg:.2f}")
+                    range_cols[2].metric("Range", f"{mn:.1f} — {mx:.1f}")
+                    range_cols[3].metric("Percentile", f"{pct:.0f}%" if pct is not None else "—")
+
+                with st.expander("Percentile diagnostics"):
+                    st.markdown(
+                        f"**{hist_ratio_choice}** — {len(values)} ratio data points "
+                        f"from {len(_dd_prices)} daily prices"
+                    )
+                    diag_df = chart_df[["period_end", "price", hist_ratio_choice]].copy()
+                    diag_df = diag_df.rename(columns={hist_ratio_choice: "ratio_value"})
+                    st.dataframe(diag_df, use_container_width=True, hide_index=True)
+                    if current is not None:
+                        count_below = sum(1 for v in values if v < current)
+                        st.markdown(
+                            f"Current value: **{current:.2f}** · "
+                            f"Values below current: **{count_below}/{len(values)}** · "
+                            f"Percentile: **{(count_below / len(values)) * 100:.1f}%**"
+                        )
+            else:
+                st.info("Not enough historical data points to chart this ratio.")
+        else:
+            st.info("No price history available. Fetch prices first.")
+
+        # Score History
+        st.divider()
+        st.markdown("**Score History**")
+
+        hist_snapshots = get_valuation_snapshots(detail_symbol, preset=preset)
+        if hist_snapshots and len(hist_snapshots) >= 2:
+            snap_df = pd.DataFrame(hist_snapshots)
+            snap_df["snapshot_date"] = pd.to_datetime(snap_df["snapshot_date"])
+            for col_name in ("score_composite", "score_valuation", "score_profitability",
+                             "score_health", "score_growth", "price_used"):
+                snap_df[col_name] = pd.to_numeric(snap_df[col_name], errors="coerce")
+            snap_df = snap_df.sort_values("snapshot_date")
+
+            score_chart_cols = ["score_composite", "score_valuation", "score_profitability",
+                                "score_health", "score_growth"]
+            chart_data = snap_df[["snapshot_date"] + score_chart_cols].set_index("snapshot_date")
+            chart_data.columns = ["Composite", "Valuation", "Profitability", "Health", "Growth"]
+            st.line_chart(chart_data)
+            st.caption(f"{len(hist_snapshots)} snapshots saved for {detail_symbol} ({preset} preset)")
+        elif hist_snapshots and len(hist_snapshots) == 1:
+            st.info("Only 1 snapshot saved. Save snapshots on multiple days to see score trends.")
+        else:
+            st.info("No saved snapshots yet. Click **Save Snapshot** to start tracking score history.")
+
+# ── Tab: Portfolio Stats ──────────────────────────────────────────────────
+
+with val_tab_port:
+    st.subheader("Portfolio-Level Stats")
+
+    statements = get_statements()
+    if statements:
+        if account_filter:
+            statements = [s for s in statements if s["account_id"] == account_filter]
+
+        latest_stmt = statements[0] if statements else None
+        positions = get_positions(latest_stmt["id"]) if latest_stmt else []
+
+        port_stats = compute_portfolio_stats(positions, all_ratios)
+
+        if port_stats:
+            st.markdown("**Weighted Averages** (by market value)")
+            wa_cols = st.columns(5)
+            wa_items = [
+                ("Wtd P/E", port_stats.get("weighted_pe_ttm"), "{:.1f}"),
+                ("Wtd P/B", port_stats.get("weighted_pb"), "{:.2f}"),
+                ("Wtd P/S", port_stats.get("weighted_ps"), "{:.2f}"),
+                ("Wtd Earn Yield", port_stats.get("weighted_earnings_yield"), "{:.2%}"),
+                ("Wtd Div Yield", port_stats.get("weighted_dividend_yield"), "{:.2%}"),
+            ]
+            for col, (label, val, fmt) in zip(wa_cols, wa_items):
+                if val is not None and not math.isnan(val) and not math.isinf(val):
+                    col.metric(label, fmt.format(val))
+                else:
+                    col.metric(label, "—")
+
+            st.markdown("**Concentration**")
+            conc_cols = st.columns(3)
+            hhi = port_stats.get("herfindahl")
+            top_pct = port_stats.get("top_holding_pct")
+            n_hold = port_stats.get("num_holdings")
+
+            conc_cols[0].metric(
+                "Holdings",
+                f"{n_hold:.0f}" if n_hold else "—",
+            )
+            conc_cols[1].metric(
+                "Top Holding",
+                f"{top_pct:.1f}%" if top_pct is not None else "—",
+            )
+            if hhi is not None:
+                if hhi < 1500:
+                    hhi_label = "Diversified"
+                elif hhi < 2500:
+                    hhi_label = "Moderate"
+                else:
+                    hhi_label = "Concentrated"
+                conc_cols[2].metric("HHI", f"{hhi:.0f}", delta=hhi_label, delta_color="off")
+            else:
+                conc_cols[2].metric("HHI", "—")
+
+            ey_cost = port_stats.get("earnings_yield_on_cost")
+            if ey_cost is not None:
+                st.metric("Earnings Yield on Cost", f"{ey_cost:.2%}")
+        else:
+            st.info("Could not compute portfolio stats — no matching positions with ratio data.")
     else:
-        st.info("Could not compute portfolio stats — no matching positions with ratio data.")
-else:
-    st.info("No statements found.")
+        st.info("No statements found.")
