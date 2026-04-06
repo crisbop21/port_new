@@ -152,31 +152,6 @@ else:
         "Cost value is the total cost basis reported by IBKR."
     )
 
-# ── Export ─────────────────────────────────────────────────────────────────
-st.subheader("Export")
-if not _PDF_AVAILABLE:
-    st.error(
-        f"PDF export unavailable — install fpdf2 (`pip install fpdf2`). "
-        f"Error: {_pdf_import_err_msg}"
-    )
-    logger.error("PDF export skipped — import failed: %s", _pdf_import_err_msg)
-else:
-    try:
-        pdf_bytes = generate_holdings_pdf(
-            df=df,
-            account_id=selected_account,
-            as_of=as_of,
-        )
-        st.download_button(
-            label="Download Holdings PDF",
-            data=pdf_bytes,
-            file_name=f"holdings_{selected_account}_{as_of.isoformat()}.pdf",
-            mime="application/pdf",
-        )
-    except Exception as e:
-        st.error(f"PDF generation failed: {e}")
-        logger.exception("PDF generation failed")
-
 st.divider()
 
 # ── Beta vs Benchmark ──────────────────────────────────────────────────────
@@ -696,6 +671,43 @@ for asset_class, group in df.groupby("asset_class", sort=True):
     }
     detail_df = detail_df.rename(columns={k: v for k, v in col_labels.items() if k in detail_df.columns})
     st.dataframe(detail_df, use_container_width=True)
+
+# ── Export ─────────────────────────────────────────────────────────────────
+
+st.divider()
+st.subheader("Export")
+
+_beta_for_pdf = st.session_state.get("beta_result") if _BETA_AVAILABLE else None
+_bench_for_pdf = st.session_state.get("beta_benchmark") if _BETA_AVAILABLE else None
+
+if not _PDF_AVAILABLE:
+    st.error(
+        f"PDF export unavailable — install fpdf2 (`pip install fpdf2`). "
+        f"Error: {_pdf_import_err_msg}"
+    )
+    logger.error("PDF export skipped — import failed: %s", _pdf_import_err_msg)
+else:
+    try:
+        pdf_bytes = generate_holdings_pdf(
+            df=df,
+            account_id=selected_account,
+            as_of=as_of,
+            beta_result=_beta_for_pdf,
+            beta_benchmark=_bench_for_pdf,
+        )
+        if _beta_for_pdf:
+            st.caption(f"PDF includes portfolio beta vs {_bench_for_pdf}.")
+        else:
+            st.caption("Calculate beta above to include it in the PDF.")
+        st.download_button(
+            label="Download Holdings PDF",
+            data=pdf_bytes,
+            file_name=f"holdings_{selected_account}_{as_of.isoformat()}.pdf",
+            mime="application/pdf",
+        )
+    except Exception as e:
+        st.error(f"PDF generation failed: {e}")
+        logger.exception("PDF generation failed")
 
 # ── Reconciliation ──────────────────────────────────────────────────────────
 

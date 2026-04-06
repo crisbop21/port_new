@@ -167,3 +167,80 @@ class TestGenerateHoldingsPdf:
         # Option strike and right should appear
         assert "200" in text
         assert "C" in text
+
+
+@pytest.fixture
+def beta_result():
+    """Beta result dict as stored in st.session_state."""
+    return {
+        "portfolio_beta": 1.15,
+        "portfolio_dollar_beta": 44000.0,
+        "betas": {"AAPL": 1.25, "QQQ": 1.02},
+        "dollar_betas": {"AAPL": 21875.0, "QQQ": 19380.0},
+        "position_betas": [
+            {"symbol": "AAPL", "effective_beta": 1.25, "market_value": 17500.0},
+            {"symbol": "QQQ", "effective_beta": 1.02, "market_value": 19000.0},
+            {"symbol": "AAPL 20260417 200 C", "effective_beta": 5.5, "market_value": 1750.0},
+        ],
+    }
+
+
+class TestPdfWithBeta:
+    def test_portfolio_beta_in_summary(self, holdings_df, beta_result):
+        result = generate_holdings_pdf(
+            df=holdings_df,
+            account_id="U1234567",
+            as_of=date(2026, 4, 4),
+            beta_result=beta_result,
+            beta_benchmark="SPY",
+        )
+        text = result.decode("latin-1")
+        assert "1.15" in text
+        assert "SPY" in text
+
+    def test_portfolio_dollar_beta_in_summary(self, holdings_df, beta_result):
+        result = generate_holdings_pdf(
+            df=holdings_df,
+            account_id="U1234567",
+            as_of=date(2026, 4, 4),
+            beta_result=beta_result,
+            beta_benchmark="SPY",
+        )
+        text = result.decode("latin-1")
+        assert "44,000" in text
+
+    def test_per_symbol_betas(self, holdings_df, beta_result):
+        result = generate_holdings_pdf(
+            df=holdings_df,
+            account_id="U1234567",
+            as_of=date(2026, 4, 4),
+            beta_result=beta_result,
+            beta_benchmark="SPY",
+        )
+        text = result.decode("latin-1")
+        assert "1.25" in text  # AAPL beta
+        assert "1.02" in text  # QQQ beta
+
+    def test_beta_section_header(self, holdings_df, beta_result):
+        result = generate_holdings_pdf(
+            df=holdings_df,
+            account_id="U1234567",
+            as_of=date(2026, 4, 4),
+            beta_result=beta_result,
+            beta_benchmark="SPY",
+        )
+        text = result.decode("latin-1")
+        assert "Portfolio Beta" in text
+
+    def test_no_beta_no_crash(self, holdings_df):
+        """When beta_result is None, PDF should still generate without beta section."""
+        result = generate_holdings_pdf(
+            df=holdings_df,
+            account_id="U1234567",
+            as_of=date(2026, 4, 4),
+            beta_result=None,
+            beta_benchmark=None,
+        )
+        text = result.decode("latin-1")
+        assert "Portfolio Beta" not in text
+        assert result[:5] == b"%PDF-"

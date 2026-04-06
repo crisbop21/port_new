@@ -10,6 +10,8 @@ def generate_holdings_pdf(
     df: pd.DataFrame,
     account_id: str,
     as_of: date,
+    beta_result: dict | None = None,
+    beta_benchmark: str | None = None,
 ) -> bytes:
     """Build a PDF summarising the holdings in *df* and return the raw bytes.
 
@@ -23,6 +25,11 @@ def generate_holdings_pdf(
         Account identifier (or "All Accounts").
     as_of : date
         Snapshot date.
+    beta_result : dict | None
+        Beta calculation result from session state. Keys: portfolio_beta,
+        portfolio_dollar_beta, betas, dollar_betas, position_betas.
+    beta_benchmark : str | None
+        Benchmark symbol (e.g. "SPY") used for the beta calculation.
     """
     has_market_data = "market_value" in df.columns and df["market_value"].notna().any()
 
@@ -56,6 +63,38 @@ def generate_holdings_pdf(
         pdf.cell(0, 6, f"Positions: {len(df)}", new_x="LMARGIN", new_y="NEXT")
 
     pdf.ln(4)
+
+    # ── Portfolio Beta ──────────────────────────────────────────────────────
+    if beta_result is not None and beta_benchmark is not None:
+        pdf.set_font("Helvetica", "B", 12)
+        pdf.cell(0, 8, f"Portfolio Beta vs {beta_benchmark}", new_x="LMARGIN", new_y="NEXT")
+        pdf.set_font("Helvetica", "", 10)
+
+        port_beta = beta_result.get("portfolio_beta")
+        port_dollar_beta = beta_result.get("portfolio_dollar_beta")
+        if port_beta is not None:
+            pdf.cell(0, 6, f"Portfolio Beta: {port_beta:.2f}", new_x="LMARGIN", new_y="NEXT")
+        if port_dollar_beta is not None:
+            pdf.cell(0, 6, f"Dollar Beta: ${port_dollar_beta:,.0f}", new_x="LMARGIN", new_y="NEXT")
+
+        # Per-symbol beta table
+        betas = beta_result.get("betas", {})
+        dollar_betas = beta_result.get("dollar_betas", {})
+        if betas:
+            pdf.ln(2)
+            beta_cols = ["Symbol", f"Beta ({beta_benchmark})", "Dollar Beta"]
+            beta_rows = []
+            for sym in sorted(betas.keys()):
+                b = betas[sym]
+                db = dollar_betas.get(sym)
+                beta_rows.append([
+                    sym,
+                    f"{b:.3f}" if b is not None else "N/A",
+                    f"${db:,.0f}" if db is not None else "N/A",
+                ])
+            _render_table(pdf, beta_cols, beta_rows)
+
+        pdf.ln(4)
 
     # ── Consolidated Market Value by Symbol ──────────────────────────────────
     pdf.set_font("Helvetica", "B", 12)
