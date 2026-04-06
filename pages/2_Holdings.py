@@ -135,6 +135,9 @@ for col in numeric_cols:
 
 # ── Metric cards ────────────────────────────────────────────────────────────
 
+from src.ui_helpers import render_freshness
+render_freshness("Snapshot date", as_of)
+
 has_market_data = "market_value" in df.columns and df["market_value"].notna().any()
 
 if has_market_data:

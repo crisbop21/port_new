@@ -125,8 +125,11 @@ st.divider()
 
 st.subheader("Stored Prices")
 
+from src.ui_helpers import render_freshness
+
 # Latest price summary
 latest_data = []
+_newest_price_date = None
 for sym in symbols_with_benchmarks:
     latest = get_latest_price(sym)
     if latest:
@@ -137,6 +140,11 @@ for sym in symbols_with_benchmarks:
             "Adj Close": float(latest["adj_close"]),
             "Volume": latest["volume"],
         })
+        pd_str = latest["price_date"]
+        if _newest_price_date is None or pd_str > str(_newest_price_date or ""):
+            _newest_price_date = pd_str
+
+render_freshness("Price data", _newest_price_date)
 
 if latest_data:
     latest_df = pd.DataFrame(latest_data)

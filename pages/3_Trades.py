@@ -23,9 +23,27 @@ with st.sidebar:
     selected_account = st.selectbox("Account", account_options)
     account_filter = None if selected_account == "All Accounts" else selected_account
 
-    date_col1, date_col2 = st.columns(2)
-    date_from = date_col1.date_input("From", value=date.today() - timedelta(days=90))
-    date_to = date_col2.date_input("To", value=date.today())
+    # Date range presets
+    preset = st.selectbox(
+        "Date range",
+        options=["Custom", "1W", "1M", "3M", "YTD", "1Y"],
+        index=3,  # default to 3M
+    )
+    today = date.today()
+    preset_ranges = {
+        "1W": today - timedelta(days=7),
+        "1M": today - timedelta(days=30),
+        "3M": today - timedelta(days=90),
+        "YTD": date(today.year, 1, 1),
+        "1Y": today - timedelta(days=365),
+    }
+    if preset == "Custom":
+        date_col1, date_col2 = st.columns(2)
+        date_from = date_col1.date_input("From", value=today - timedelta(days=90))
+        date_to = date_col2.date_input("To", value=today)
+    else:
+        date_from = preset_ranges[preset]
+        date_to = today
 
     symbol = st.text_input("Symbol", placeholder="e.g. AAPL").strip().upper() or None
 
