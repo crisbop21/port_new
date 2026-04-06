@@ -214,7 +214,7 @@ else:
                         f"**Fetch All Portfolio Prices** — it now includes {benchmark} automatically."
                     )
                 else:
-                    # Fetch prices for each symbol
+                    # ── Step 1: compute raw underlying betas ──────────────
                     holdings_for_beta: dict[str, dict] = {}
                     for sym in sorted(beta_symbols):
                         sym_prices = get_daily_prices(sym, date_from=lookback_start, date_to=as_of)
@@ -231,26 +231,120 @@ else:
                                 for e in errs:
                                     st.warning(f"{sym}: {e}")
 
-                        # Compute market value for this underlying
+                        # Market value for stocks/ETFs only (options handled separately)
                         mv = 0.0
                         for _, r in df.iterrows():
-                            underlying = (
-                                r["symbol"].split(" ")[0]
-                                if r["asset_class"] == "OPT" and " " in r["symbol"]
-                                else r["symbol"]
-                            )
-                            if underlying == sym:
+                            if r["asset_class"] in ("STK", "ETF") and r["symbol"] == sym:
                                 mv += abs(float(r.get("market_value", 0) or 0))
 
                         holdings_for_beta[sym] = {"market_value": mv, "prices": sym_prices}
-                        logger.info("Symbol %s: mv=%.2f, price_rows=%d", sym, mv, len(sym_prices))
 
-                    result = compute_portfolio_beta(holdings_for_beta, bench_prices)
+                    # Get raw underlying betas (used for stocks + as input for option beta)
+                    raw_result = compute_portfolio_beta(holdings_for_beta, bench_prices)
+                    underlying_betas = raw_result["betas"]
+                    logger.info("Underlying betas: %s", underlying_betas)
+
+                    # ── Step 2: compute per-position effective beta ───────
+                    # For STK/ETF: effective_beta = underlying_beta
+                    # For OPT: effective_beta = option_beta (delta × leverage adjusted)
+                    position_betas: list[dict] = []  # {symbol, effective_beta, market_value}
+
+                    for _, r in df.iterrows():
+                        sym = r["symbol"]
+                        ac = r["asset_class"]
+                        mv = abs(float(r.get("market_value", 0) or 0))
+                        underlying = sym.split(" ")[0] if ac == "OPT" and " " in sym else sym
+                        u_beta = underlying_betas.get(underlying)
+
+                        if ac in ("STK", "ETF"):
+                            position_betas.append({
+                                "symbol": sym, "effective_beta": u_beta,
+                                "market_value": mv,
+                            })
+                        elif ac == "OPT":
+                            # Compute option beta using delta + leverage
+                            strike_val = float(r.get("strike", 0) or 0)
+                            right_val = r.get("right")
+                            expiry_val = r.get("expiry")
+                            mkt_price = abs(float(r.get("market_price", 0) or 0))
+
+                            # Get underlying price
+                            u_price = None
+                            for _, ur in df.iterrows():
+                                if ur["symbol"] == underlying and ur["asset_class"] in ("STK", "ETF"):
+                                    u_price = float(ur.get("market_price", 0) or 0)
+                                    break
+                            if not u_price or u_price <= 0:
+                                latest_p = get_daily_prices(underlying, date_from=as_of - timedelta(days=10), date_to=as_of)
+                                if latest_p:
+                                    u_price = float(latest_p[-1].get("close", 0) or 0)
+
+                            # DTE
+                            dte_years = None
+                            if expiry_val:
+                                try:
+                                    exp_d = date.fromisoformat(str(expiry_val)) if isinstance(expiry_val, str) else expiry_val
+                                    dte_years = max((exp_d - as_of).days, 0) / 365.0
+                                except (ValueError, TypeError):
+                                    pass
+
+                            # Realized vol
+                            sigma = 0.30
+                            vol_prices = get_daily_prices(underlying, date_from=as_of - timedelta(days=60), date_to=as_of)
+                            if len(vol_prices) >= 21:
+                                vdf = pd.DataFrame(vol_prices)
+                                vdf["adj_close"] = pd.to_numeric(vdf["adj_close"], errors="coerce")
+                                vdf = vdf.sort_values("price_date")
+                                lr = np.log(vdf["adj_close"] / vdf["adj_close"].shift(1))
+                                cv = lr.rolling(20).std().iloc[-1] * np.sqrt(252)
+                                if pd.notna(cv) and cv > 0:
+                                    sigma = float(cv)
+
+                            ob = None
+                            if (u_price and u_price > 0 and strike_val > 0
+                                    and dte_years and dte_years > 0 and right_val
+                                    and mkt_price > 0):
+                                ob = compute_option_beta(
+                                    underlying_beta=u_beta,
+                                    underlying_price=u_price,
+                                    option_price=mkt_price,
+                                    strike=strike_val,
+                                    dte_years=dte_years,
+                                    sigma=sigma,
+                                    right=right_val,
+                                )
+
+                            position_betas.append({
+                                "symbol": sym, "effective_beta": ob,
+                                "market_value": mv,
+                            })
+
+                    # ── Step 3: aggregate portfolio beta ──────────────────
+                    total_mv = sum(p["market_value"] for p in position_betas if p["effective_beta"] is not None)
+                    if total_mv > 0:
+                        port_beta = sum(
+                            p["effective_beta"] * p["market_value"]
+                            for p in position_betas if p["effective_beta"] is not None
+                        ) / total_mv
+                    else:
+                        port_beta = None
+
+                    port_dollar_beta = sum(
+                        p["effective_beta"] * p["market_value"]
+                        for p in position_betas if p["effective_beta"] is not None
+                    )
+
+                    result = {
+                        "betas": underlying_betas,
+                        "dollar_betas": raw_result["dollar_betas"],
+                        "portfolio_beta": port_beta,
+                        "portfolio_dollar_beta": port_dollar_beta,
+                        "position_betas": position_betas,
+                    }
+
                     logger.info(
-                        "Beta result: portfolio_beta=%s, dollar_beta=%s, per_symbol=%s",
-                        result["portfolio_beta"],
-                        result["portfolio_dollar_beta"],
-                        {k: v for k, v in result["betas"].items()},
+                        "Portfolio beta (option-adjusted): %.3f, dollar_beta: %.0f",
+                        port_beta or 0, port_dollar_beta,
                     )
                     st.session_state.beta_result = result
                     st.session_state.beta_benchmark = benchmark
