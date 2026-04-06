@@ -169,15 +169,21 @@ if not symbol_stats.empty:
     symbol_stats = symbol_stats.sort_values("total_pnl", ascending=False)
 
     disp_stats = symbol_stats[["symbol", "total_pnl", "trades", "win_rate", "avg_pnl", "total_commission"]].copy()
-    disp_stats["total_pnl"] = disp_stats["total_pnl"].map(lambda v: f"${v:,.2f}")
-    disp_stats["avg_pnl"] = disp_stats["avg_pnl"].map(lambda v: f"${v:,.2f}")
-    disp_stats["total_commission"] = disp_stats["total_commission"].map(lambda v: f"${v:,.2f}")
-    disp_stats["win_rate"] = disp_stats["win_rate"].map(lambda v: f"{v:.1f}%")
     disp_stats = disp_stats.rename(columns={
         "symbol": "Symbol", "total_pnl": "Total P&L", "trades": "Trades",
         "win_rate": "Win Rate %", "avg_pnl": "Avg P&L", "total_commission": "Commissions",
     })
-    st.dataframe(disp_stats, use_container_width=True, hide_index=True)
+    st.dataframe(
+        disp_stats,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Total P&L": st.column_config.NumberColumn(format="$%.2f"),
+            "Avg P&L": st.column_config.NumberColumn(format="$%.2f"),
+            "Commissions": st.column_config.NumberColumn(format="$%.2f"),
+            "Win Rate %": st.column_config.NumberColumn(format="%.1f%%"),
+        },
+    )
 
     # Top winners / losers bar chart
     top_n = min(10, len(symbol_stats))
@@ -290,15 +296,21 @@ else:
               delta=f"{total_unrealized:,.2f}")
 
     disp_unreal = unrealized_stats[["symbol", "quantity", "breakeven", "market_value", "unrealized_pnl", "positions"]].copy()
-    disp_unreal["quantity"] = disp_unreal["quantity"].map(lambda v: f"{v:,.2f}")
-    disp_unreal["breakeven"] = disp_unreal["breakeven"].map(lambda v: f"${v:,.2f}")
-    disp_unreal["market_value"] = disp_unreal["market_value"].map(lambda v: f"${v:,.2f}")
-    disp_unreal["unrealized_pnl"] = disp_unreal["unrealized_pnl"].map(lambda v: f"${v:,.2f}")
     disp_unreal = disp_unreal.rename(columns={
         "symbol": "Symbol", "quantity": "Total Qty", "breakeven": "Avg Breakeven",
         "market_value": "Market Value", "unrealized_pnl": "Unrealized P&L", "positions": "Positions",
     })
-    st.dataframe(disp_unreal, use_container_width=True, hide_index=True)
+    st.dataframe(
+        disp_unreal,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Total Qty": st.column_config.NumberColumn(format="%.2f"),
+            "Avg Breakeven": st.column_config.NumberColumn(format="$%.2f"),
+            "Market Value": st.column_config.NumberColumn(format="$%.2f"),
+            "Unrealized P&L": st.column_config.NumberColumn(format="$%.2f"),
+        },
+    )
 
     # Bar chart of unrealized P&L by symbol
     top_u = min(10, len(unrealized_stats))
@@ -323,14 +335,15 @@ if df["asset_class"].eq("OPT").any():
 show_cols = [c for c in display_cols if c in df.columns]
 
 trade_log = df[show_cols].reset_index(drop=True).copy()
-for col in ["price", "proceeds", "commission", "realized_pnl", "strike"]:
-    if col in trade_log.columns:
-        trade_log[col] = trade_log[col].map(lambda v: f"${v:,.2f}")
 st.dataframe(
     trade_log,
     use_container_width=True,
     column_config={
         "trade_date": st.column_config.DatetimeColumn("Date/Time", format="YYYY-MM-DD HH:mm"),
-        "realized_pnl": "Realized P&L",
+        "price": st.column_config.NumberColumn("Price", format="$%.2f"),
+        "proceeds": st.column_config.NumberColumn("Proceeds", format="$%.2f"),
+        "commission": st.column_config.NumberColumn("Commission", format="$%.2f"),
+        "realized_pnl": st.column_config.NumberColumn("Realized P&L", format="$%.2f"),
+        "strike": st.column_config.NumberColumn("Strike", format="$%.2f"),
     },
 )
