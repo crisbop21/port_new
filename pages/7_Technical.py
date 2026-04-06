@@ -151,20 +151,10 @@ for col in ma_flag_cols:
 rename_map.update(ma_rename)
 display_df = display_df.rename(columns=rename_map)
 
-# Color-code the composite score
-def _color_score(val):
-    """Return background color for a score value."""
-    if pd.isna(val):
-        return ""
-    if val >= 70:
-        return "background-color: #c6efce"  # green
-    elif val >= 40:
-        return "background-color: #ffeb9c"  # yellow
-    else:
-        return "background-color: #ffc7ce"  # red
+from src.ui_helpers import color_score
 
 score_columns = ["Composite"] + list(SIGNAL_LABELS.values())
-styled = display_df.style.map(_color_score, subset=score_columns)
+styled = display_df.style.map(color_score, subset=score_columns)
 
 st.dataframe(
     styled,

@@ -64,11 +64,16 @@ def _check_data_readiness(acct_filter):
 
     # 4. Daily prices
     prices_ok = 0
+    newest_price_date = None
     for sym in symbols[:5]:  # sample check
         p = get_latest_price(sym)
         if p:
             prices_ok += 1
+            pd_str = p.get("price_date")
+            if pd_str and (newest_price_date is None or str(pd_str) > str(newest_price_date)):
+                newest_price_date = pd_str
     status["has_prices"] = prices_ok > 0 if symbols else False
+    status["latest_price_date"] = newest_price_date
 
     # 5. Fundamentals
     if symbols:
@@ -87,11 +92,18 @@ def _check_data_readiness(acct_filter):
     return status
 
 
+from src.ui_helpers import freshness_badge
+
 with st.expander("Data Setup Progress", expanded=False):
     readiness = _check_data_readiness(account_filter)
 
     def _status_icon(ok):
         return "✅" if ok else "⬜"
+
+    # Build freshness suffix for prices
+    price_fresh = ""
+    if readiness["has_prices"] and readiness.get("latest_price_date"):
+        price_fresh = f" · {freshness_badge(readiness['latest_price_date'])}"
 
     steps = [
         (_status_icon(readiness["statements"] > 0),
@@ -104,7 +116,7 @@ with st.expander("Data Setup Progress", expanded=False):
          f"Trades imported ({readiness['trades']} trades)",
          None),
         (_status_icon(readiness["has_prices"]),
-         "Daily prices fetched",
+         f"Daily prices fetched{price_fresh}",
          "pages/6_Prices.py" if not readiness["has_prices"] else None),
         (_status_icon(readiness["has_metrics"]),
          "SEC fundamentals loaded",
@@ -127,6 +139,47 @@ with st.expander("Data Setup Progress", expanded=False):
 
     done = sum(1 for i, l, _ in steps if i == "✅")
     st.progress(done / len(steps), text=f"{done}/{len(steps)} complete")
+
+    # Fetch All Data button — populates prices + metrics in one click
+    if readiness["symbols"] and (not readiness["has_prices"] or not readiness["has_metrics"]):
+        if st.button("Fetch All Data", type="primary",
+                     help="Fetch daily prices and SEC fundamentals for all portfolio symbols."):
+            from src.price_fetcher import fetch_prices_for_symbols
+            from src.fetcher import fetch_metrics_for_symbol
+            from src.db import upsert_daily_prices, upsert_stock_metrics, clear_query_caches
+
+            syms = readiness["symbols"]
+            total_steps = len(syms) * 2  # prices + metrics
+            prog = st.progress(0, text="Fetching data...")
+            step = 0
+
+            # Fetch prices
+            if not readiness["has_prices"]:
+                for i, sym in enumerate(syms):
+                    step += 1
+                    prog.progress(step / total_steps, text=f"Prices: {sym} ({i+1}/{len(syms)})")
+                    from src.price_fetcher import fetch_daily_prices as _fdp
+                    prices, _ = _fdp(sym, start=date.today() - timedelta(days=365))
+                    if prices:
+                        upsert_daily_prices(prices)
+            else:
+                step += len(syms)
+
+            # Fetch metrics
+            if not readiness["has_metrics"]:
+                for i, sym in enumerate(syms):
+                    step += 1
+                    prog.progress(step / total_steps, text=f"Metrics: {sym} ({i+1}/{len(syms)})")
+                    metrics, _ = fetch_metrics_for_symbol(sym)
+                    if metrics:
+                        upsert_stock_metrics(metrics)
+            else:
+                step += len(syms)
+
+            prog.empty()
+            clear_query_caches()
+            st.success("Data fetch complete! Refresh the page to see updated progress.")
+            st.rerun()
 
 # ── Load data ────────────────────────────────────────────────────────────────
 

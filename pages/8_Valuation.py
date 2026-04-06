@@ -441,22 +441,7 @@ with val_tab_comp:
 # ── Fundamental Score Ranking ────────────────────────────────────────────────
 
 
-def _color_score(val):
-    """Color-code scores green/yellow/red."""
-    if isinstance(val, str):
-        try:
-            val = float(val)
-        except ValueError:
-            return ""
-    if pd.isna(val):
-        return ""
-    if val >= 70:
-        return "background-color: #c6efce"
-    elif val >= 40:
-        return "background-color: #ffeb9c"
-    else:
-        return "background-color: #ffc7ce"
-
+from src.ui_helpers import color_score
 
 score_rows = []
 for sym in scored_symbols:
@@ -476,7 +461,7 @@ score_df = score_df.sort_values("Composite", ascending=False, na_position="last"
 score_df.insert(0, "Rank", range(1, len(score_df) + 1))
 
 score_cols = ["Composite", "Valuation", "Profitability", "Health", "Growth"]
-styled = score_df.style.map(_color_score, subset=score_cols)
+styled = score_df.style.map(color_score, subset=score_cols)
 
 with val_tab_scores:
     st.subheader("Fundamental Score")
