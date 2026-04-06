@@ -20,7 +20,16 @@ from src.db import (
     reconcile_account,
     reconcile_pair,
 )
-from src.pdf_holdings import generate_holdings_pdf
+# PDF export import — guarded so the page still works without fpdf2
+_PDF_AVAILABLE = False
+_pdf_import_err_msg = ""
+try:
+    from src.pdf_holdings import generate_holdings_pdf
+    _PDF_AVAILABLE = True
+    logger.info("PDF export module loaded successfully")
+except Exception as _pdf_import_err:
+    logger.exception("Failed to import PDF export module")
+    _pdf_import_err_msg = str(_pdf_import_err)
 
 # Beta imports — ALL beta-related imports guarded so the page still works
 _BETA_AVAILABLE = False
@@ -144,21 +153,25 @@ else:
     )
 
 # ── PDF export button ──────────────────────────────────────────────────────
-try:
-    pdf_bytes = generate_holdings_pdf(
-        df=df,
-        account_id=selected_account,
-        as_of=as_of,
-    )
-    st.download_button(
-        label="Download Holdings PDF",
-        data=pdf_bytes,
-        file_name=f"holdings_{selected_account}_{as_of.isoformat()}.pdf",
-        mime="application/pdf",
-    )
-except Exception as e:
-    st.error(f"PDF generation failed: {e}")
-    logger.exception("PDF generation failed")
+if not _PDF_AVAILABLE:
+    st.error(f"PDF export unavailable: {_pdf_import_err_msg}")
+    logger.error("PDF export section skipped — import failed: %s", _pdf_import_err_msg)
+else:
+    try:
+        pdf_bytes = generate_holdings_pdf(
+            df=df,
+            account_id=selected_account,
+            as_of=as_of,
+        )
+        st.download_button(
+            label="Download Holdings PDF",
+            data=pdf_bytes,
+            file_name=f"holdings_{selected_account}_{as_of.isoformat()}.pdf",
+            mime="application/pdf",
+        )
+    except Exception as e:
+        st.error(f"PDF generation failed: {e}")
+        logger.exception("PDF generation failed")
 
 st.divider()
 
