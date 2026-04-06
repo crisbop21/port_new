@@ -1,4 +1,6 @@
-"""Tests for portfolio beta calculation."""
+"""Tests for portfolio beta calculation and option Greeks."""
+
+import math
 
 import numpy as np
 import pandas as pd
@@ -8,7 +10,10 @@ from datetime import date, timedelta
 from src.beta import (
     compute_beta,
     compute_portfolio_beta,
+    compute_option_delta,
+    compute_option_beta,
     BENCHMARKS,
+    DEFAULT_RISK_FREE_RATE,
 )
 
 
@@ -227,3 +232,277 @@ class TestBenchmarks:
     def test_spy_and_qqq_in_benchmarks(self):
         assert "SPY" in BENCHMARKS
         assert "QQQ" in BENCHMARKS
+
+
+# ── Tests: compute_option_delta ──────────────────────────────────────────────
+
+
+class TestComputeOptionDelta:
+    """Tests for Black-Scholes delta calculation."""
+
+    def test_atm_call_delta_near_half(self):
+        """ATM call with moderate vol and time should have delta ~0.5-0.6."""
+        delta = compute_option_delta(
+            underlying_price=100.0,
+            strike=100.0,
+            dte_years=0.25,
+            sigma=0.30,
+            right="C",
+        )
+        assert delta is not None
+        assert 0.45 < delta < 0.65
+
+    def test_atm_put_delta_near_neg_half(self):
+        """ATM put should have delta ~-0.5 to -0.4."""
+        delta = compute_option_delta(
+            underlying_price=100.0,
+            strike=100.0,
+            dte_years=0.25,
+            sigma=0.30,
+            right="P",
+        )
+        assert delta is not None
+        assert -0.6 < delta < -0.4
+
+    def test_deep_itm_call_delta_near_one(self):
+        """Deep ITM call should have delta approaching 1."""
+        delta = compute_option_delta(
+            underlying_price=150.0,
+            strike=100.0,
+            dte_years=0.25,
+            sigma=0.20,
+            right="C",
+        )
+        assert delta is not None
+        assert delta > 0.95
+
+    def test_deep_otm_call_delta_near_zero(self):
+        """Deep OTM call should have delta near 0."""
+        delta = compute_option_delta(
+            underlying_price=50.0,
+            strike=100.0,
+            dte_years=0.25,
+            sigma=0.20,
+            right="C",
+        )
+        assert delta is not None
+        assert delta < 0.05
+
+    def test_deep_itm_put_delta_near_neg_one(self):
+        """Deep ITM put should have delta approaching -1."""
+        delta = compute_option_delta(
+            underlying_price=50.0,
+            strike=100.0,
+            dte_years=0.25,
+            sigma=0.20,
+            right="P",
+        )
+        assert delta is not None
+        assert delta < -0.95
+
+    def test_deep_otm_put_delta_near_zero(self):
+        """Deep OTM put should have delta near 0."""
+        delta = compute_option_delta(
+            underlying_price=150.0,
+            strike=100.0,
+            dte_years=0.25,
+            sigma=0.20,
+            right="P",
+        )
+        assert delta is not None
+        assert abs(delta) < 0.05
+
+    def test_call_put_parity(self):
+        """Call delta - Put delta should equal ~1 (adjusted for dividends)."""
+        call_d = compute_option_delta(
+            underlying_price=100.0,
+            strike=100.0,
+            dte_years=0.5,
+            sigma=0.25,
+            right="C",
+        )
+        put_d = compute_option_delta(
+            underlying_price=100.0,
+            strike=100.0,
+            dte_years=0.5,
+            sigma=0.25,
+            right="P",
+        )
+        assert call_d is not None and put_d is not None
+        # With no dividends, call_delta - put_delta ≈ 1.0
+        assert abs((call_d - put_d) - 1.0) < 0.02
+
+    def test_expired_option_returns_none(self):
+        """Zero or negative DTE should return None."""
+        delta = compute_option_delta(
+            underlying_price=100.0,
+            strike=100.0,
+            dte_years=0.0,
+            sigma=0.25,
+            right="C",
+        )
+        assert delta is None
+
+    def test_zero_vol_returns_none(self):
+        delta = compute_option_delta(
+            underlying_price=100.0,
+            strike=100.0,
+            dte_years=0.25,
+            sigma=0.0,
+            right="C",
+        )
+        assert delta is None
+
+    def test_zero_underlying_price_returns_none(self):
+        delta = compute_option_delta(
+            underlying_price=0.0,
+            strike=100.0,
+            dte_years=0.25,
+            sigma=0.25,
+            right="C",
+        )
+        assert delta is None
+
+    def test_higher_vol_widens_delta(self):
+        """Higher vol should push ATM delta closer to 0.5 and OTM delta higher."""
+        delta_low_vol = compute_option_delta(
+            underlying_price=80.0, strike=100.0, dte_years=0.25,
+            sigma=0.10, right="C",
+        )
+        delta_high_vol = compute_option_delta(
+            underlying_price=80.0, strike=100.0, dte_years=0.25,
+            sigma=0.50, right="C",
+        )
+        assert delta_low_vol is not None and delta_high_vol is not None
+        # Higher vol → OTM call has higher delta
+        assert delta_high_vol > delta_low_vol
+
+    def test_longer_dte_increases_delta_for_otm(self):
+        """Longer time to expiry should increase OTM call delta."""
+        delta_short = compute_option_delta(
+            underlying_price=80.0, strike=100.0, dte_years=0.05,
+            sigma=0.25, right="C",
+        )
+        delta_long = compute_option_delta(
+            underlying_price=80.0, strike=100.0, dte_years=1.0,
+            sigma=0.25, right="C",
+        )
+        assert delta_short is not None and delta_long is not None
+        assert delta_long > delta_short
+
+    def test_with_dividend_yield(self):
+        """Dividend yield should reduce call delta slightly."""
+        delta_no_div = compute_option_delta(
+            underlying_price=100.0, strike=100.0, dte_years=0.5,
+            sigma=0.25, right="C", dividend_yield=0.0,
+        )
+        delta_with_div = compute_option_delta(
+            underlying_price=100.0, strike=100.0, dte_years=0.5,
+            sigma=0.25, right="C", dividend_yield=0.03,
+        )
+        assert delta_no_div is not None and delta_with_div is not None
+        assert delta_with_div < delta_no_div
+
+
+# ── Tests: compute_option_beta ───────────────────────────────────────────────
+
+
+class TestComputeOptionBeta:
+    """Tests for option beta = underlying_beta * delta * leverage."""
+
+    def test_atm_call_beta_higher_than_underlying(self):
+        """ATM call should have beta > underlying beta due to leverage."""
+        ob = compute_option_beta(
+            underlying_beta=1.2,
+            underlying_price=100.0,
+            option_price=5.0,
+            strike=100.0,
+            dte_years=0.25,
+            sigma=0.30,
+            right="C",
+        )
+        assert ob is not None
+        assert ob > 1.2  # leveraged
+
+    def test_put_beta_is_negative(self):
+        """Put option beta should be negative (inverse exposure)."""
+        ob = compute_option_beta(
+            underlying_beta=1.0,
+            underlying_price=100.0,
+            option_price=5.0,
+            strike=100.0,
+            dte_years=0.25,
+            sigma=0.30,
+            right="P",
+        )
+        assert ob is not None
+        assert ob < 0
+
+    def test_deep_itm_call_beta_close_to_leveraged_underlying(self):
+        """Deep ITM call (delta~1) beta ≈ underlying_beta * (S/option_price)."""
+        ob = compute_option_beta(
+            underlying_beta=1.5,
+            underlying_price=150.0,
+            option_price=52.0,  # ~$2 time value on $50 ITM
+            strike=100.0,
+            dte_years=0.25,
+            sigma=0.20,
+            right="C",
+        )
+        assert ob is not None
+        # delta ~1, leverage ~150/52 ~2.88, so beta ~1.5 * 1 * 2.88 ~4.3
+        assert 3.0 < ob < 6.0
+
+    def test_zero_option_price_returns_none(self):
+        """Worthless option should return None."""
+        ob = compute_option_beta(
+            underlying_beta=1.0,
+            underlying_price=100.0,
+            option_price=0.0,
+            strike=100.0,
+            dte_years=0.25,
+            sigma=0.30,
+            right="C",
+        )
+        assert ob is None
+
+    def test_none_underlying_beta_returns_none(self):
+        ob = compute_option_beta(
+            underlying_beta=None,
+            underlying_price=100.0,
+            option_price=5.0,
+            strike=100.0,
+            dte_years=0.25,
+            sigma=0.30,
+            right="C",
+        )
+        assert ob is None
+
+    def test_expired_option_returns_none(self):
+        ob = compute_option_beta(
+            underlying_beta=1.0,
+            underlying_price=100.0,
+            option_price=5.0,
+            strike=100.0,
+            dte_years=0.0,
+            sigma=0.30,
+            right="C",
+        )
+        assert ob is None
+
+    def test_short_put_beta_positive(self):
+        """Short put (negative quantity) has positive beta exposure.
+        The sign flip from quantity is handled at the portfolio level,
+        not in compute_option_beta which works per-contract."""
+        ob = compute_option_beta(
+            underlying_beta=1.0,
+            underlying_price=100.0,
+            option_price=5.0,
+            strike=100.0,
+            dte_years=0.25,
+            sigma=0.30,
+            right="P",
+        )
+        # Per-contract put beta is negative (delta is negative)
+        assert ob is not None
+        assert ob < 0

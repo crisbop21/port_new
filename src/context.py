@@ -12,7 +12,10 @@ from decimal import Decimal
 import numpy as np
 import pandas as pd
 
-from src.beta import BENCHMARKS, compute_beta, compute_portfolio_beta
+from src.beta import (
+    BENCHMARKS, compute_beta, compute_option_beta, compute_option_delta,
+    compute_portfolio_beta,
+)
 from src.db import (
     get_daily_prices,
     get_latest_price,
@@ -307,6 +310,50 @@ def build_position_context(
                 dollar_beta = result["dollar_betas"].get(sym)
                 underlyings_ctx[sym][f"dollar_beta_{bench.lower()}"] = dollar_beta
 
+    # ── Enrich option positions with delta and option beta ──────────────
+    for pos in enriched_positions:
+        if pos["asset_class"] != "OPT":
+            continue
+
+        underlying = pos["underlying"]
+        u_ctx = underlyings_ctx.get(underlying, {})
+        u_price = u_ctx.get("current_price")
+        sigma = u_ctx.get("realized_vol_20d") or 0.30
+        strike_f = float(pos["strike"]) if pos.get("strike") else None
+        right = pos.get("right")
+        dte = pos.get("dte")
+
+        if u_price and strike_f and right and dte is not None and dte > 0:
+            dte_years = dte / 365.0
+            delta = compute_option_delta(
+                underlying_price=u_price,
+                strike=strike_f,
+                dte_years=dte_years,
+                sigma=sigma,
+                right=right,
+            )
+            pos["delta"] = delta
+
+            # Option beta vs each benchmark
+            option_price = abs(pos.get("market_value", 0)) / (abs(pos.get("quantity", 1)) * 100) if pos.get("quantity") else None
+            if option_price and option_price > 0:
+                for bench in sorted(BENCHMARKS):
+                    u_beta = u_ctx.get(f"beta_{bench.lower()}")
+                    ob = compute_option_beta(
+                        underlying_beta=u_beta,
+                        underlying_price=u_price,
+                        option_price=option_price,
+                        strike=strike_f,
+                        dte_years=dte_years,
+                        sigma=sigma,
+                        right=right,
+                    )
+                    pos[f"option_beta_{bench.lower()}"] = ob
+            else:
+                pos["delta"] = delta
+        else:
+            pos["delta"] = None
+
     return {
         "account_id": account_id,
         "as_of_date": latest_date.isoformat(),
@@ -375,14 +422,18 @@ def serialize_context(ctx: dict) -> str:
             lines.append("")
             lines.append(
                 "| Underlying | Type | Strike | Expiry | DTE | Moneyness | "
-                "Qty | Breakeven | Cost | Value | P&L |"
+                "Qty | Delta | Opt Beta (SPY) | Breakeven | Cost | Value | P&L |"
             )
             lines.append(
                 "|------------|------|--------|--------|-----|-----------|"
-                "-----|-----------|------|-------|-----|"
+                "-----|-------|----------------|-----------|------|-------|-----|"
             )
             for pos in opt_positions:
                 right_label = "Call" if pos.get("right") == "C" else "Put"
+                delta = pos.get("delta")
+                delta_str = f"{delta:.3f}" if delta is not None else "N/A"
+                ob_spy = pos.get("option_beta_spy")
+                ob_str = f"{ob_spy:.2f}" if ob_spy is not None else "N/A"
                 lines.append(
                     f"| {pos.get('underlying', '?')} "
                     f"| {right_label} "
@@ -391,6 +442,8 @@ def serialize_context(ctx: dict) -> str:
                     f"| {pos.get('dte', '?')} "
                     f"| {_moneyness_str(pos.get('moneyness'))} "
                     f"| {pos.get('quantity', '?')} "
+                    f"| {delta_str} "
+                    f"| {ob_str} "
                     f"| {pos.get('breakeven', 'N/A')} "
                     f"| {_format_number(pos.get('cost_basis'))} "
                     f"| {_format_number(pos.get('market_value'))} "
