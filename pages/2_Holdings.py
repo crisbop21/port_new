@@ -1,5 +1,6 @@
 """Holdings page — view positions as of any snapshot date and reconcile."""
 
+import logging
 import sys
 from datetime import date, timedelta
 from pathlib import Path
@@ -9,6 +10,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import pandas as pd
 import streamlit as st
 
+logger = logging.getLogger(__name__)
+
 from src.db import (
     get_account_ids,
     get_daily_prices,
@@ -16,10 +19,19 @@ from src.db import (
     get_snapshot_dates,
     reconcile_account,
     reconcile_pair,
+    upsert_daily_prices,
 )
-from src.beta import compute_beta, compute_portfolio_beta, BENCHMARKS
-from src.price_fetcher import fetch_daily_prices
-from src.db import upsert_daily_prices
+
+# Beta imports — guarded so the rest of the page still works if something is off
+_BETA_AVAILABLE = False
+try:
+    from src.beta import compute_portfolio_beta, BENCHMARKS
+    from src.price_fetcher import fetch_daily_prices
+    _BETA_AVAILABLE = True
+    logger.info("Beta module loaded successfully")
+except Exception as _beta_import_err:
+    logger.exception("Failed to import beta module")
+    _beta_import_err_msg = str(_beta_import_err)
 
 st.title("Holdings")
 
@@ -132,97 +144,152 @@ st.divider()
 
 st.subheader("Portfolio Beta")
 
-beta_col1, beta_col2 = st.columns([1, 1])
-with beta_col1:
-    benchmark = st.selectbox(
-        "Benchmark",
-        options=sorted(BENCHMARKS),
-        index=0,  # QQQ first alphabetically
-        help="Select the benchmark index to compute beta against.",
-    )
-with beta_col2:
-    calculate_beta = st.button("Calculate Beta", type="primary")
-
-# Collect unique stock/ETF symbols for beta (use underlying for options)
-beta_symbols: set[str] = set()
-for _, row in df.iterrows():
-    sym = row["symbol"]
-    ac = row["asset_class"]
-    if ac == "OPT" and " " in sym:
-        beta_symbols.add(sym.split(" ")[0])
-    else:
-        beta_symbols.add(sym)
-
-# Store beta results in session state so they persist across reruns
-if "beta_result" not in st.session_state:
-    st.session_state.beta_result = None
-    st.session_state.beta_benchmark = None
-
-if calculate_beta:
-    lookback_start = as_of - timedelta(days=400)  # buffer for 252 trading days
-
-    with st.spinner(f"Fetching prices and computing beta vs {benchmark}..."):
-        try:
-            # Fetch benchmark prices (auto-fetch if missing)
-            bench_prices = get_daily_prices(benchmark, date_from=lookback_start, date_to=as_of)
-            if len(bench_prices) < 60:
-                fetched, errs = fetch_daily_prices(benchmark, start=lookback_start, end=as_of)
-                if fetched:
-                    upsert_daily_prices(fetched)
-                    bench_prices = get_daily_prices(benchmark, date_from=lookback_start, date_to=as_of)
-
-            if len(bench_prices) < 60:
-                st.error(
-                    f"Not enough price data for {benchmark} ({len(bench_prices)} rows, "
-                    f"need at least 60). Go to **Prices** page to fetch {benchmark} prices."
-                )
-            else:
-                # Fetch prices for each symbol
-                holdings_for_beta: dict[str, dict] = {}
-                for sym in sorted(beta_symbols):
-                    sym_prices = get_daily_prices(sym, date_from=lookback_start, date_to=as_of)
-                    if len(sym_prices) < 60:
-                        fetched, _ = fetch_daily_prices(sym, start=lookback_start, end=as_of)
-                        if fetched:
-                            upsert_daily_prices(fetched)
-                            sym_prices = get_daily_prices(sym, date_from=lookback_start, date_to=as_of)
-                    # Compute market value for this underlying
-                    mv = 0.0
-                    for _, r in df.iterrows():
-                        underlying = r["symbol"].split(" ")[0] if r["asset_class"] == "OPT" and " " in r["symbol"] else r["symbol"]
-                        if underlying == sym:
-                            mv += abs(float(r.get("market_value", 0) or 0))
-                    holdings_for_beta[sym] = {"market_value": mv, "prices": sym_prices}
-
-                result = compute_portfolio_beta(holdings_for_beta, bench_prices)
-                st.session_state.beta_result = result
-                st.session_state.beta_benchmark = benchmark
-
-        except Exception as e:
-            st.error(f"Beta calculation error: {e}")
-
-# Display beta results if available
-beta_result = st.session_state.get("beta_result")
-beta_benchmark = st.session_state.get("beta_benchmark")
-
-if beta_result is not None and beta_benchmark is not None:
-    if beta_result["portfolio_beta"] is not None:
-        bc1, bc2, bc3 = st.columns(3)
-        bc1.metric(f"Portfolio Beta vs {beta_benchmark}", f"{beta_result['portfolio_beta']:.2f}")
-        bc2.metric(
-            f"Dollar Beta vs {beta_benchmark}",
-            f"${beta_result['portfolio_dollar_beta']:,.0f}",
-            help="For every 1% move in the benchmark, portfolio moves by approx this dollar amount / 100.",
-        )
-        valid_count = sum(1 for b in beta_result["betas"].values() if b is not None)
-        bc3.metric("Symbols with Beta", f"{valid_count}/{len(beta_result['betas'])}")
-    else:
-        st.warning(
-            f"Could not compute portfolio beta. Ensure daily prices are fetched "
-            f"for your holdings and {beta_benchmark} (go to **Prices** page)."
-        )
+if not _BETA_AVAILABLE:
+    st.error(f"Beta module failed to load: {_beta_import_err_msg}")
+    logger.error("Beta section skipped — import failed: %s", _beta_import_err_msg)
 else:
-    st.caption("Click **Calculate Beta** to compute portfolio beta vs the selected benchmark.")
+    logger.info("Rendering beta section")
+
+    beta_col1, beta_col2 = st.columns([1, 1])
+    with beta_col1:
+        benchmark = st.selectbox(
+            "Benchmark",
+            options=sorted(BENCHMARKS),
+            index=0,  # QQQ first alphabetically
+            help="Select the benchmark index to compute beta against.",
+        )
+    with beta_col2:
+        calculate_beta = st.button("Calculate Beta", type="primary")
+
+    # Collect unique stock/ETF symbols for beta (use underlying for options)
+    beta_symbols: set[str] = set()
+    for _, row in df.iterrows():
+        sym = row["symbol"]
+        ac = row["asset_class"]
+        if ac == "OPT" and " " in sym:
+            beta_symbols.add(sym.split(" ")[0])
+        else:
+            beta_symbols.add(sym)
+
+    logger.info("Beta symbols extracted: %s", sorted(beta_symbols))
+
+    # Store beta results in session state so they persist across reruns
+    if "beta_result" not in st.session_state:
+        st.session_state.beta_result = None
+        st.session_state.beta_benchmark = None
+
+    if calculate_beta:
+        lookback_start = as_of - timedelta(days=400)  # buffer for 252 trading days
+        logger.info(
+            "Calculate Beta clicked — benchmark=%s, lookback=%s to %s, symbols=%s",
+            benchmark, lookback_start, as_of, sorted(beta_symbols),
+        )
+
+        with st.spinner(f"Fetching prices and computing beta vs {benchmark}..."):
+            try:
+                # Fetch benchmark prices (auto-fetch if missing)
+                bench_prices = get_daily_prices(benchmark, date_from=lookback_start, date_to=as_of)
+                logger.info("Benchmark %s: %d price rows from DB", benchmark, len(bench_prices))
+
+                if len(bench_prices) < 60:
+                    st.info(f"Fetching {benchmark} prices from Yahoo Finance...")
+                    fetched, errs = fetch_daily_prices(benchmark, start=lookback_start, end=as_of)
+                    logger.info("Fetched %d rows for %s from yfinance (errors: %s)", len(fetched), benchmark, errs)
+                    if fetched:
+                        upsert_daily_prices(fetched)
+                        bench_prices = get_daily_prices(benchmark, date_from=lookback_start, date_to=as_of)
+                        logger.info("After upsert, benchmark %s: %d rows", benchmark, len(bench_prices))
+                    if errs:
+                        for e in errs:
+                            st.warning(f"Price fetch warning: {e}")
+
+                if len(bench_prices) < 60:
+                    st.error(
+                        f"Not enough price data for **{benchmark}** ({len(bench_prices)} rows, "
+                        f"need at least 60). Go to **Prices** page to fetch {benchmark} prices first."
+                    )
+                else:
+                    # Fetch prices for each symbol
+                    holdings_for_beta: dict[str, dict] = {}
+                    for sym in sorted(beta_symbols):
+                        sym_prices = get_daily_prices(sym, date_from=lookback_start, date_to=as_of)
+                        logger.info("Symbol %s: %d price rows from DB", sym, len(sym_prices))
+
+                        if len(sym_prices) < 60:
+                            st.info(f"Fetching {sym} prices from Yahoo Finance...")
+                            fetched, errs = fetch_daily_prices(sym, start=lookback_start, end=as_of)
+                            logger.info("Fetched %d rows for %s from yfinance", len(fetched), sym)
+                            if fetched:
+                                upsert_daily_prices(fetched)
+                                sym_prices = get_daily_prices(sym, date_from=lookback_start, date_to=as_of)
+                            if errs:
+                                for e in errs:
+                                    st.warning(f"{sym}: {e}")
+
+                        # Compute market value for this underlying
+                        mv = 0.0
+                        for _, r in df.iterrows():
+                            underlying = (
+                                r["symbol"].split(" ")[0]
+                                if r["asset_class"] == "OPT" and " " in r["symbol"]
+                                else r["symbol"]
+                            )
+                            if underlying == sym:
+                                mv += abs(float(r.get("market_value", 0) or 0))
+
+                        holdings_for_beta[sym] = {"market_value": mv, "prices": sym_prices}
+                        logger.info("Symbol %s: mv=%.2f, price_rows=%d", sym, mv, len(sym_prices))
+
+                    result = compute_portfolio_beta(holdings_for_beta, bench_prices)
+                    logger.info(
+                        "Beta result: portfolio_beta=%s, dollar_beta=%s, per_symbol=%s",
+                        result["portfolio_beta"],
+                        result["portfolio_dollar_beta"],
+                        {k: v for k, v in result["betas"].items()},
+                    )
+                    st.session_state.beta_result = result
+                    st.session_state.beta_benchmark = benchmark
+                    st.success("Beta calculation complete!")
+
+            except Exception as e:
+                logger.exception("Beta calculation failed")
+                st.error(f"Beta calculation error: {e}")
+
+    # Display beta results if available
+    beta_result = st.session_state.get("beta_result")
+    beta_benchmark = st.session_state.get("beta_benchmark")
+
+    if beta_result is not None and beta_benchmark is not None:
+        if beta_result["portfolio_beta"] is not None:
+            bc1, bc2, bc3 = st.columns(3)
+            bc1.metric(f"Portfolio Beta vs {beta_benchmark}", f"{beta_result['portfolio_beta']:.2f}")
+            bc2.metric(
+                f"Dollar Beta vs {beta_benchmark}",
+                f"${beta_result['portfolio_dollar_beta']:,.0f}",
+                help="For every 1% move in the benchmark, portfolio moves by approx this dollar amount / 100.",
+            )
+            valid_count = sum(1 for b in beta_result["betas"].values() if b is not None)
+            bc3.metric("Symbols with Beta", f"{valid_count}/{len(beta_result['betas'])}")
+
+            # Diagnostic expander
+            with st.expander("Beta details per symbol"):
+                beta_detail_rows = []
+                for sym in sorted(beta_result["betas"].keys()):
+                    b = beta_result["betas"][sym]
+                    db = beta_result["dollar_betas"][sym]
+                    beta_detail_rows.append({
+                        "Symbol": sym,
+                        "Beta": f"{b:.3f}" if b is not None else "N/A (insufficient data)",
+                        "Dollar Beta": f"${db:,.0f}" if db is not None else "N/A",
+                    })
+                st.dataframe(pd.DataFrame(beta_detail_rows), use_container_width=True, hide_index=True)
+        else:
+            st.warning(
+                f"Could not compute portfolio beta. Ensure daily prices are fetched "
+                f"for your holdings and {beta_benchmark} (go to **Prices** page)."
+            )
+    else:
+        st.caption("Click **Calculate Beta** to compute portfolio beta vs the selected benchmark.")
 
 st.divider()
 
@@ -288,19 +355,22 @@ consol_df["pct_of_account"] = (
 consol_df = consol_df.sort_values("market_value", ascending=False).reset_index(drop=True)
 
 # Add beta and dollar beta columns if beta has been calculated
-if beta_result is not None:
+_beta_result_for_table = st.session_state.get("beta_result") if _BETA_AVAILABLE else None
+_beta_bench_for_table = st.session_state.get("beta_benchmark") if _BETA_AVAILABLE else None
+
+if _beta_result_for_table is not None:
     consol_df["beta"] = consol_df["symbol"].map(
-        lambda s: beta_result["betas"].get(s)
+        lambda s: _beta_result_for_table["betas"].get(s)
     )
     consol_df["dollar_beta"] = consol_df["symbol"].map(
-        lambda s: beta_result["dollar_betas"].get(s)
+        lambda s: _beta_result_for_table["dollar_betas"].get(s)
     )
 
 col_table, col_chart = st.columns([1, 1])
 
 with col_table:
     base_cols = ["symbol", "quantity", "breakeven", "market_value", "pct_of_account"]
-    if beta_result is not None:
+    if _beta_result_for_table is not None:
         base_cols += ["beta", "dollar_beta"]
 
     display_mv = consol_df[base_cols].copy()
@@ -317,10 +387,10 @@ with col_table:
         "pct_of_account": "% of Account",
     }
 
-    if beta_result is not None:
+    if _beta_result_for_table is not None:
         display_mv["beta"] = display_mv["beta"].map(lambda v: f"{v:.2f}" if v is not None else "N/A")
         display_mv["dollar_beta"] = display_mv["dollar_beta"].map(lambda v: f"${v:,.0f}" if v is not None else "N/A")
-        rename_map["beta"] = f"Beta ({beta_benchmark})"
+        rename_map["beta"] = f"Beta ({_beta_bench_for_table})"
         rename_map["dollar_beta"] = "Dollar Beta"
 
     display_mv = display_mv.rename(columns=rename_map)
