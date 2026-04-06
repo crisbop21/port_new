@@ -262,17 +262,18 @@ else:
                     for _, r in df.iterrows():
                         sym = r["symbol"]
                         ac = r["asset_class"]
-                        mv = abs(float(r.get("market_value", 0) or 0))
+                        raw_mv = float(r.get("market_value", 0) or 0)
                         underlying = sym.split(" ")[0] if ac == "OPT" and " " in sym else sym
                         u_beta = underlying_betas.get(underlying)
 
                         if ac in ("STK", "ETF"):
                             position_betas.append({
                                 "symbol": sym, "effective_beta": u_beta,
-                                "market_value": mv,
+                                "market_value": abs(raw_mv),
                             })
                         elif ac == "OPT":
                             # Compute option beta using delta + leverage
+                            mv = raw_mv  # preserve sign for short positions
                             strike_val = float(r.get("strike", 0) or 0)
                             right_val = r.get("right")
                             expiry_val = r.get("expiry")
@@ -330,19 +331,16 @@ else:
                             })
 
                     # ── Step 3: aggregate portfolio beta ──────────────────
-                    total_mv = sum(p["market_value"] for p in position_betas if p["effective_beta"] is not None)
-                    if total_mv > 0:
-                        port_beta = sum(
-                            p["effective_beta"] * p["market_value"]
-                            for p in position_betas if p["effective_beta"] is not None
-                        ) / total_mv
-                    else:
-                        port_beta = None
-
+                    # Use abs(mv) for weights so long/short don't cancel in denominator
+                    total_mv = sum(abs(p["market_value"]) for p in position_betas if p["effective_beta"] is not None)
                     port_dollar_beta = sum(
                         p["effective_beta"] * p["market_value"]
                         for p in position_betas if p["effective_beta"] is not None
                     )
+                    if total_mv > 0:
+                        port_beta = port_dollar_beta / total_mv
+                    else:
+                        port_beta = None
 
                     result = {
                         "betas": underlying_betas,
@@ -383,12 +381,29 @@ else:
             # Diagnostic expander
             with st.expander("Beta details per symbol"):
                 beta_detail_rows = []
+                # Underlying betas (STK/ETF)
                 for sym in sorted(beta_result["betas"].keys()):
                     b = beta_result["betas"][sym]
-                    db = beta_result["dollar_betas"][sym]
+                    db = beta_result["dollar_betas"].get(sym)
                     beta_detail_rows.append({
                         "Symbol": sym,
+                        "Type": "Underlying",
                         "Beta": f"{b:.3f}" if b is not None else "N/A (insufficient data)",
+                        "Dollar Beta": f"${db:,.0f}" if db is not None else "N/A",
+                    })
+                # Option position betas
+                for p in beta_result.get("position_betas", []):
+                    sym = p["symbol"]
+                    # Skip STK/ETF — already shown above as underlyings
+                    if sym in beta_result["betas"]:
+                        continue
+                    eb = p["effective_beta"]
+                    mv = p["market_value"]
+                    db = eb * mv if eb is not None else None
+                    beta_detail_rows.append({
+                        "Symbol": sym,
+                        "Type": "Option",
+                        "Beta": f"{eb:.3f}" if eb is not None else "N/A",
                         "Dollar Beta": f"${db:,.0f}" if db is not None else "N/A",
                     })
                 st.dataframe(pd.DataFrame(beta_detail_rows), use_container_width=True, hide_index=True)
