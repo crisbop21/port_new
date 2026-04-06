@@ -498,10 +498,6 @@ with col_table:
         base_cols += ["beta", "dollar_beta"]
 
     display_mv = consol_df[base_cols].copy()
-    display_mv["quantity"] = display_mv["quantity"].map(lambda v: f"{v:,.2f}")
-    display_mv["breakeven"] = display_mv["breakeven"].map(lambda v: f"${v:,.2f}")
-    display_mv["market_value"] = display_mv["market_value"].map(lambda v: f"${v:,.2f}")
-    display_mv["pct_of_account"] = display_mv["pct_of_account"].map(lambda v: f"{v:.1f}%")
 
     rename_map = {
         "symbol": "Symbol",
@@ -511,14 +507,21 @@ with col_table:
         "pct_of_account": "% of Account",
     }
 
+    col_config = {
+        "Total Qty": st.column_config.NumberColumn(format="%.2f"),
+        "Avg Breakeven": st.column_config.NumberColumn(format="$%.2f"),
+        "Market Value ($)": st.column_config.NumberColumn(format="$%.2f"),
+        "% of Account": st.column_config.NumberColumn(format="%.1f%%"),
+    }
+
     if _beta_result_for_table is not None:
-        display_mv["beta"] = display_mv["beta"].map(lambda v: f"{v:.2f}" if v is not None else "N/A")
-        display_mv["dollar_beta"] = display_mv["dollar_beta"].map(lambda v: f"${v:,.0f}" if v is not None else "N/A")
         rename_map["beta"] = f"Beta ({_beta_bench_for_table})"
         rename_map["dollar_beta"] = "Dollar Beta"
+        col_config[f"Beta ({_beta_bench_for_table})"] = st.column_config.NumberColumn(format="%.2f")
+        col_config["Dollar Beta"] = st.column_config.NumberColumn(format="$%.0f")
 
     display_mv = display_mv.rename(columns=rename_map)
-    st.dataframe(display_mv, use_container_width=True, hide_index=True)
+    st.dataframe(display_mv, use_container_width=True, hide_index=True, column_config=col_config)
 
 with col_chart:
     import altair as alt
@@ -656,36 +659,30 @@ for asset_class, group in df.groupby("asset_class", sort=True):
         detail_df["opt_dollar_beta"] = opt_dollar_betas
         show_cols = show_cols + ["delta", "opt_beta", "opt_dollar_beta"]
 
-    dollar_cols = ["cost_value", "market_value", "cost_basis", "market_price", "unrealized_pnl", "strike"]
-    for col in dollar_cols:
-        if col in detail_df.columns:
-            detail_df[col] = detail_df[col].map(lambda v: f"${v:,.2f}")
     if "multiplier" in detail_df.columns:
         detail_df["multiplier"] = detail_df["multiplier"].astype(int)
-
-    # Format delta and option beta columns (pd.notna handles both None and NaN)
-    if "delta" in detail_df.columns:
-        detail_df["delta"] = detail_df["delta"].map(
-            lambda v: f"{v:.3f}" if pd.notna(v) else "N/A"
-        )
-    if "opt_beta" in detail_df.columns:
-        detail_df["opt_beta"] = detail_df["opt_beta"].map(
-            lambda v: f"{v:.2f}" if pd.notna(v) else "N/A"
-        )
-    if "opt_dollar_beta" in detail_df.columns:
-        detail_df["opt_dollar_beta"] = detail_df["opt_dollar_beta"].map(
-            lambda v: f"${v:,.0f}" if pd.notna(v) else "N/A"
-        )
 
     col_labels = {
         "cost_value": "Cost Value", "market_value": "Market Value",
         "cost_basis": "Cost Basis", "market_price": "Market Price",
         "unrealized_pnl": "Unrealized P&L", "multiplier": "Mult",
-        "delta": "Delta", "opt_beta": f"Option Beta",
+        "delta": "Delta", "opt_beta": "Option Beta",
         "opt_dollar_beta": "Dollar Beta",
     }
     detail_df = detail_df.rename(columns={k: v for k, v in col_labels.items() if k in detail_df.columns})
-    st.dataframe(detail_df, use_container_width=True)
+
+    detail_col_config = {
+        "Cost Value": st.column_config.NumberColumn(format="$%.2f"),
+        "Market Value": st.column_config.NumberColumn(format="$%.2f"),
+        "Cost Basis": st.column_config.NumberColumn(format="$%.2f"),
+        "Market Price": st.column_config.NumberColumn(format="$%.2f"),
+        "Unrealized P&L": st.column_config.NumberColumn(format="$%.2f"),
+        "strike": st.column_config.NumberColumn(format="$%.2f"),
+        "Delta": st.column_config.NumberColumn(format="%.3f"),
+        "Option Beta": st.column_config.NumberColumn(format="%.2f"),
+        "Dollar Beta": st.column_config.NumberColumn(format="$%.0f"),
+    }
+    st.dataframe(detail_df, use_container_width=True, column_config=detail_col_config)
 
 # ── Export ─────────────────────────────────────────────────────────────────
 

@@ -139,15 +139,15 @@ if not metrics_data:
 
 # Build a summary table: rows = symbols, columns = metrics
 DISPLAY_METRICS = [
-    ("revenue", "Revenue", "${:,.0f}"),
-    ("net_income", "Net Income", "${:,.0f}"),
-    ("eps_diluted", "EPS (Diluted)", "${:,.2f}"),
-    ("total_assets", "Total Assets", "${:,.0f}"),
-    ("total_liabilities", "Total Liabilities", "${:,.0f}"),
-    ("stockholders_equity", "Equity", "${:,.0f}"),
-    ("shares_outstanding", "Shares Out", "{:,.0f}"),
-    ("operating_income", "Operating Income", "${:,.0f}"),
-    ("cash_and_equivalents", "Cash", "${:,.0f}"),
+    ("revenue", "Revenue", "$%.0f"),
+    ("net_income", "Net Income", "$%.0f"),
+    ("eps_diluted", "EPS (Diluted)", "$%.2f"),
+    ("total_assets", "Total Assets", "$%.0f"),
+    ("total_liabilities", "Total Liabilities", "$%.0f"),
+    ("stockholders_equity", "Equity", "$%.0f"),
+    ("shares_outstanding", "Shares Out", "%.0f"),
+    ("operating_income", "Operating Income", "$%.0f"),
+    ("cash_and_equivalents", "Cash", "$%.0f"),
 ]
 
 # Pre-compute split detection per symbol for use in summary + detail
@@ -220,13 +220,13 @@ for sym in sorted(metrics_data.keys()):
                             if sym not in [n.split(":")[0] for n in split_notes]:
                                 split_notes.append(f"{sym}: {len(sym_splits)} split(s) detected — per-share metrics adjusted")
 
-                    row[display_name] = fmt.format(val)
+                    row[display_name] = val
                 except (ValueError, TypeError):
-                    row[display_name] = str(raw_val)
+                    row[display_name] = None
             else:
-                row[display_name] = "—"
+                row[display_name] = None
         else:
-            row[display_name] = "—"
+            row[display_name] = None
 
     # Add the fiscal period for context
     any_metric = next(iter(sym_metrics.values()), {})
@@ -237,7 +237,11 @@ for sym in sorted(metrics_data.keys()):
 
 if rows:
     summary_df = pd.DataFrame(rows)
-    st.dataframe(summary_df, use_container_width=True, hide_index=True)
+    metrics_col_config = {
+        display_name: st.column_config.NumberColumn(display_name, format=fmt)
+        for _, display_name, fmt in DISPLAY_METRICS
+    }
+    st.dataframe(summary_df, use_container_width=True, hide_index=True, column_config=metrics_col_config)
     notes = []
     if ttm_notes:
         notes.append("TTM-adjusted: " + " | ".join(ttm_notes))

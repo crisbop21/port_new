@@ -146,15 +146,13 @@ if not trade_df.empty:
     show_cols = [c for c in ["trade_date", "symbol", "side", "quantity", "price", "realized_pnl"]
                  if c in recent.columns]
     recent_disp = recent[show_cols].reset_index(drop=True).copy()
-    for col in ["price", "realized_pnl"]:
-        if col in recent_disp.columns:
-            recent_disp[col] = recent_disp[col].map(lambda v: f"${v:,.2f}")
     st.dataframe(
         recent_disp,
         use_container_width=True,
         column_config={
             "trade_date": st.column_config.DatetimeColumn("Date", format="YYYY-MM-DD HH:mm"),
-            "realized_pnl": "Realized P&L",
+            "price": st.column_config.NumberColumn("Price", format="$%.2f"),
+            "realized_pnl": st.column_config.NumberColumn("Realized P&L", format="$%.2f"),
         },
     )
 
