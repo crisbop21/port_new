@@ -1,7 +1,7 @@
 """Holdings page — view positions as of any snapshot date and reconcile."""
 
 import sys
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -11,11 +11,15 @@ import streamlit as st
 
 from src.db import (
     get_account_ids,
+    get_daily_prices,
     get_positions_as_of,
     get_snapshot_dates,
     reconcile_account,
     reconcile_pair,
 )
+from src.beta import compute_beta, compute_portfolio_beta, BENCHMARKS
+from src.price_fetcher import fetch_daily_prices
+from src.db import upsert_daily_prices
 
 st.title("Holdings")
 
@@ -124,6 +128,96 @@ else:
 
 st.divider()
 
+# ── Beta vs Benchmark ──────────────────────────────────────────────────────
+
+st.subheader("Portfolio Beta")
+
+benchmark = st.selectbox(
+    "Benchmark",
+    options=sorted(BENCHMARKS),
+    index=0,  # QQQ first alphabetically
+    help="Select the benchmark index to compute beta against.",
+)
+
+# Collect unique stock/ETF symbols for beta (use underlying for options)
+beta_symbols: set[str] = set()
+for _, row in df.iterrows():
+    sym = row["symbol"]
+    ac = row["asset_class"]
+    if ac == "OPT" and " " in sym:
+        beta_symbols.add(sym.split(" ")[0])
+    else:
+        beta_symbols.add(sym)
+
+# Fetch benchmark + symbol prices (auto-fetch if missing)
+lookback_start = as_of - timedelta(days=400)  # extra buffer for 252 trading days
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _load_beta_data(
+    symbols: tuple[str, ...], bench: str, start: date, end: date
+):
+    """Load prices and compute betas for all symbols vs benchmark."""
+    # Ensure benchmark prices exist
+    bench_prices = get_daily_prices(bench, date_from=start, date_to=end)
+    if len(bench_prices) < 60:
+        fetched, _ = fetch_daily_prices(bench, start=start, end=end)
+        if fetched:
+            upsert_daily_prices(fetched)
+            bench_prices = get_daily_prices(bench, date_from=start, date_to=end)
+
+    holdings_for_beta: dict[str, dict] = {}
+    for sym in symbols:
+        sym_prices = get_daily_prices(sym, date_from=start, date_to=end)
+        if len(sym_prices) < 60:
+            fetched, _ = fetch_daily_prices(sym, start=start, end=end)
+            if fetched:
+                upsert_daily_prices(fetched)
+                sym_prices = get_daily_prices(sym, date_from=start, date_to=end)
+        holdings_for_beta[sym] = {"market_value": 0.0, "prices": sym_prices}
+
+    return bench_prices, holdings_for_beta
+
+
+bench_prices, holdings_for_beta = _load_beta_data(
+    tuple(sorted(beta_symbols)), benchmark, lookback_start, as_of,
+)
+
+# Attach market values from consolidated data (computed later, but we need it now)
+# First compute per-symbol market values
+_sym_mv: dict[str, float] = {}
+for _, row in df.iterrows():
+    sym = row["symbol"]
+    ac = row["asset_class"]
+    underlying = sym.split(" ")[0] if ac == "OPT" and " " in sym else sym
+    mv = abs(float(row.get("market_value", 0) or 0))
+    _sym_mv[underlying] = _sym_mv.get(underlying, 0.0) + mv
+
+for sym in holdings_for_beta:
+    holdings_for_beta[sym]["market_value"] = _sym_mv.get(sym, 0.0)
+
+beta_result = compute_portfolio_beta(holdings_for_beta, bench_prices)
+
+# Display portfolio-level beta metrics
+if beta_result["portfolio_beta"] is not None:
+    bc1, bc2, bc3 = st.columns(3)
+    bc1.metric(f"Portfolio Beta vs {benchmark}", f"{beta_result['portfolio_beta']:.2f}")
+    bc2.metric(
+        f"Dollar Beta vs {benchmark}",
+        f"${beta_result['portfolio_dollar_beta']:,.0f}",
+        help="For every 1% move in the benchmark, portfolio moves by approx this dollar amount / 100.",
+    )
+    # Count how many symbols have valid beta
+    valid_count = sum(1 for b in beta_result["betas"].values() if b is not None)
+    bc3.metric("Symbols with Beta", f"{valid_count}/{len(beta_result['betas'])}")
+else:
+    st.warning(
+        f"Could not compute portfolio beta. Ensure daily prices are fetched "
+        f"for your holdings and {benchmark} (go to **Prices** page)."
+    )
+
+st.divider()
+
 # ── Consolidated market value per symbol ───────────────────────────────────
 
 st.subheader("Market Value by Symbol" if has_market_data else "Cost Basis by Symbol")
@@ -185,20 +279,32 @@ consol_df["pct_of_account"] = (
 )
 consol_df = consol_df.sort_values("market_value", ascending=False).reset_index(drop=True)
 
+# Add beta and dollar beta columns from beta_result
+consol_df["beta"] = consol_df["symbol"].map(
+    lambda s: beta_result["betas"].get(s)
+)
+consol_df["dollar_beta"] = consol_df["symbol"].map(
+    lambda s: beta_result["dollar_betas"].get(s)
+)
+
 col_table, col_chart = st.columns([1, 1])
 
 with col_table:
-    display_mv = consol_df[["symbol", "quantity", "breakeven", "market_value", "pct_of_account"]].copy()
+    display_mv = consol_df[["symbol", "quantity", "breakeven", "market_value", "pct_of_account", "beta", "dollar_beta"]].copy()
     display_mv["quantity"] = display_mv["quantity"].map(lambda v: f"{v:,.2f}")
     display_mv["breakeven"] = display_mv["breakeven"].map(lambda v: f"${v:,.2f}")
     display_mv["market_value"] = display_mv["market_value"].map(lambda v: f"${v:,.2f}")
     display_mv["pct_of_account"] = display_mv["pct_of_account"].map(lambda v: f"{v:.1f}%")
+    display_mv["beta"] = display_mv["beta"].map(lambda v: f"{v:.2f}" if v is not None else "N/A")
+    display_mv["dollar_beta"] = display_mv["dollar_beta"].map(lambda v: f"${v:,.0f}" if v is not None else "N/A")
     display_mv = display_mv.rename(columns={
         "symbol": "Symbol",
         "quantity": "Total Qty",
         "breakeven": "Avg Breakeven",
         "market_value": "Market Value ($)",
         "pct_of_account": "% of Account",
+        "beta": f"Beta ({benchmark})",
+        "dollar_beta": "Dollar Beta",
     })
     st.dataframe(display_mv, use_container_width=True, hide_index=True)
 

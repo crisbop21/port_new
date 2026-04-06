@@ -12,6 +12,7 @@ from decimal import Decimal
 import numpy as np
 import pandas as pd
 
+from src.beta import BENCHMARKS, compute_beta, compute_portfolio_beta
 from src.db import (
     get_daily_prices,
     get_latest_price,
@@ -274,11 +275,44 @@ def build_position_context(
             "recent_trades": trade_summary,
         }
 
+    # ── Beta calculation vs benchmarks ─────────────────────────────────────
+    beta_data: dict[str, dict] = {}  # {benchmark: {portfolio_beta, betas, ...}}
+    for bench in sorted(BENCHMARKS):
+        bench_prices = get_daily_prices(bench, date_from=lookback_start)
+        if not bench_prices:
+            continue
+
+        # Build holdings dict for beta computation
+        holdings_for_beta: dict[str, dict] = {}
+        for underlying in sorted(underlyings_seen):
+            sym_prices = get_daily_prices(underlying, date_from=lookback_start)
+            # Use market value sum across all positions for this underlying
+            mv = sum(
+                abs(float(p.get("market_value", 0) or 0))
+                for p in positions_raw
+                if _extract_underlying(p["symbol"], p["asset_class"]) == underlying
+            )
+            holdings_for_beta[underlying] = {
+                "market_value": mv,
+                "prices": sym_prices,
+            }
+
+        result = compute_portfolio_beta(holdings_for_beta, bench_prices)
+        beta_data[bench] = result
+
+        # Inject per-symbol beta into underlyings context
+        for sym, beta_val in result["betas"].items():
+            if sym in underlyings_ctx:
+                underlyings_ctx[sym][f"beta_{bench.lower()}"] = beta_val
+                dollar_beta = result["dollar_betas"].get(sym)
+                underlyings_ctx[sym][f"dollar_beta_{bench.lower()}"] = dollar_beta
+
     return {
         "account_id": account_id,
         "as_of_date": latest_date.isoformat(),
         "positions": enriched_positions,
         "underlyings": underlyings_ctx,
+        "beta": beta_data,
     }
 
 
@@ -380,6 +414,21 @@ def serialize_context(ctx: dict) -> str:
                 )
             lines.append("")
 
+    # ── Portfolio Beta ───────────────────────────────────────────────────────
+    beta_data = ctx.get("beta", {})
+    if beta_data:
+        lines.append("## Portfolio Beta")
+        lines.append("")
+        lines.append("| Benchmark | Portfolio Beta | Dollar Beta |")
+        lines.append("|-----------|---------------|-------------|")
+        for bench, data in sorted(beta_data.items()):
+            pb = data.get("portfolio_beta")
+            db = data.get("portfolio_dollar_beta", 0)
+            pb_str = f"{pb:.2f}" if pb is not None else "N/A"
+            db_str = f"${db:,.0f}" if db else "N/A"
+            lines.append(f"| {bench} | {pb_str} | {db_str} |")
+        lines.append("")
+
     # ── Underlying analysis tables ───────────────────────────────────────────
     underlyings = ctx.get("underlyings", {})
     if underlyings:
@@ -401,6 +450,15 @@ def serialize_context(ctx: dict) -> str:
                 lines.append(vol_line)
             elif vol is not None:
                 lines.append(f"- **Realized Vol 20d**: {vol:.1%}")
+
+            # Beta vs benchmarks
+            for bench in sorted(BENCHMARKS):
+                beta_val = data.get(f"beta_{bench.lower()}")
+                dollar_beta_val = data.get(f"dollar_beta_{bench.lower()}")
+                if beta_val is not None:
+                    db_str = f" (${dollar_beta_val:,.0f} dollar beta)" if dollar_beta_val else ""
+                    lines.append(f"- **Beta vs {bench}**: {beta_val:.2f}{db_str}")
+
             lines.append("")
 
             # ── Fundamental Evaluation Table ─────────────────────────────────
