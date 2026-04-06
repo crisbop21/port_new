@@ -152,10 +152,14 @@ else:
         "Cost value is the total cost basis reported by IBKR."
     )
 
-# ── PDF export button ──────────────────────────────────────────────────────
+# ── Export ─────────────────────────────────────────────────────────────────
+st.subheader("Export")
 if not _PDF_AVAILABLE:
-    st.error(f"PDF export unavailable: {_pdf_import_err_msg}")
-    logger.error("PDF export section skipped — import failed: %s", _pdf_import_err_msg)
+    st.error(
+        f"PDF export unavailable — install fpdf2 (`pip install fpdf2`). "
+        f"Error: {_pdf_import_err_msg}"
+    )
+    logger.error("PDF export skipped — import failed: %s", _pdf_import_err_msg)
 else:
     try:
         pdf_bytes = generate_holdings_pdf(
