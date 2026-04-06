@@ -36,6 +36,11 @@ if not symbols:
     st.info("No stock/ETF positions found. Upload a statement with holdings first.")
     st.stop()
 
+# Always include benchmark symbols for beta calculation
+BENCHMARK_SYMBOLS = ["SPY", "QQQ"]
+benchmarks_to_add = [b for b in BENCHMARK_SYMBOLS if b not in symbols]
+symbols_with_benchmarks = symbols + benchmarks_to_add
+
 # ── Fetch controls ───────────────────────────────────────────────────────────
 
 st.subheader("Fetch Prices")
@@ -50,16 +55,19 @@ with col2:
     end_date = st.date_input("End date", value=date.today())
 
 st.write(f"**Portfolio symbols:** {', '.join(symbols)}")
+if benchmarks_to_add:
+    st.caption(f"Benchmarks (for beta calculation): {', '.join(benchmarks_to_add)}")
 
 if st.button("Fetch All Portfolio Prices", type="primary"):
+    fetch_list = symbols_with_benchmarks
     progress = st.progress(0, text="Fetching prices...")
     all_prices = []
     all_errors = []
 
-    for i, sym in enumerate(symbols):
+    for i, sym in enumerate(fetch_list):
         progress.progress(
-            (i + 1) / len(symbols),
-            text=f"Fetching {sym} ({i + 1}/{len(symbols)})...",
+            (i + 1) / len(fetch_list),
+            text=f"Fetching {sym} ({i + 1}/{len(fetch_list)})...",
         )
         prices, errs = fetch_daily_prices(sym, start=start_date, end=end_date)
         all_prices.extend(prices)
@@ -79,7 +87,7 @@ if st.button("Fetch All Portfolio Prices", type="primary"):
         st.success(
             f"Saved {inserted + updated} price rows "
             f"({inserted} new, {updated} updated) "
-            f"for {len(symbols)} symbols."
+            f"for {len(fetch_list)} symbols."
         )
         if db_errors:
             for err in db_errors:
@@ -116,7 +124,7 @@ st.subheader("Stored Prices")
 
 # Latest price summary
 latest_data = []
-for sym in symbols:
+for sym in symbols_with_benchmarks:
     latest = get_latest_price(sym)
     if latest:
         latest_data.append({
@@ -142,7 +150,7 @@ else:
     st.info("No prices stored yet. Use the fetch button above.")
 
 # Per-symbol chart
-selected_sym = st.selectbox("View price chart", [""] + symbols)
+selected_sym = st.selectbox("View price chart", [""] + symbols_with_benchmarks)
 if selected_sym:
     price_rows = get_daily_prices(selected_sym, date_from=start_date, date_to=end_date)
     if price_rows:
