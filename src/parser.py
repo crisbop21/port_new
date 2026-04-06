@@ -55,6 +55,7 @@ SECTION_NAMES: set[str] = {
     "Trades", "Transaction Fees", "Interest", "Dividends",
     "Withholding Tax", "Notes/Legal Notes", "Time Weighted Rate of Return",
     "Deposits & Withdrawals", "Fees", "Other Fees", "Sales Tax",
+    "Complex Positions Summary",
 }
 
 
