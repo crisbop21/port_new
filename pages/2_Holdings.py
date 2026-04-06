@@ -460,14 +460,19 @@ for asset_class, group in df.groupby("asset_class", sort=True):
             mkt_value = float(orow.get("market_value", 0) or 0)
 
             # Get underlying price from market_price of the underlying
-            # Look up from the latest price in the underlying's beta data
             underlying_beta = _beta_result_for_table["betas"].get(underlying)
             underlying_price = None
-            # Get underlying price from any STK/ETF row with same symbol
+            # First try: look up from STK/ETF holdings
             for _, urow in df.iterrows():
                 if urow["symbol"] == underlying and urow["asset_class"] in ("STK", "ETF"):
                     underlying_price = float(urow.get("market_price", 0) or 0)
                     break
+            # Fallback: get latest price from daily_prices DB (covers cases
+            # like QQQ where user holds options but not the underlying stock)
+            if not underlying_price or underlying_price <= 0:
+                latest = get_daily_prices(underlying, date_from=as_of - timedelta(days=10), date_to=as_of)
+                if latest:
+                    underlying_price = float(latest[-1].get("close", 0) or 0)
 
             # Compute DTE in years
             dte_years = None
@@ -480,9 +485,9 @@ for asset_class, group in df.groupby("asset_class", sort=True):
                 except (ValueError, TypeError):
                     pass
 
-            # Use realized vol from context or a default
+            # Use realized vol from daily prices or a default
             sigma = 0.30  # default fallback
-            if _BETA_AVAILABLE and underlying_price and underlying_price > 0:
+            if _BETA_AVAILABLE:
                 lookback_start_vol = as_of - timedelta(days=60)
                 vol_prices = get_daily_prices(underlying, date_from=lookback_start_vol, date_to=as_of)
                 if len(vol_prices) >= 21:
@@ -539,18 +544,18 @@ for asset_class, group in df.groupby("asset_class", sort=True):
     if "multiplier" in detail_df.columns:
         detail_df["multiplier"] = detail_df["multiplier"].astype(int)
 
-    # Format delta and option beta columns
+    # Format delta and option beta columns (pd.notna handles both None and NaN)
     if "delta" in detail_df.columns:
         detail_df["delta"] = detail_df["delta"].map(
-            lambda v: f"{v:.3f}" if v is not None else "N/A"
+            lambda v: f"{v:.3f}" if pd.notna(v) else "N/A"
         )
     if "opt_beta" in detail_df.columns:
         detail_df["opt_beta"] = detail_df["opt_beta"].map(
-            lambda v: f"{v:.2f}" if v is not None else "N/A"
+            lambda v: f"{v:.2f}" if pd.notna(v) else "N/A"
         )
     if "opt_dollar_beta" in detail_df.columns:
         detail_df["opt_dollar_beta"] = detail_df["opt_dollar_beta"].map(
-            lambda v: f"${v:,.0f}" if v is not None else "N/A"
+            lambda v: f"${v:,.0f}" if pd.notna(v) else "N/A"
         )
 
     col_labels = {
