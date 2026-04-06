@@ -20,6 +20,7 @@ from src.db import (
     reconcile_account,
     reconcile_pair,
 )
+from src.pdf_holdings import generate_holdings_pdf
 
 # Beta imports — ALL beta-related imports guarded so the page still works
 _BETA_AVAILABLE = False
@@ -141,6 +142,23 @@ else:
         "Market value and unrealized P&L may be unavailable. "
         "Cost value is the total cost basis reported by IBKR."
     )
+
+# ── PDF export button ──────────────────────────────────────────────────────
+try:
+    pdf_bytes = generate_holdings_pdf(
+        df=df,
+        account_id=selected_account,
+        as_of=as_of,
+    )
+    st.download_button(
+        label="Download Holdings PDF",
+        data=pdf_bytes,
+        file_name=f"holdings_{selected_account}_{as_of.isoformat()}.pdf",
+        mime="application/pdf",
+    )
+except Exception as e:
+    st.error(f"PDF generation failed: {e}")
+    logger.exception("PDF generation failed")
 
 st.divider()
 

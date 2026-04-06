@@ -12,3 +12,4 @@ yfinance==1.2.0
 numpy==2.2.3
 scipy==1.14.1
 anthropic==0.52.0
+fpdf2==2.8.7
