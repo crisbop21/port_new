@@ -506,3 +506,90 @@ class TestComputeOptionBeta:
         # Per-contract put beta is negative (delta is negative)
         assert ob is not None
         assert ob < 0
+
+
+# ── Tests: option dollar beta sign (position-level) ──────────────────────────
+
+
+class TestOptionDollarBetaSign:
+    """Dollar beta must reflect position direction (long vs short).
+
+    option_beta is per-contract (negative for puts, positive for calls).
+    market_value is negative for short positions.
+    dollar_beta = option_beta * market_value  (no abs!)
+
+    Short put:  negative ob * negative mv = positive dollar beta  (bullish) ✓
+    Long  put:  negative ob * positive mv  = negative dollar beta (bearish) ✓
+    Short call: positive ob * negative mv  = negative dollar beta (bearish) ✓
+    Long  call: positive ob * positive mv  = positive dollar beta (bullish) ✓
+    """
+
+    @staticmethod
+    def _compute_dollar_beta(option_beta: float, market_value: float) -> float:
+        """Replicate the dollar beta formula from pages/2_Holdings.py."""
+        return option_beta * market_value
+
+    def test_short_put_dollar_beta_is_positive(self):
+        """Short put = bullish exposure → dollar beta should be positive."""
+        ob = compute_option_beta(
+            underlying_beta=1.0,
+            underlying_price=100.0,
+            option_price=5.0,
+            strike=100.0,
+            dte_years=0.25,
+            sigma=0.30,
+            right="P",
+        )
+        assert ob is not None and ob < 0  # put beta is negative per-contract
+        # Short position → market_value is negative
+        market_value = -500.0  # qty=-1, mult=100, price=5.0
+        dollar_beta = self._compute_dollar_beta(ob, market_value)
+        assert dollar_beta > 0, "Short put should have positive (bullish) dollar beta"
+
+    def test_long_put_dollar_beta_is_negative(self):
+        """Long put = bearish exposure → dollar beta should be negative."""
+        ob = compute_option_beta(
+            underlying_beta=1.0,
+            underlying_price=100.0,
+            option_price=5.0,
+            strike=100.0,
+            dte_years=0.25,
+            sigma=0.30,
+            right="P",
+        )
+        assert ob is not None and ob < 0
+        market_value = 500.0  # qty=+1
+        dollar_beta = self._compute_dollar_beta(ob, market_value)
+        assert dollar_beta < 0, "Long put should have negative (bearish) dollar beta"
+
+    def test_short_call_dollar_beta_is_negative(self):
+        """Short call = bearish exposure → dollar beta should be negative."""
+        ob = compute_option_beta(
+            underlying_beta=1.0,
+            underlying_price=100.0,
+            option_price=5.0,
+            strike=100.0,
+            dte_years=0.25,
+            sigma=0.30,
+            right="C",
+        )
+        assert ob is not None and ob > 0  # call beta is positive per-contract
+        market_value = -500.0  # qty=-1
+        dollar_beta = self._compute_dollar_beta(ob, market_value)
+        assert dollar_beta < 0, "Short call should have negative (bearish) dollar beta"
+
+    def test_long_call_dollar_beta_is_positive(self):
+        """Long call = bullish exposure → dollar beta should be positive."""
+        ob = compute_option_beta(
+            underlying_beta=1.0,
+            underlying_price=100.0,
+            option_price=5.0,
+            strike=100.0,
+            dte_years=0.25,
+            sigma=0.30,
+            right="C",
+        )
+        assert ob is not None and ob > 0
+        market_value = 500.0  # qty=+1
+        dollar_beta = self._compute_dollar_beta(ob, market_value)
+        assert dollar_beta > 0, "Long call should have positive (bullish) dollar beta"

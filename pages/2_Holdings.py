@@ -630,9 +630,9 @@ for asset_class, group in df.groupby("asset_class", sort=True):
 
             deltas.append(delta)
             opt_betas.append(ob)
-            # Dollar beta = option_beta * market_value (already accounts for quantity sign via market_value)
+            # Dollar beta = option_beta * market_value (quantity sign embedded in market_value)
             if ob is not None and mkt_value != 0:
-                opt_dollar_betas.append(ob * abs(mkt_value))
+                opt_dollar_betas.append(ob * mkt_value)
             else:
                 opt_dollar_betas.append(None)
 
