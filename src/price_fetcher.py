@@ -74,6 +74,50 @@ def fetch_daily_prices(
     return prices, errors
 
 
+def fetch_missing_prices(
+    symbol: str,
+    start: date,
+    end: date,
+) -> tuple[list[DailyPrice], list[str]]:
+    """Fetch only the prices not already stored in the database.
+
+    Checks the existing date range in DB and only fetches the gaps
+    (before the earliest stored date and/or after the latest stored date).
+    Returns (prices, errors) — only the newly fetched data.
+    """
+    from src.db import get_price_date_range
+
+    min_stored, max_stored = get_price_date_range(symbol)
+
+    if min_stored is None:
+        # No data at all — fetch the full range
+        return fetch_daily_prices(symbol, start=start, end=end)
+
+    all_prices: list[DailyPrice] = []
+    all_errors: list[str] = []
+
+    # Fetch earlier gap: requested start → day before earliest stored
+    if start < min_stored:
+        early_end = min_stored - timedelta(days=1)
+        if early_end >= start:
+            prices, errs = fetch_daily_prices(symbol, start=start, end=early_end)
+            all_prices.extend(prices)
+            all_errors.extend(errs)
+
+    # Fetch later gap: day after latest stored → requested end
+    if end > max_stored:
+        late_start = max_stored + timedelta(days=1)
+        if late_start <= end:
+            prices, errs = fetch_daily_prices(symbol, start=late_start, end=end)
+            all_prices.extend(prices)
+            all_errors.extend(errs)
+
+    if not all_prices and not all_errors:
+        logger.info("No missing prices for %s (%s to %s already covered)", symbol, start, end)
+
+    return all_prices, all_errors
+
+
 def fetch_prices_for_symbols(
     symbols: list[str],
     start: date | None = None,

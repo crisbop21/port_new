@@ -16,7 +16,7 @@ from src.db import (
     get_portfolio_symbols,
     upsert_daily_prices,
 )
-from src.price_fetcher import fetch_daily_prices, fetch_prices_for_symbols
+from src.price_fetcher import fetch_daily_prices, fetch_missing_prices, fetch_prices_for_symbols
 
 st.title("Daily Prices")
 
@@ -72,7 +72,7 @@ if st.button("Fetch All Portfolio Prices", type="primary"):
             (i + 1) / len(fetch_list),
             text=f"Fetching {sym} ({i + 1}/{len(fetch_list)})...",
         )
-        prices, errs = fetch_daily_prices(sym, start=start_date, end=end_date)
+        prices, errs = fetch_missing_prices(sym, start=start_date, end=end_date)
         all_prices.extend(prices)
         all_errors.extend(errs)
 
@@ -106,7 +106,7 @@ with st.expander("Fetch a single symbol"):
     single_sym = st.text_input("Symbol", placeholder="e.g. AAPL").strip().upper()
     if single_sym and st.button("Fetch"):
         with st.spinner(f"Fetching {single_sym}..."):
-            prices, errs = fetch_daily_prices(single_sym, start=start_date, end=end_date)
+            prices, errs = fetch_missing_prices(single_sym, start=start_date, end=end_date)
         if errs:
             for err in errs:
                 st.warning(err)

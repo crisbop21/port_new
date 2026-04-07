@@ -40,7 +40,7 @@ try:
         compute_portfolio_beta, compute_option_delta, compute_option_beta,
         BENCHMARKS, DEFAULT_RISK_FREE_RATE,
     )
-    from src.price_fetcher import fetch_daily_prices
+    from src.price_fetcher import fetch_missing_prices
     _BETA_AVAILABLE = True
     logger.info("Beta module loaded successfully")
 except Exception as _beta_import_err:
@@ -217,7 +217,7 @@ else:
 
                 if len(bench_prices) < 60:
                     st.info(f"Fetching {benchmark} prices from Yahoo Finance...")
-                    fetched, errs = fetch_daily_prices(benchmark, start=lookback_start, end=as_of)
+                    fetched, errs = fetch_missing_prices(benchmark, start=lookback_start, end=as_of)
                     logger.info("Fetched %d rows for %s from yfinance (errors: %s)", len(fetched), benchmark, errs)
                     if fetched:
                         upsert_daily_prices(fetched)
@@ -242,7 +242,7 @@ else:
 
                         if len(sym_prices) < 60:
                             st.info(f"Fetching {sym} prices from Yahoo Finance...")
-                            fetched, errs = fetch_daily_prices(sym, start=lookback_start, end=as_of)
+                            fetched, errs = fetch_missing_prices(sym, start=lookback_start, end=as_of)
                             logger.info("Fetched %d rows for %s from yfinance", len(fetched), sym)
                             if fetched:
                                 upsert_daily_prices(fetched)
