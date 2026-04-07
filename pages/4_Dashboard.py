@@ -158,8 +158,8 @@ with st.expander("Data Setup Progress", expanded=False):
                 for i, sym in enumerate(syms):
                     step += 1
                     prog.progress(step / total_steps, text=f"Prices: {sym} ({i+1}/{len(syms)})")
-                    from src.price_fetcher import fetch_daily_prices as _fdp
-                    prices, _ = _fdp(sym, start=date.today() - timedelta(days=365))
+                    from src.price_fetcher import fetch_missing_prices as _fmp
+                    prices, _ = _fmp(sym, start=date.today() - timedelta(days=365), end=date.today())
                     if prices:
                         upsert_daily_prices(prices)
             else:

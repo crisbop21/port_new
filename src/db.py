@@ -1117,6 +1117,38 @@ def upsert_daily_prices(
     return inserted, updated, errors
 
 
+def get_price_date_range(symbol: str) -> tuple[date | None, date | None]:
+    """Return (min_date, max_date) of stored prices for a symbol, or (None, None)."""
+    try:
+        result = (
+            get_client()
+            .table("daily_prices")
+            .select("price_date")
+            .eq("symbol", symbol.upper())
+            .order("price_date", desc=False)
+            .limit(1)
+            .execute()
+        )
+        if not result.data:
+            return None, None
+        min_date = date.fromisoformat(result.data[0]["price_date"])
+
+        result2 = (
+            get_client()
+            .table("daily_prices")
+            .select("price_date")
+            .eq("symbol", symbol.upper())
+            .order("price_date", desc=True)
+            .limit(1)
+            .execute()
+        )
+        max_date = date.fromisoformat(result2.data[0]["price_date"])
+        return min_date, max_date
+    except Exception as e:
+        logger.exception("Failed to get price date range for %s", symbol)
+        return None, None
+
+
 @st.cache_data(ttl=60)
 def get_daily_prices(
     symbol: str,
