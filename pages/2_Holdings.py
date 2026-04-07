@@ -197,10 +197,12 @@ else:
 
     logger.info("Beta symbols extracted: %s", sorted(beta_symbols))
 
-    # Store beta results in session state so they persist across reruns
+    # Store beta results and manual overrides in session state
     if "beta_result" not in st.session_state:
         st.session_state.beta_result = None
         st.session_state.beta_benchmark = None
+    if "manual_betas" not in st.session_state:
+        st.session_state.manual_betas = {}
 
     if calculate_beta:
         lookback_start = as_of - timedelta(days=400)  # buffer for 252 trading days
@@ -263,6 +265,15 @@ else:
                     raw_result = compute_portfolio_beta(holdings_for_beta, bench_prices)
                     underlying_betas = raw_result["betas"]
                     logger.info("Underlying betas: %s", underlying_betas)
+
+                    # Apply manual beta overrides for symbols with no data
+                    manual = st.session_state.get("manual_betas", {})
+                    for sym, mb in manual.items():
+                        if sym in underlying_betas and underlying_betas[sym] is None and mb is not None:
+                            underlying_betas[sym] = mb
+                            mv = holdings_for_beta.get(sym, {}).get("market_value", 0)
+                            raw_result["dollar_betas"][sym] = mb * mv
+                            logger.info("Applied manual beta override for %s: %.3f", sym, mb)
 
                     # ── Step 2: compute per-position effective beta ───────
                     # For STK/ETF: effective_beta = underlying_beta
@@ -423,6 +434,29 @@ else:
                 f"for your holdings and {beta_benchmark}."
             )
             st.page_link("pages/6_Prices.py", label="Go to Prices", icon="📈")
+        # ── Manual beta override for symbols with N/A ────────────────────
+        na_symbols = [
+            sym for sym, b in beta_result["betas"].items() if b is None
+        ]
+        if na_symbols:
+            with st.expander(f"Manual beta override ({len(na_symbols)} symbols missing data)"):
+                st.caption(
+                    "Enter a beta value for symbols where price data is unavailable. "
+                    "Click **Recalculate** to update the portfolio beta."
+                )
+                manual = st.session_state.get("manual_betas", {})
+                for sym in sorted(na_symbols):
+                    manual[sym] = st.number_input(
+                        f"{sym} beta",
+                        value=manual.get(sym, 1.0),
+                        min_value=-5.0,
+                        max_value=10.0,
+                        step=0.01,
+                        format="%.2f",
+                        key=f"manual_beta_{sym}",
+                    )
+                st.session_state.manual_betas = manual
+                st.info("Click **Calculate Beta** above to recalculate with your manual overrides.")
     else:
         st.caption("Click **Calculate Beta** to compute portfolio beta vs the selected benchmark.")
 
