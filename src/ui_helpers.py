@@ -3,7 +3,78 @@
 from datetime import date, timedelta
 
 import pandas as pd
+import plotly.graph_objects as go
+import plotly.io as pio
 import streamlit as st
+
+
+# ── Financial color palette ──────────────────────────────────────────────────
+
+COLORS = {
+    "primary": "#1f77b4",
+    "profit": "#22c55e",
+    "loss": "#ef4444",
+    "warning": "#f59e0b",
+    "neutral": "#64748b",
+    "series": [
+        "#1f77b4",
+        "#22c55e",
+        "#f59e0b",
+        "#a855f7",
+        "#ef4444",
+        "#3b82f6",
+        "#ec4899",
+        "#06b6d4",
+    ],
+}
+
+# ── Plotly chart template ────────────────────────────────────────────────────
+
+_ibkr_template = go.layout.Template(
+    layout=go.Layout(
+        font=dict(family="Source Sans Pro, sans-serif", color="#262730"),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        colorway=COLORS["series"],
+        hovermode="x unified",
+        hoverlabel=dict(bgcolor="white", font_size=13),
+        xaxis=dict(gridcolor="#e2e8f0", showgrid=True),
+        yaxis=dict(gridcolor="#e2e8f0", showgrid=True),
+        margin=dict(l=0, r=0, t=40, b=0),
+    )
+)
+pio.templates["ibkr"] = _ibkr_template
+pio.templates.default = "ibkr"
+
+
+# ── Metric card CSS ─────────────────────────────────────────────────────────
+
+METRIC_CARD_CSS = """
+<style>
+[data-testid="stMetric"] {
+    background: linear-gradient(135deg, #f8fafc 0%, #f1f5f9 100%);
+    border: 1px solid #e2e8f0;
+    border-radius: 0.6rem;
+    padding: 0.8rem 1rem;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.06);
+}
+[data-testid="stMetric"] label {
+    font-size: 0.78rem;
+    color: #64748b;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+}
+[data-testid="stMetricValue"] {
+    font-size: 1.5rem;
+    font-weight: 700;
+}
+</style>
+"""
+
+
+def inject_metric_card_css():
+    """Inject CSS to style st.metric widgets as polished cards."""
+    st.markdown(METRIC_CARD_CSS, unsafe_allow_html=True)
 
 
 # ── Score color coding ─────────────────────────────────────────────────────
