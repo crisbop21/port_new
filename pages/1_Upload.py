@@ -363,13 +363,11 @@ if uploaded is not None:
             st.balloons()
             st.divider()
             st.subheader("Next steps")
-            col_a, col_b, col_c = st.columns(3)
+            col_a, col_b = st.columns(2)
             with col_a:
                 st.page_link("pages/6_Prices.py", label="Fetch Prices", icon="📈")
             with col_b:
                 st.page_link("pages/2_Holdings.py", label="View Holdings", icon="📋")
-            with col_c:
-                st.page_link("pages/4_Dashboard.py", label="Dashboard", icon="📊")
         elif saved == 0:
             st.error(
                 "No accounts were saved. Check the errors above.\n\n"
