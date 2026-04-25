@@ -124,7 +124,8 @@ with st.expander("Fetch from SEC EDGAR", expanded=not has_data):
             st.warning("No metrics were fetched. Check the issues below.")
 
         if all_errors:
-            with st.expander(f"Issues ({len(all_errors)})", expanded=len(all_metrics) == 0):
+            with st.container(border=True):
+                st.markdown(f"**Issues ({len(all_errors)})**")
                 for err in all_errors:
                     st.text(err)
 
