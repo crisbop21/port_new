@@ -33,7 +33,7 @@ from src.db import (
 )
 from src.models import ValuationSnapshot
 from src.splits import detect_splits, normalize_metrics
-from src.ttm import compute_ttm_latest, is_flow_metric
+from src.ttm import compute_ttm, compute_ttm_latest, is_flow_metric
 from src.valuation import (
     SCORE_PRESETS,
     compute_fundamental_score,
@@ -547,6 +547,132 @@ with val_tab_deep:
                     _dd_metric_hist[_m_name] = sorted(_m_rows, key=lambda r: str(r.get("period_end", "")))
 
         _dd_hist_data = compute_historical_ratios(_dd_metric_hist, _dd_prices) if _dd_prices else []
+
+        # ── P/E DIAGNOSTIC ───────────────────────────────────────────────────
+        with st.expander(f"🔍 P/E Diagnostic — {detail_symbol}", expanded=True):
+            st.caption(
+                "Read-only dump of every intermediate value behind the "
+                "displayed P/E. Use to debug discrepancies vs. external sources."
+            )
+
+            # 1. Latest price
+            _diag_price_row = get_latest_price(detail_symbol)
+            st.markdown("**1. `get_latest_price`**")
+            if _diag_price_row:
+                st.json({
+                    "symbol": _diag_price_row.get("symbol"),
+                    "price_date": str(_diag_price_row.get("price_date")),
+                    "open": _diag_price_row.get("open"),
+                    "close": _diag_price_row.get("close"),
+                    "adj_close": _diag_price_row.get("adj_close"),
+                })
+            else:
+                st.write("No price row.")
+
+            # 2. Latest eps_diluted row (input to compute_ratios live path)
+            _diag_latest_all = get_latest_stock_metrics(detail_symbol)
+            _diag_eps_latest = _diag_latest_all.get("eps_diluted") if _diag_latest_all else None
+            st.markdown("**2. Latest `eps_diluted` row (input to live `compute_ratios`)**")
+            if _diag_eps_latest:
+                st.json({
+                    "period_end": str(_diag_eps_latest.get("period_end")),
+                    "fiscal_period": _diag_eps_latest.get("fiscal_period"),
+                    "fiscal_year": _diag_eps_latest.get("fiscal_year"),
+                    "duration_days": _diag_eps_latest.get("duration_days"),
+                    "reporting_style": _diag_eps_latest.get("reporting_style"),
+                    "filing_type": _diag_eps_latest.get("filing_type"),
+                    "metric_value": float(_diag_eps_latest["metric_value"])
+                    if _diag_eps_latest.get("metric_value") is not None else None,
+                })
+            else:
+                st.write("No eps_diluted row.")
+
+            # 3. All eps_diluted rows for this symbol
+            _diag_eps_rows = get_stock_metrics(symbol=detail_symbol, metric_name="eps_diluted")
+            st.markdown(f"**3. All `eps_diluted` rows in DB ({len(_diag_eps_rows)} total — newest first)**")
+            if _diag_eps_rows:
+                _diag_eps_df = pd.DataFrame([
+                    {
+                        "period_end": str(r.get("period_end")),
+                        "fp": r.get("fiscal_period"),
+                        "fy": r.get("fiscal_year"),
+                        "days": r.get("duration_days"),
+                        "style": r.get("reporting_style"),
+                        "form": r.get("filing_type"),
+                        "value": float(r["metric_value"]) if r.get("metric_value") is not None else None,
+                    }
+                    for r in _diag_eps_rows
+                ])
+                st.dataframe(_diag_eps_df, use_container_width=True, hide_index=True)
+
+            # 4. Detected splits
+            _diag_shares_rows = get_stock_metrics(symbol=detail_symbol, metric_name="shares_outstanding")
+            from src.splits import detect_splits as _detect_splits
+            _diag_splits = _detect_splits(_diag_shares_rows, _diag_eps_rows)
+            st.markdown(f"**4. Detected splits ({len(_diag_splits)})**")
+            if _diag_splits:
+                st.dataframe(
+                    pd.DataFrame([
+                        {
+                            "period_end": str(s.period_end),
+                            "prior_period_end": str(s.prior_period_end),
+                            "shares_ratio": s.shares_ratio,
+                            "confidence": s.confidence,
+                            "reason": s.reason,
+                        }
+                        for s in _diag_splits
+                    ]),
+                    use_container_width=True, hide_index=True,
+                )
+            else:
+                st.write("No splits detected.")
+
+            # 5. compute_ttm output on raw eps_diluted (what compute_historical_ratios uses)
+            _diag_eps_asc = sorted(_diag_eps_rows, key=lambda r: str(r.get("period_end", "")))
+            _diag_ttm_rows = compute_ttm(_diag_eps_asc)
+            st.markdown(f"**5. `compute_ttm(eps_diluted)` output — last 15 rows (raw, no split norm)**")
+            if _diag_ttm_rows:
+                _diag_ttm_df = pd.DataFrame([
+                    {
+                        "period_end": str(r.get("period_end")),
+                        "fp": r.get("fiscal_period"),
+                        "fy": r.get("fiscal_year"),
+                        "metric_value": float(r["metric_value"]) if r.get("metric_value") is not None else None,
+                        "quarterly_value": r.get("quarterly_value"),
+                        "ttm_value": r.get("ttm_value"),
+                        "ttm_method": r.get("ttm_method"),
+                    }
+                    for r in _diag_ttm_rows[-15:]
+                ])
+                st.dataframe(_diag_ttm_df, use_container_width=True, hide_index=True)
+
+            # 6. Last 5 rows of compute_historical_ratios
+            st.markdown("**6. `compute_historical_ratios` — last 5 rows**")
+            if _dd_hist_data:
+                _diag_hist_df = pd.DataFrame([
+                    {
+                        "period_end": r.get("period_end"),
+                        "price": r.get("price"),
+                        "pe_ttm": r.get("pe_ttm"),
+                        "pb": r.get("pb"),
+                        "ps": r.get("ps"),
+                        "ev_ebitda": r.get("ev_ebitda"),
+                    }
+                    for r in _dd_hist_data[-5:]
+                ])
+                st.dataframe(_diag_hist_df, use_container_width=True, hide_index=True)
+            else:
+                st.write("compute_historical_ratios returned no rows.")
+
+            # 7. Final displayed values
+            st.markdown("**7. Final values in `all_ratios[symbol]` (what gets displayed)**")
+            st.json({
+                "pe_ttm": ratios.get("pe_ttm"),
+                "pb": ratios.get("pb"),
+                "ps": ratios.get("ps"),
+                "ev_ebitda": ratios.get("ev_ebitda"),
+                "market_cap": ratios.get("market_cap"),
+            })
 
         # Score overview
         cols = st.columns(5)
