@@ -343,23 +343,59 @@ def _build_snapshots() -> list[ValuationSnapshot]:
     return snaps
 
 
+# ── Auto-save today's snapshot ──────────────────────────────────────────────
+# Saves once per (date, preset) per session. Upsert is idempotent on the
+# (symbol, snapshot_date, preset) unique key, so re-running is safe.
+
+_today = date.today()
+_auto_latest = get_latest_valuation_snapshots(scored_symbols, preset=preset)
+_missing_today = [
+    sym for sym in scored_symbols
+    if str(_auto_latest.get(sym, {}).get("snapshot_date", "")) != _today.isoformat()
+]
+_auto_status: str | None = None
+if _missing_today:
+    _auto_snapshots = [s for s in _build_snapshots() if s.symbol in _missing_today]
+    if _auto_snapshots:
+        ins, upd, errs = upsert_valuation_snapshots(_auto_snapshots)
+        clear_query_caches()
+        if errs:
+            _auto_status = f"Auto-save errors: {'; '.join(errs)}"
+        else:
+            _auto_status = (
+                f"Auto-saved today's snapshots ({ins} new, {upd} updated) "
+                f"for **{preset}** preset."
+            )
+
 # ── Save snapshot controls ───────────────────────────────────────────────────
 
 col_save, col_save_info = st.columns([1, 3])
 
 with col_save:
     save_clicked = st.button("Save Snapshot", type="primary",
-                              help="Persist today's valuation ratios and scores to the database for historical tracking.")
+                              help="Re-save today's snapshot (already auto-saved on page load).")
 
 with col_save_info:
-    # Check when last snapshot was saved
-    cached = get_latest_valuation_snapshots(scored_symbols[:1], preset=preset)
-    if cached:
-        last_row = next(iter(cached.values()), {})
-        last_date = last_row.get("snapshot_date", "never")
-        st.caption(f"Last saved: **{last_date}** · Saves {len(scored_symbols)} symbols for preset **{preset}**")
+    if _auto_status:
+        if _auto_status.startswith("Auto-save errors"):
+            st.error(_auto_status)
+        else:
+            st.caption(_auto_status)
     else:
-        st.caption(f"No snapshots saved yet · Will save {len(scored_symbols)} symbols for preset **{preset}**")
+        # Already up to date — show the most recent snapshot date
+        cached = get_latest_valuation_snapshots(scored_symbols[:1], preset=preset)
+        if cached:
+            last_row = next(iter(cached.values()), {})
+            last_date = last_row.get("snapshot_date", "never")
+            st.caption(
+                f"Snapshot up to date: **{last_date}** · "
+                f"{len(scored_symbols)} symbols for preset **{preset}**"
+            )
+        else:
+            st.caption(
+                f"No snapshots saved yet · Will save {len(scored_symbols)} "
+                f"symbols for preset **{preset}**"
+            )
 
 if save_clicked:
     snapshots = _build_snapshots()

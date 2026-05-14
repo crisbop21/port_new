@@ -1149,26 +1149,46 @@ def get_price_date_range(symbol: str) -> tuple[date | None, date | None]:
         return None, None
 
 
+_DAILY_PRICES_PAGE_SIZE = 1000
+
+
 @st.cache_data(ttl=60)
 def get_daily_prices(
     symbol: str,
     date_from: date | None = None,
     date_to: date | None = None,
 ) -> list[dict]:
-    """Fetch daily prices for a symbol, optionally filtered by date range."""
+    """Fetch daily prices for a symbol, optionally filtered by date range.
+
+    Pages through results via `.range()` — PostgREST silently caps a plain
+    `select` at 1000 rows, which with ascending date order drops the most
+    recent prices and makes downstream valuation ratios appear frozen.
+    """
     try:
-        query = (
-            get_client()
-            .table("daily_prices")
-            .select("*")
-            .eq("symbol", symbol.upper())
-        )
-        if date_from:
-            query = query.gte("price_date", date_from.isoformat())
-        if date_to:
-            query = query.lte("price_date", date_to.isoformat())
-        result = query.order("price_date", desc=False).execute()
-        return result.data
+        rows: list[dict] = []
+        offset = 0
+        while True:
+            query = (
+                get_client()
+                .table("daily_prices")
+                .select("*")
+                .eq("symbol", symbol.upper())
+            )
+            if date_from:
+                query = query.gte("price_date", date_from.isoformat())
+            if date_to:
+                query = query.lte("price_date", date_to.isoformat())
+            result = (
+                query.order("price_date", desc=False)
+                .range(offset, offset + _DAILY_PRICES_PAGE_SIZE - 1)
+                .execute()
+            )
+            batch = result.data or []
+            rows.extend(batch)
+            if len(batch) < _DAILY_PRICES_PAGE_SIZE:
+                break
+            offset += _DAILY_PRICES_PAGE_SIZE
+        return rows
     except Exception as e:
         logger.exception("Failed to fetch daily prices for %s", symbol)
         st.error(f"Database error fetching daily prices: {e}")
