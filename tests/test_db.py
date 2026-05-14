@@ -1110,3 +1110,92 @@ class TestUpsertStockMetrics:
         inserted, updated, errors = upsert_stock_metrics([sample_metric])
         assert updated == 1
         assert inserted == 0
+
+
+# ── Daily prices pagination ─────────────────────────────────────────────────
+
+
+class TestGetDailyPricesPagination:
+    """PostgREST silently caps `select` at 1000 rows unless `.range()` is used.
+
+    With multi-year lookbacks, this previously truncated the result to the
+    *oldest* 1000 rows because of `order(price_date, desc=False)` — making the
+    most-recent prices invisible and downstream P/E ratios stale.
+    """
+
+    def _make_paged_client(self, total_rows: int, page_size: int = 1000):
+        """Mock supabase client that returns slices via .range(start, end)."""
+        all_rows = [
+            {
+                "symbol": "AAPL",
+                "price_date": f"2020-01-{(i % 28) + 1:02d}",
+                "adj_close": 100 + i,
+            }
+            for i in range(total_rows)
+        ]
+
+        client = MagicMock()
+        table = MagicMock()
+        query = MagicMock()
+
+        def _range(start, end):
+            # PostgREST .range is inclusive on both ends
+            sliced = all_rows[start : end + 1]
+            range_mock = MagicMock()
+            range_mock.execute.return_value = MagicMock(data=sliced)
+            return range_mock
+
+        query.range.side_effect = _range
+        # Plain execute returns first page (fallback for non-paginated callers)
+        query.execute.return_value = MagicMock(data=all_rows[:page_size])
+
+        # Chained filter methods all return `query`
+        for method in ("eq", "gte", "lte", "order"):
+            getattr(query, method).return_value = query
+
+        table.select.return_value = query
+        client.table.return_value = table
+        return client, all_rows
+
+    @patch("src.db.get_client")
+    def test_returns_all_rows_when_under_page_size(self, mock_get_client):
+        from src.db import get_daily_prices
+
+        client, all_rows = self._make_paged_client(total_rows=500)
+        mock_get_client.return_value = client
+
+        get_daily_prices.clear()
+        result = get_daily_prices("AAPL")
+        assert len(result) == 500
+
+    @patch("src.db.get_client")
+    def test_paginates_beyond_default_postgrest_limit(self, mock_get_client):
+        """With 1500 rows of history, pagination must return all 1500 — not 1000."""
+        from src.db import get_daily_prices
+
+        client, all_rows = self._make_paged_client(total_rows=1500)
+        mock_get_client.return_value = client
+
+        get_daily_prices.clear()
+        result = get_daily_prices("AAPL")
+        assert len(result) == 1500, (
+            f"Expected 1500 rows after pagination, got {len(result)}. "
+            "get_daily_prices must use .range() to bypass PostgREST's "
+            "1000-row default cap."
+        )
+
+    @patch("src.db.get_client")
+    def test_includes_most_recent_row(self, mock_get_client):
+        """The newest row must be present — otherwise P/E appears 'stuck'."""
+        from src.db import get_daily_prices
+
+        client, all_rows = self._make_paged_client(total_rows=1500)
+        mock_get_client.return_value = client
+
+        get_daily_prices.clear()
+        result = get_daily_prices("AAPL")
+        result_dates = {r["price_date"] for r in result}
+        newest_expected = all_rows[-1]["price_date"]
+        assert newest_expected in result_dates, (
+            "Most recent price row missing — P/E will appear stale."
+        )
