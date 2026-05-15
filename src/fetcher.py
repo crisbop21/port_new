@@ -483,18 +483,51 @@ def fetch_metrics_for_symbol(symbol: str) -> tuple[list[StockMetric], list[str]]
     reporting_style = _classify_reporting_style(all_raw_entries)
     logger.info("%s: reporting_style = %s", symbol, reporting_style)
 
-    # Step 4: Extract each metric (all historical periods)
+    # Step 4: Extract each metric (all historical periods).
+    #
+    # Companies sometimes report the SAME metric under DIFFERENT XBRL tags
+    # across periods (e.g. Alphabet reported revenue under
+    # ``RevenueFromContractWithCustomerExcludingAssessedTax`` through FY2024
+    # then switched to ``Revenues`` in FY2025).  We therefore MERGE values
+    # from every tag in the list rather than stopping at the first match.
+    # Earlier-listed tags take priority on (end, fp) collisions because the
+    # XBRL_TAG_MAP order encodes the preferred / most recent concept.
     for metric_name, xbrl_tags in XBRL_TAG_MAP.items():
-        all_values: list[dict] = []
+        merged_by_key: dict[tuple[str, str], dict] = {}
         matched_tag: str | None = None
+        matched_tags: list[str] = []
 
         for tag in xbrl_tags:
             values = _extract_fact_values(facts, tag)
-            if values:
-                all_values = _pick_all_annual(values)
-                if all_values:
-                    matched_tag = tag
-                    break  # first matching tag wins
+            if not values:
+                continue
+
+            picked = _pick_all_annual(values)
+            if not picked:
+                continue
+
+            matched_tags.append(tag)
+            if matched_tag is None:
+                matched_tag = tag  # earliest-listed tag with data
+
+            for v in picked:
+                key = (v.get("end", ""), v.get("fp", ""))
+                if not key[0]:
+                    continue
+                # First tag wins on collisions; later tags only fill gaps
+                if key not in merged_by_key:
+                    merged_by_key[key] = v
+
+        all_values = sorted(
+            merged_by_key.values(),
+            key=lambda v: v.get("end", ""),
+            reverse=True,
+        )
+        if len(matched_tags) > 1:
+            logger.info(
+                "%s: metric '%s' merged across %d XBRL tags: %s",
+                symbol, metric_name, len(matched_tags), matched_tags,
+            )
 
         if not all_values:
             msg = f"{symbol}: metric '{metric_name}' — no data found (tried {len(xbrl_tags)} XBRL tags)"

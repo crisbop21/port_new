@@ -440,3 +440,142 @@ class TestPickAllAnnualDuration:
         result = _pick_all_annual(values)
         assert len(result) == 1
         assert result[0]["val"] == 25000
+
+
+
+# ── Regression: tag-switching across periods (GOOGL revenue concept change) ───
+
+
+class TestMergesAcrossXBRLTags:
+    """Companies sometimes report the SAME metric under DIFFERENT XBRL tags
+    in different periods.  Alphabet (GOOGL) is the canonical example: it
+    reported revenue under ``us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax``
+    through fiscal year 2024, then switched to ``us-gaap:Revenues`` starting
+    fiscal year 2025.
+
+    The fetcher must merge data from ALL tags in the tag list (with
+    earlier-listed tags taking priority on date collisions) — picking only
+    the "first tag that has any data" silently drops half the history and
+    produces incorrect TTM aggregates, P/E, P/S, etc.
+    """
+
+    @patch("src.fetcher._get_session")
+    def test_revenue_merges_across_two_tags_googl_pattern(self, mock_session_fn):
+        """The full period range should be covered by merging both tags."""
+        # Simulate Alphabet's reporting style: 2023-2024 under RFCWCEAT,
+        # 2025 onwards under Revenues.
+        googl_like_facts = {
+            "entityName": "Alphabet Inc.",
+            "cik": 1652044,
+            "facts": {
+                "us-gaap": {
+                    # Tag 1 in XBRL_TAG_MAP order — only has 2025 onwards
+                    "Revenues": {
+                        "units": {
+                            "USD": [
+                                {"val": 90_234_000_000, "end": "2025-03-31",
+                                 "start": "2025-01-01", "form": "10-Q",
+                                 "fy": 2025, "fp": "Q1", "filed": "2025-04-29"},
+                                {"val": 96_428_000_000, "end": "2025-06-30",
+                                 "start": "2025-04-01", "form": "10-Q",
+                                 "fy": 2025, "fp": "Q2", "filed": "2025-07-30"},
+                            ]
+                        }
+                    },
+                    # Tag 2 — only has 2023-2024
+                    "RevenueFromContractWithCustomerExcludingAssessedTax": {
+                        "units": {
+                            "USD": [
+                                {"val": 80_539_000_000, "end": "2024-03-31",
+                                 "start": "2024-01-01", "form": "10-Q",
+                                 "fy": 2024, "fp": "Q1", "filed": "2024-04-26"},
+                                {"val": 84_742_000_000, "end": "2024-06-30",
+                                 "start": "2024-04-01", "form": "10-Q",
+                                 "fy": 2024, "fp": "Q2", "filed": "2024-07-24"},
+                                {"val": 88_268_000_000, "end": "2024-09-30",
+                                 "start": "2024-07-01", "form": "10-Q",
+                                 "fy": 2024, "fp": "Q3", "filed": "2024-10-30"},
+                                {"val": 350_018_000_000, "end": "2024-12-31",
+                                 "start": "2024-01-01", "form": "10-K",
+                                 "fy": 2024, "fp": "FY", "filed": "2025-02-04"},
+                            ]
+                        }
+                    },
+                },
+                "dei": {},
+            },
+        }
+
+        session = MagicMock()
+        session.get.side_effect = [
+            _mock_sec_response(
+                {"0": {"ticker": "GOOGL", "cik_str": 1652044}}
+            ),
+            _mock_sec_response(googl_like_facts),
+        ]
+        mock_session_fn.return_value = session
+
+        metrics, _ = fetch_metrics_for_symbol("GOOGL")
+        revenue_periods = sorted(
+            m.period_end for m in metrics if m.metric_name == "revenue"
+        )
+
+        # MUST include BOTH 2024 (from tag 2) AND 2025 (from tag 1)
+        assert date(2024, 3, 31) in revenue_periods, (
+            f"GOOGL Q1 2024 revenue missing — fetcher dropped data from "
+            f"the second XBRL tag.  Got: {revenue_periods}"
+        )
+        assert date(2025, 6, 30) in revenue_periods, (
+            f"GOOGL Q2 2025 revenue missing — fetcher dropped data from "
+            f"the first XBRL tag.  Got: {revenue_periods}"
+        )
+        # Expect all 6 unique periods (4 from RFCWCEAT + 2 from Revenues)
+        assert len(revenue_periods) == 6, (
+            f"Expected 6 unique revenue periods after merge, got "
+            f"{len(revenue_periods)}: {revenue_periods}"
+        )
+
+    @patch("src.fetcher._get_session")
+    def test_earlier_listed_tag_wins_on_date_collision(self, mock_session_fn):
+        """When two tags report the same period, earlier-listed tag wins
+        (it's the company's preferred / newer concept)."""
+        facts = {
+            "entityName": "Test Co.",
+            "cik": 1,
+            "facts": {
+                "us-gaap": {
+                    "Revenues": {
+                        "units": {
+                            "USD": [
+                                {"val": 1000, "end": "2024-03-31",
+                                 "start": "2024-01-01", "form": "10-Q",
+                                 "fy": 2024, "fp": "Q1", "filed": "2024-05-01"},
+                            ]
+                        }
+                    },
+                    "RevenueFromContractWithCustomerExcludingAssessedTax": {
+                        "units": {
+                            "USD": [
+                                {"val": 999, "end": "2024-03-31",
+                                 "start": "2024-01-01", "form": "10-Q",
+                                 "fy": 2024, "fp": "Q1", "filed": "2024-05-02"},
+                            ]
+                        }
+                    },
+                },
+                "dei": {},
+            },
+        }
+
+        session = MagicMock()
+        session.get.side_effect = [
+            _mock_sec_response({"0": {"ticker": "AAPL", "cik_str": 1}}),
+            _mock_sec_response(facts),
+        ]
+        mock_session_fn.return_value = session
+
+        metrics, _ = fetch_metrics_for_symbol("AAPL")
+        rev = [m for m in metrics if m.metric_name == "revenue"]
+        assert len(rev) == 1
+        # Earlier-listed Revenues should win even if RFCWCEAT was filed later
+        assert int(rev[0].metric_value) == 1000
