@@ -579,3 +579,171 @@ class TestMergesAcrossXBRLTags:
         assert len(rev) == 1
         # Earlier-listed Revenues should win even if RFCWCEAT was filed later
         assert int(rev[0].metric_value) == 1000
+
+
+
+# ── Fiscal year derivation: META-pattern XBRL fy field is wrong for
+#    comparative columns and off-cycle filings.  We must derive fy from
+#    period_end + the company's fiscal year-end month instead. ────────────────
+
+
+from src.fetcher import (  # noqa: E402
+    _detect_fiscal_year_end_month,
+    _fiscal_year_from_period_end,
+)
+
+
+class TestFiscalYearDerivation:
+    """Regressions for the META P/E bug.
+
+    When a 10-Q is filed for an early-year quarter, SEC stamps it with
+    ``fy = period_end.year + 1`` (the filing's fiscal year), even though
+    the period itself belongs to ``period_end.year``.  Trusting the XBRL
+    ``fy`` field caused the TTM pipeline to mis-pair Q1/Q2/Q3/FY values
+    and silently drop standalone-quarter isolation for Meta, producing a
+    badly inflated TTM EPS and a wrong P/E.
+    """
+
+    def test_fiscal_year_from_period_end_calendar_year_company(self):
+        # META (Dec year-end): every quarter belongs to its calendar year
+        assert _fiscal_year_from_period_end(date(2025, 3, 31), 12) == 2025
+        assert _fiscal_year_from_period_end(date(2025, 6, 30), 12) == 2025
+        assert _fiscal_year_from_period_end(date(2025, 9, 30), 12) == 2025
+        assert _fiscal_year_from_period_end(date(2025, 12, 31), 12) == 2025
+        assert _fiscal_year_from_period_end(date(2026, 3, 31), 12) == 2026
+
+    def test_fiscal_year_from_period_end_apple_september_year_end(self):
+        # AAPL (Sep year-end): Q1 ends in December of the prior calendar year
+        assert _fiscal_year_from_period_end(date(2024, 12, 28), 9) == 2025  # Q1 FY25
+        assert _fiscal_year_from_period_end(date(2025, 3, 29), 9) == 2025   # Q2 FY25
+        assert _fiscal_year_from_period_end(date(2025, 6, 28), 9) == 2025   # Q3 FY25
+        assert _fiscal_year_from_period_end(date(2025, 9, 27), 9) == 2025   # FY25
+
+    def test_fiscal_year_from_period_end_microsoft_june_year_end(self):
+        # MSFT (Jun year-end)
+        assert _fiscal_year_from_period_end(date(2024, 9, 30), 6) == 2025   # Q1 FY25
+        assert _fiscal_year_from_period_end(date(2025, 6, 30), 6) == 2025   # FY25
+        assert _fiscal_year_from_period_end(date(2025, 9, 30), 6) == 2026   # Q1 FY26
+
+    def test_detect_fiscal_year_end_month_from_facts(self):
+        facts = {
+            "facts": {
+                "us-gaap": {
+                    "Revenues": {
+                        "units": {
+                            "USD": [
+                                {"end": "2023-12-31", "form": "10-K", "fp": "FY", "val": 1},
+                                {"end": "2024-12-31", "form": "10-K", "fp": "FY", "val": 2},
+                                {"end": "2025-12-31", "form": "10-K", "fp": "FY", "val": 3},
+                            ]
+                        }
+                    }
+                }
+            }
+        }
+        assert _detect_fiscal_year_end_month(facts) == 12
+
+        # Apple-style September year-end
+        apple_facts = {
+            "facts": {
+                "us-gaap": {
+                    "Revenues": {
+                        "units": {
+                            "USD": [
+                                {"end": "2023-09-30", "form": "10-K", "fp": "FY", "val": 1},
+                                {"end": "2024-09-28", "form": "10-K", "fp": "FY", "val": 2},
+                            ]
+                        }
+                    }
+                }
+            }
+        }
+        assert _detect_fiscal_year_end_month(apple_facts) == 9
+
+    def test_meta_pattern_fy_override_for_q1_filed_in_following_year(self):
+        """Regression for the META bug.
+
+        Reproduce the exact XBRL pattern observed in the SEC data:
+        - 10-K for FY2024 ``end=2024-12-31`` stamped both ``fy=2024``
+          (original filing) and ``fy=2025`` (comparative column in the
+          FY2025 10-K).
+        - 10-Q for Q1 2025 ``end=2025-03-31`` stamped ``fy=2026``.
+
+        Before the fix, our fetcher trusted the XBRL ``fy`` field, so the
+        Q1 row was stored as FY2026 and the FY row as FY2025 — the TTM
+        cumulative-isolation logic could not pair them.  After the fix,
+        the fetcher derives fy from ``period_end`` + the company's
+        fiscal year-end month, producing consistent fy values.
+        """
+        facts = {
+            "entityName": "Meta Platforms, Inc.",
+            "cik": 1326801,
+            "facts": {
+                "us-gaap": {
+                    # Three FY 10-K period_ends -> fye_month must come out as 12
+                    "Revenues": {
+                        "units": {
+                            "USD": [
+                                {"end": "2023-12-31", "start": "2023-01-01",
+                                 "form": "10-K", "fy": 2023, "fp": "FY",
+                                 "filed": "2024-02-01", "val": 134_902_000_000},
+                                {"end": "2024-12-31", "start": "2024-01-01",
+                                 "form": "10-K", "fy": 2024, "fp": "FY",
+                                 "filed": "2025-01-30", "val": 164_501_000_000},
+                                # Comparative re-stamp in FY2025 10-K — XBRL fy=2025
+                                {"end": "2024-12-31", "start": "2024-01-01",
+                                 "form": "10-K", "fy": 2025, "fp": "FY",
+                                 "filed": "2026-01-29", "val": 164_501_000_000},
+                                {"end": "2025-12-31", "start": "2025-01-01",
+                                 "form": "10-K", "fy": 2025, "fp": "FY",
+                                 "filed": "2026-01-29", "val": 200_966_000_000},
+                                # Off-cycle quarter — XBRL fy=2026 even though period is in calendar 2025
+                                {"end": "2025-03-31", "start": "2025-01-01",
+                                 "form": "10-Q", "fy": 2026, "fp": "Q1",
+                                 "filed": "2026-04-30", "val": 42_314_000_000},
+                                {"end": "2025-06-30", "start": "2025-01-01",
+                                 "form": "10-Q", "fy": 2025, "fp": "Q2",
+                                 "filed": "2025-07-31", "val": 89_830_000_000},
+                                {"end": "2025-09-30", "start": "2025-01-01",
+                                 "form": "10-Q", "fy": 2025, "fp": "Q3",
+                                 "filed": "2025-10-30", "val": 141_073_000_000},
+                                {"end": "2026-03-31", "start": "2026-01-01",
+                                 "form": "10-Q", "fy": 2026, "fp": "Q1",
+                                 "filed": "2026-04-30", "val": 56_311_000_000},
+                            ]
+                        }
+                    },
+                },
+                "dei": {},
+            },
+        }
+        with patch("src.fetcher._get_session") as mock_sess:
+            session = MagicMock()
+            session.get.side_effect = [
+                _mock_sec_response({"0": {"ticker": "META", "cik_str": 1326801}}),
+                _mock_sec_response(facts),
+            ]
+            mock_sess.return_value = session
+            metrics, _ = fetch_metrics_for_symbol("META")
+
+        rev = {(m.period_end.isoformat(), m.fiscal_period): m
+               for m in metrics if m.metric_name == "revenue"}
+
+        # Q1 2025-03-31 must be FY2025 (period_end-derived), NOT FY2026
+        m_q1 = rev[("2025-03-31", "Q1")]
+        assert m_q1.fiscal_year == 2025, (
+            f"Q1 2025-03-31 should be FY2025, got FY{m_q1.fiscal_year}. "
+            f"The XBRL fy=2026 must be overridden by period_end derivation."
+        )
+
+        # FY 2024-12-31 must be FY2024, not FY2025 (the comparative re-stamp value)
+        m_fy24 = rev[("2024-12-31", "FY")]
+        assert m_fy24.fiscal_year == 2024, (
+            f"FY 2024-12-31 should be FY2024, got FY{m_fy24.fiscal_year}."
+        )
+
+        # Q2/Q3/FY2025 already correct, must remain so
+        assert rev[("2025-06-30", "Q2")].fiscal_year == 2025
+        assert rev[("2025-09-30", "Q3")].fiscal_year == 2025
+        assert rev[("2025-12-31", "FY")].fiscal_year == 2025
+        assert rev[("2026-03-31", "Q1")].fiscal_year == 2026

@@ -351,6 +351,67 @@ def _classify_reporting_style(all_entries: list[dict]) -> str:
     return "standalone_quarterly"
 
 
+def _detect_fiscal_year_end_month(facts: dict) -> int:
+    """Detect the company's fiscal year-end calendar month from XBRL facts.
+
+    Scans 10-K filings (``fp == 'FY'``) for ``Revenues``/``NetIncomeLoss``
+    and returns the most common ``period_end`` month.  Defaults to 12 (Dec).
+
+    The XBRL ``fy`` field on individual fact entries is the fiscal year of
+    the **filing**, not the **period** — it diverges for comparative
+    prior-year columns re-stamped in a later 10-K.  The fiscal year-end
+    *month*, however, is stable across filings, so deriving the period's
+    fiscal year from ``(period_end, fye_month)`` is robust.
+    """
+    from collections import Counter
+
+    end_months: Counter[int] = Counter()
+    us_gaap = facts.get("facts", {}).get("us-gaap", {})
+    scan_tags = (
+        "Revenues",
+        "RevenueFromContractWithCustomerExcludingAssessedTax",
+        "NetIncomeLoss",
+        "Assets",
+    )
+    for tag in scan_tags:
+        tag_data = us_gaap.get(tag, {})
+        for unit_values in tag_data.get("units", {}).values():
+            for v in unit_values:
+                if v.get("form") != "10-K" or v.get("fp") != "FY":
+                    continue
+                end = v.get("end", "")
+                if len(end) >= 7:
+                    try:
+                        end_months[int(end[5:7])] += 1
+                    except ValueError:
+                        continue
+
+    if not end_months:
+        return 12  # safe default — most US filers use Dec year-end
+    return end_months.most_common(1)[0][0]
+
+
+def _fiscal_year_from_period_end(period_end: date, fye_month: int) -> int:
+    """Derive the fiscal year a given period_end belongs to.
+
+    For a company whose fiscal year ends in month ``fye_month``:
+      - if ``period_end.month <= fye_month``: the date is in fiscal year
+        ``period_end.year``
+      - else: the date is in fiscal year ``period_end.year + 1``
+
+    Examples
+    --------
+    * META (fye_month=12): 2025-03-31 -> FY2025 ✓
+    * AAPL (fye_month=9): 2024-12-31 -> FY2025 (Q1 of fiscal 2025) ✓
+    * MSFT (fye_month=6): 2024-09-30 -> FY2025 (Q1 of fiscal 2025) ✓
+    """
+    if fye_month < 1 or fye_month > 12:
+        return period_end.year
+    if period_end.month <= fye_month:
+        return period_end.year
+    return period_end.year + 1
+
+
 def _pick_all_annual(values: list[dict]) -> list[dict]:
     """From a list of XBRL fact entries, return all 10-K and 10-Q values.
 
@@ -483,6 +544,13 @@ def fetch_metrics_for_symbol(symbol: str) -> tuple[list[StockMetric], list[str]]
     reporting_style = _classify_reporting_style(all_raw_entries)
     logger.info("%s: reporting_style = %s", symbol, reporting_style)
 
+    # Detect the company's fiscal year-end month once — we use this to
+    # derive each period's fiscal year from its period_end date instead of
+    # trusting the unreliable XBRL ``fy`` field, which reflects the
+    # *filing's* fiscal year and diverges for comparative columns.
+    fye_month = _detect_fiscal_year_end_month(facts)
+    logger.info("%s: fiscal_year_end_month = %d", symbol, fye_month)
+
     # Step 4: Extract each metric (all historical periods).
     #
     # Companies sometimes report the SAME metric under DIFFERENT XBRL tags
@@ -585,15 +653,11 @@ def fetch_metrics_for_symbol(symbol: str) -> tuple[list[StockMetric], list[str]]
             # Compute duration for cumulative vs standalone awareness
             duration_days = _compute_duration_days(raw_start, raw_end)
 
-            # Use XBRL fy field; fall back to period_end year
-            fy = None
-            if fiscal_year is not None:
-                try:
-                    fy = int(fiscal_year)
-                except (ValueError, TypeError):
-                    fy = period_end.year
-            else:
-                fy = period_end.year
+            # Derive fiscal year from period_end and the company's fiscal
+            # year-end month.  Do NOT trust the XBRL ``fy`` field: it is the
+            # filing's fiscal year and is wrong for comparative prior-year
+            # columns in 10-Ks and for off-cycle filings.
+            fy = _fiscal_year_from_period_end(period_end, fye_month)
 
             # Build validated model
             try:
