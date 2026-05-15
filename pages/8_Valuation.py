@@ -32,6 +32,7 @@ from src.db import (
     upsert_valuation_snapshots,
 )
 from src.models import ValuationSnapshot
+from src.refresh import get_freshness, refresh_symbols_default
 from src.splits import detect_splits, normalize_metrics
 from src.ttm import compute_ttm, compute_ttm_latest, is_flow_metric
 from src.valuation import (
@@ -75,6 +76,85 @@ if not metrics_data:
     st.stop()
 
 symbols_with_data = sorted(metrics_data.keys())
+
+# -- Freshness indicator + Refresh-from-SEC control ------------------------
+refresh_target_symbols: list[str] = sorted(set(symbols) | set(symbols_with_data))
+freshness = get_freshness(refresh_target_symbols)
+_today_for_freshness = date.today()
+stale_symbols = [
+    sym for sym, info in freshness.items()
+    if info.is_stale(today=_today_for_freshness)
+]
+latest_metric_dates = [
+    info.latest_metric_period_end for info in freshness.values()
+    if info.latest_metric_period_end is not None
+]
+latest_price_dates = [
+    info.latest_price_date for info in freshness.values()
+    if info.latest_price_date is not None
+]
+newest_metric = max(latest_metric_dates) if latest_metric_dates else None
+newest_price = max(latest_price_dates) if latest_price_dates else None
+
+col_refresh_btn, col_refresh_info = st.columns([1, 4])
+with col_refresh_btn:
+    refresh_clicked = st.button(
+        "Refresh latest data",
+        type="primary" if stale_symbols else "secondary",
+        help=(
+            "Pull the latest SEC fundamentals (10-K / 10-Q) and missing market "
+            "prices for every portfolio symbol, then recompute all valuation "
+            "ratios with the freshest data available."
+        ),
+    )
+with col_refresh_info:
+    bits: list[str] = []
+    if newest_metric is not None:
+        bits.append(f"Latest fundamentals: **{newest_metric.isoformat()}**")
+    if newest_price is not None:
+        bits.append(f"Latest price: **{newest_price.isoformat()}**")
+    if stale_symbols:
+        preview = ", ".join(stale_symbols[:5])
+        more = f" (+{len(stale_symbols) - 5} more)" if len(stale_symbols) > 5 else ""
+        bits.append(f"WARNING: {len(stale_symbols)} symbol(s) look stale: {preview}{more}")
+    if bits:
+        st.caption(" - ".join(bits))
+    else:
+        st.caption("No freshness info available yet.")
+
+if refresh_clicked:
+    progress = st.progress(0.0, text="Starting refresh...")
+
+    def _on_progress(sym: str, idx: int, total: int) -> None:
+        progress.progress(idx / max(total, 1), text=f"Refreshing {sym} ({idx}/{total})...")
+
+    with st.spinner("Pulling latest SEC fundamentals and market prices..."):
+        summary = refresh_symbols_default(
+            refresh_target_symbols,
+            today=_today_for_freshness,
+            progress_cb=_on_progress,
+        )
+    progress.empty()
+
+    msg = (
+        f"Refreshed {len(summary.symbols)} symbol(s) in "
+        f"{summary.duration_seconds:.1f}s -- metrics: "
+        f"+{summary.metrics_inserted} new / {summary.metrics_updated} updated, "
+        f"prices: +{summary.prices_inserted} new / {summary.prices_updated} updated."
+    )
+    if summary.has_errors:
+        st.warning(msg)
+        with st.expander(f"Issues during refresh ({len(summary.errors)})"):
+            for err in summary.errors:
+                st.text(err)
+    else:
+        st.success(msg)
+
+    # Re-read DB so the rest of the page works on the freshly persisted data.
+    metrics_data = get_metrics_for_symbols(symbols)
+    symbols_with_data = sorted(metrics_data.keys())
+    freshness = get_freshness(refresh_target_symbols)
+
 
 # ── Controls ─────────────────────────────────────────────────────────────────
 
